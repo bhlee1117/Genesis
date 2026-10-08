@@ -274,7 +274,10 @@ transform.
 
 Both parents can be pinned (`recipient_plasmid_id`, `donor_plasmid_id`) and
 both come with ranked alternatives and a stated reason for each, because
-which plasmid to start from is a lab judgement as much as a computation.
+which plasmid to start from is a lab judgement as much as a computation. The
+Design tab lists the candidates under each parent's map and rebuilds the
+plan around whichever one is picked; "let Genesis recommend" stays available
+so a pin can always be undone.
 
 Equivalence between parts is decided at two levels. DNA k-mers catch
 boundary variants of the same gene; **protein comparison** catches

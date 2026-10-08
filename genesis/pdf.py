@@ -702,6 +702,8 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
         x2, y2 = _polar(cx, cy, radius + 3, mf)
         doc.line(x1, y1, x2, y2, rgb=rgb, width=1.0)
 
+    # Size only. A plasmid name runs off both sides of a circle this size
+    # and overprints the ring; the heading above already carries it.
     doc.text_at(f"{length:,} bp", cx, cy + 2, "F2", 9, centre=True)
     doc.text_at("circular", cx, cy - 10, "F1", 7, rgb=(0.5, 0.5, 0.52),
                 centre=True)

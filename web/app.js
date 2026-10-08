@@ -718,12 +718,15 @@ function circularMap(length, items, opts) {
   });
 
   var host = h('div', { class: 'map-circular' });
+  var captionHost = h('div');
+  var caption = null;
   var lastWidth = 0;
 
   function draw() {
     var w = Math.round(host.clientWidth) || 560;
     if (w === lastWidth) return;
     lastWidth = w;
+    caption = null;
     clear(host);
 
     var size = Math.max(Math.min(w, 560), 320);
@@ -824,11 +827,11 @@ function circularMap(length, items, opts) {
           class: 'circ-highlight hl-' + kind
         }));
       });
-      node.appendChild(svg('text', {
-        x: cx, y: cy + 44, 'text-anchor': 'middle',
-        class: 'circ-hl-label hl-' + kind
-      }, (kind === 'cut' ? 'cut out ' : 'take ') + bp(hl.length) +
-         (hl.label ? ' (' + hl.label + ')' : '')));
+      /* The caption goes under the map, not inside it: element names make
+         it wider than the circle and it would cross the ring. */
+      caption = h('p', { class: 'circ-caption hl-' + kind },
+        (kind === 'cut' ? 'cut out ' : 'take ') + bp(hl.length) +
+        (hl.label ? ' \u2014 ' + hl.label : ''));
     }
 
     (opts.markers || []).forEach(function (m) {
@@ -845,17 +848,19 @@ function circularMap(length, items, opts) {
       node.appendChild(g);
     });
 
+    /* Only the size goes in the middle. A plasmid name is long enough to
+       run off both sides of the circle and overprint the ring, and the card
+       header already carries it. */
     node.appendChild(svg('text', {
-      x: cx, y: cy - 2, 'text-anchor': 'middle', class: 'circ-name'
-    }, opts.label || ''));
-    node.appendChild(svg('text', {
-      x: cx, y: cy + 14, 'text-anchor': 'middle', class: 'circ-size'
+      x: cx, y: cy + 2, 'text-anchor': 'middle', class: 'circ-size'
     }, bp(span)));
     node.appendChild(svg('text', {
-      x: cx, y: cy + 28, 'text-anchor': 'middle', class: 'circ-topo'
+      x: cx, y: cy + 16, 'text-anchor': 'middle', class: 'circ-topo'
     }, 'circular'));
 
     host.appendChild(node);
+    clear(captionHost);
+    if (caption) captionHost.appendChild(caption);
   }
 
   // Draw once up front: the element is not in the document yet, so a
@@ -868,7 +873,7 @@ function circularMap(length, items, opts) {
   var note = h('p', { class: 'map-note muted small' },
     'Outer ring reads forward, inner ring reverse. Arrowheads point the way ' +
     'a coding sequence is translated. Position 1 is at the top.');
-  return h('div', null, host, note);
+  return h('div', null, host, captionHost, note);
 }
 
 function featureMap(length, items, opts) {
@@ -1783,8 +1788,34 @@ function usingYaml() {
 }
 
 /** Build the `spec` payload: a YAML string, or the object form. */
+/* Parents the user chose explicitly. Null means "let Genesis recommend",
+   which is the default and must stay reachable once something is pinned. */
+var pinnedParents = { recipient: null, donor: null };
+
+/* A pinned parent has to survive whichever way the spec is being written.
+   In YAML mode collectSpec hands back the user's own text, so the pins are
+   merged into it rather than silently dropped. */
+function withPins(spec) {
+  if (typeof spec !== 'string') return spec;
+  var lines = spec.split('\n').filter(function (line) {
+    return !/^\s*(recipient|donor)_plasmid_id\s*:/.test(line);
+  });
+  var extra = [];
+  if (pinnedParents.recipient) {
+    extra.push('recipient_plasmid_id: ' + pinnedParents.recipient);
+  }
+  if (pinnedParents.donor) {
+    extra.push('donor_plasmid_id: ' + pinnedParents.donor);
+  }
+  if (!extra.length) return lines.join('\n');
+  // Top-level keys must come before the modules list in this YAML dialect.
+  var at = lines.findIndex(function (line) { return /^modules\s*:/.test(line); });
+  if (at < 0) at = lines.length;
+  return lines.slice(0, at).concat(extra, lines.slice(at)).join('\n');
+}
+
 function collectSpec() {
-  if (usingYaml()) return $('spec-yaml').value;
+  if (usingYaml()) return withPins($('spec-yaml').value);
   var backbone = $('spec-backbone').value.trim();
   var spec = {
     name: $('spec-name').value.trim() || 'untitled',
@@ -1807,6 +1838,8 @@ function collectSpec() {
   // A bare integer is treated as a plasmid id, anything else as a name.
   if (/^\d+$/.test(backbone)) spec.backbone_plasmid_id = parseInt(backbone, 10);
   else spec.backbone = backbone;
+  if (pinnedParents.recipient) spec.recipient_plasmid_id = pinnedParents.recipient;
+  if (pinnedParents.donor) spec.donor_plasmid_id = pinnedParents.donor;
   return spec;
 }
 
@@ -2208,8 +2241,78 @@ function suggestedName(construct) {
  * donor with the region to take. Both are circles for the same reason the
  * product is.
  * ------------------------------------------------------------------------ */
-function parentCard(role, parent, kind) {
-  if (!parent) return null;
+
+/* A list of candidate parents, with the reason each was offered, and a way
+ * to choose one. Which plasmid to start from is a lab judgement as much as
+ * a computation, so the recommendation is a default rather than a verdict
+ * and "let Genesis recommend" stays reachable once something is pinned. */
+function parentPicker(role, options, chosenId) {
+  options = options || [];
+  if (options.length < 2 && !pinnedParents[role]) return null;
+
+  var box = h('div', { class: 'parent-picker' });
+  box.appendChild(h('div', { class: 'picker-head muted small' },
+    options.length + ' plasmid' + (options.length === 1 ? '' : 's') +
+    ' could serve as the ' + role + ' \u2014 ranked, best first'));
+
+  var list = h('div', { class: 'picker-list', role: 'radiogroup',
+                        'aria-label': role + ' options' });
+
+  function row(option) {
+    var id = option ? option.id : null;
+    var isPinned = pinnedParents[role] === id;
+    var isActive = id === null
+      ? !pinnedParents[role]
+      : (isPinned || (!pinnedParents[role] && id === chosenId));
+
+    var item = h('button', {
+      type: 'button', role: 'radio',
+      'aria-checked': isActive ? 'true' : 'false',
+      class: 'picker-row' + (isActive ? ' active' : '') +
+             (isPinned ? ' pinned' : ''),
+      onclick: function () {
+        pinnedParents[role] = id;
+        generatePlan();
+      }
+    });
+
+    if (id === null) {
+      item.appendChild(h('span', { class: 'picker-name' },
+        'Let Genesis recommend'));
+      item.appendChild(h('span', { class: 'picker-why muted small' },
+        'clears the pin and re-ranks'));
+      return item;
+    }
+
+    item.appendChild(h('span', { class: 'picker-name' }, option.name));
+    if (isPinned) item.appendChild(h('span', { class: 'pill pill-accent' }, 'pinned'));
+    else if (isActive) item.appendChild(h('span', { class: 'pill' }, 'recommended'));
+    item.appendChild(h('span', { class: 'picker-why muted small' },
+      (option.reasons || []).join(' \u00b7 ')));
+    if (option.owner) {
+      item.appendChild(h('span', { class: 'picker-owner muted small' },
+        option.owner));
+    }
+    return item;
+  }
+
+  options.forEach(function (option) { list.appendChild(row(option)); });
+  if (pinnedParents[role]) list.appendChild(row(null));
+  box.appendChild(list);
+  return box;
+}
+
+function parentCard(role, parent, kind, options) {
+  if (!parent) {
+    if (!(options || []).length) return null;
+    var empty = h('div', { class: 'parent-card' },
+      h('div', { class: 'parent-head' },
+        h('span', { class: 'parent-role ' + role }, role.toUpperCase()),
+        h('span', { class: 'muted' }, 'none chosen')));
+    var pickEmpty = parentPicker(role, options, null);
+    if (pickEmpty) empty.appendChild(pickEmpty);
+    return empty;
+  }
   var head = h('div', { class: 'parent-head' },
     h('span', { class: 'parent-role ' + role }, role.toUpperCase()),
     h('strong', null, parent.name),
@@ -2223,6 +2326,8 @@ function parentCard(role, parent, kind) {
     }), {
       label: parent.name, highlight: parent.highlight, highlightKind: kind
     }));
+  var picker = parentPicker(role, options, parent.id);
+  if (picker) card.appendChild(picker);
   return card;
 }
 
@@ -2238,8 +2343,9 @@ function schemeCard(plan) {
         'the donor in its place')));
 
   var grid = h('div', { class: 'parent-grid' });
-  var rec = parentCard('recipient', scheme.recipient, 'cut');
-  var don = parentCard('donor', scheme.donor, 'take');
+  var rec = parentCard('recipient', scheme.recipient, 'cut',
+                       scheme.recipient_options);
+  var don = parentCard('donor', scheme.donor, 'take', scheme.donor_options);
   if (rec) grid.appendChild(rec);
   if (don) grid.appendChild(don);
   card.appendChild(grid);
@@ -2260,19 +2366,6 @@ function schemeCard(plan) {
       ' and is what the primers anneal to or the enzymes cut between.'));
   }
 
-  var options = scheme.donor_options || [];
-  if (options.length > 1) {
-    var list = h('p', { class: 'muted small' },
-      'Other plasmids carrying this part: ');
-    options.slice(1, 6).forEach(function (o, i) {
-      if (i) list.appendChild(document.createTextNode(', '));
-      list.appendChild(h('span', { class: 'donor-alt' },
-        o.name + ' (' + bp(o.length) + ')'));
-    });
-    list.appendChild(document.createTextNode(
-      '. Which to use is a lab preference; name one as the backbone to pin it.'));
-    card.appendChild(list);
-  }
   return card;
 }
 
@@ -3358,6 +3451,12 @@ function specToYaml() {
     if ((m.name || '').trim()) lines.push('    name: ' + m.name.trim());
     if (m.part_id) lines.push('    part_id: ' + m.part_id);
   });
+  if (pinnedParents.recipient) {
+    lines.splice(1, 0, 'recipient_plasmid_id: ' + pinnedParents.recipient);
+  }
+  if (pinnedParents.donor) {
+    lines.splice(1, 0, 'donor_plasmid_id: ' + pinnedParents.donor);
+  }
   return lines.join('\n') + '\n';
 }
 
