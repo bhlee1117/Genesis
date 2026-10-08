@@ -1814,3 +1814,196 @@ class TestVectorDesignIntegration(unittest.TestCase):
         first = _json.loads(self.conn.execute(
             "SELECT plan FROM design WHERE id = 1").fetchone()["plan"])
         self.assertEqual(first["construct"]["name"], "original")
+
+
+# --------------------------------------------------------------------------
+class TestVerification(unittest.TestCase):
+    """Read the designed molecule back and check it against the request.
+
+    These tests inject faults, because a verifier that only ever says "yes"
+    is worth nothing.
+    """
+
+    def _resolved(self, items):
+        from genesis.construct import ResolvedModule
+        return [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s, t, [], [])
+                for t, n, s in items]
+
+    def test_a_correct_construct_verifies(self):
+        from genesis.verify import verify_design
+        mods = self._resolved([("promoter", "hSyn", rand_seq(400, 900)),
+                               ("CDS", "gene", orf(200, 901))])
+        construct = assemble(mods, "", True)
+        result = verify_design(construct, mods, True)
+        self.assertTrue(result.passed, result.problems)
+        self.assertEqual(len(result.checks), 2)
+        self.assertTrue(all(c.found for c in result.checks))
+
+    def test_a_dropped_module_is_caught(self):
+        """The layout claims a part is there; the sequence says otherwise."""
+        from genesis.verify import verify_design
+        mods = self._resolved([("promoter", "hSyn", rand_seq(400, 902)),
+                               ("CDS", "gene", orf(200, 903))])
+        construct = assemble(mods, "", True)
+        # cut the CDS out of the finished molecule, as a bug would
+        construct.seq = construct.seq.replace(mods[1].seq, "")
+        result = verify_design(construct, mods, True)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("does not appear" in p for p in result.problems),
+                        result.problems)
+
+    def test_a_truncated_module_is_caught(self):
+        from genesis.verify import verify_design
+        mods = self._resolved([("CDS", "gene", orf(200, 904))])
+        construct = assemble(mods, "", True)
+        construct.seq = construct.seq[:-30]          # lose the last 10 codons
+        result = verify_design(construct, mods, True)
+        self.assertFalse(result.passed)
+
+    def test_an_inverted_module_is_caught(self):
+        from genesis.verify import verify_design
+        mods = self._resolved([("promoter", "p", rand_seq(300, 905)),
+                               ("CDS", "gene", orf(200, 906))])
+        construct = assemble(mods, "", True)
+        construct.seq = construct.seq.replace(mods[1].seq,
+                                              st.revcomp(mods[1].seq))
+        result = verify_design(construct, mods, True)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("wrong way round" in p for p in result.problems),
+                        result.problems)
+
+    def test_a_reordered_construct_is_caught(self):
+        from genesis.verify import verify_design
+        a, b, c = rand_seq(300, 907), rand_seq(300, 908), rand_seq(300, 909)
+        mods = self._resolved([("promoter", "one", a), ("CDS", "two", b),
+                               ("polyA", "three", c)])
+        construct = assemble(mods, "", True)
+        construct.seq = a + c + b                    # swap the last two
+        result = verify_design(construct, mods, True)
+        self.assertFalse(result.order_ok)
+        self.assertTrue(any("different order" in p for p in result.problems),
+                        result.problems)
+
+    def test_a_duplicated_part_is_reported(self):
+        from genesis.verify import verify_design
+        gene = orf(200, 910)
+        mods = self._resolved([("CDS", "gene", gene)])
+        construct = assemble(mods, "", True)
+        construct.seq = construct.seq + rand_seq(200, 911) + gene
+        result = verify_design(construct, mods, True)
+        self.assertTrue(any("appears 2 times" in p for p in result.problems),
+                        result.problems)
+
+    def test_lox_sites_appearing_twice_is_not_a_fault(self):
+        """Two of each lox site is what makes the cassette work."""
+        from genesis.construct import expand_dio
+        from genesis.verify import verify_design
+        mods = self._resolved([("Cre-lox", "DIO", ""),
+                               ("CDS", "payload", orf(250, 912))])
+        expanded, _ = expand_dio(mods)
+        construct = assemble(expanded, "", True)
+        result = verify_design(construct, expanded, True)
+        self.assertTrue(result.passed, result.problems)
+        self.assertFalse(any("appears 2 times" in p for p in result.problems),
+                         result.problems)
+
+    def test_an_inverted_payload_is_confirmed_to_switch_on(self):
+        from genesis.construct import expand_dio
+        from genesis.verify import verify_design
+        from genesis.validate import lox_sites_from_layout, simulate_cre
+        mods = self._resolved([("Cre-lox", "DIO", ""),
+                               ("CDS", "payload", orf(250, 913))])
+        expanded, _ = expand_dio(mods)
+        construct = assemble(expanded, "", True)
+        recombined, _ = simulate_cre(construct.seq,
+                                     lox_sites_from_layout(construct.seq))
+        result = verify_design(construct, expanded, True, recombined)
+        self.assertIsNotNone(result.recombined)
+        self.assertTrue(result.recombined["all_switched"], result.problems)
+        self.assertEqual(set(result.recombined["now_forward"]),
+                         {"payload"})
+
+    def test_every_design_carries_a_verification(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        seq = orf(150, 914)
+        pl = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'vv',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 915), len(seq) + 2000)).lastrowid
+        pid = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(), len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,0,?,1)""", (pid, pl, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("v", modules=[Module("CDS", "gene")]),
+                      cfg)
+        self.assertIn("verification", plan)
+        self.assertTrue(plan["verification"]["passed"],
+                        plan["verification"]["problems"])
+
+
+# --------------------------------------------------------------------------
+class TestCreLoxModes(unittest.TestCase):
+
+    def _mods(self, mode):
+        from genesis.construct import ResolvedModule
+        return [
+            ResolvedModule(Module(type="Cre-lox", name="", mode=mode), None,
+                           mode, "", "Cre-lox", [], []),
+            ResolvedModule(Module(type="CDS", name="payload"), None, "payload",
+                           orf(250, 920), "CDS", [], []),
+        ]
+
+    def _switches(self, mode):
+        from genesis.construct import expand_dio
+        from genesis.validate import lox_sites_from_layout, simulate_cre
+        mods = self._mods(mode)
+        protein = st.translate(mods[1].seq).rstrip("*")
+        expanded, _ = expand_dio(mods)
+        construct = assemble(expanded, "", True)
+        before = any(o["strand"] == 1 and o["protein"] == protein
+                     for o in st.find_orfs(construct.seq, min_aa=200))
+        recombined, log = simulate_cre(construct.seq,
+                                       lox_sites_from_layout(construct.seq))
+        after = any(o["strand"] == 1 and o["protein"] == protein
+                    for o in st.find_orfs(recombined, min_aa=200))
+        return before, after, log
+
+    def test_dio_and_flex_switch_on(self):
+        for mode in ("DIO", "FLEX"):
+            before, after, log = self._switches(mode)
+            self.assertFalse(before, f"{mode} must be off before Cre")
+            self.assertTrue(after, f"{mode} must be on after Cre")
+            self.assertEqual(len(log), 2, mode)
+
+    def test_fas_uses_loxfas_and_switches_on(self):
+        from genesis.construct import expand_dio
+        from genesis.validate import lox_sites_from_layout
+        expanded, _ = expand_dio(self._mods("FAS"))
+        construct = assemble(expanded, "", True)
+        names = {s.name for s in lox_sites_from_layout(construct.seq)}
+        self.assertEqual(names, {"loxFAS", "loxP"})
+        before, after, _ = self._switches("FAS")
+        self.assertFalse(before)
+        self.assertTrue(after)
+
+    def test_do_switches_off(self):
+        before, after, _ = self._switches("DO")
+        self.assertTrue(before, "DO expresses until Cre arrives")
+        self.assertFalse(after, "DO must be off after Cre")
+
+    def test_dio_is_still_accepted_as_a_type(self):
+        spec = ConstructSpec.from_dict(
+            {"name": "x", "modules": [{"type": "DIO"}]})
+        self.assertEqual(spec.modules[0].type, "Cre-lox")
+        self.assertEqual(spec.modules[0].mode, "DIO")
+
+    def test_an_unknown_mode_is_refused(self):
+        from genesis.construct import resolve_mode
+        with self.assertRaises(ValueError):
+            resolve_mode("nonsense")

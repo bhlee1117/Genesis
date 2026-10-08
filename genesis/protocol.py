@@ -30,11 +30,11 @@ from .seqtools import gc_fraction, tm
 # --------------------------------------------------------------------------
 
 #: Module types that belong in a construct name, in the order people read them.
-NAMED_TYPES = ("promoter", "enhancer", "DIO", "CDS", "trafficking_motif",
-               "p2A", "IRES", "tag")
+NAMED_TYPES = ("promoter", "enhancer", "Cre-lox", "DIO", "CDS",
+               "trafficking_motif", "p2A", "IRES", "tag")
 
 #: Types whose own name is the architecture, not a part label.
-ARCHITECTURAL_TYPES = {"DIO"}
+ARCHITECTURAL_TYPES = {"Cre-lox", "DIO"}
 
 _DROP_TOKENS = {"cds", "sequence", "seq", "fragment", "insert", "gene",
                 "new", "dna", "part"}
@@ -105,9 +105,16 @@ def suggest_name(plan: dict) -> str:
     # Vector family, from the ITRs if present and otherwise from the backbone
     # name. No word boundaries here: these markers are normally glued to a
     # prefix, as in "pAAV_backbone" or "pLJM1".
+    # The vector family decides the prefix. When one was asked for it wins
+    # outright: if the user said this is an AAV, the name says pAAV.
     prefix = ""
+    family = (plan.get("vector") or {}).get("family") or ""
     backbone = (plan.get("backbone") or {}).get("name", "") or ""
-    if "AAV_ITR" in types or re.search(r"AAV", backbone, re.I):
+    if family == "AAV":
+        prefix = "pAAV"
+    elif family == "lentiviral":
+        prefix = "pLenti"
+    elif "AAV_ITR" in types or re.search(r"AAV", backbone, re.I):
         prefix = "pAAV"
     elif re.search(r"lenti|fugw|pLJM|pHR|FCK|FUW", backbone, re.I):
         prefix = "pLenti"
@@ -117,7 +124,9 @@ def suggest_name(plan: dict) -> str:
         if item["type"] not in NAMED_TYPES:
             continue
         if item["type"] in ARCHITECTURAL_TYPES:
-            tokens.append(item["type"])
+            # Name the arrangement people recognise - DIO, FLEX, FAS -
+            # rather than the family it belongs to.
+            tokens.append(item.get("mode") or item.get("name") or "DIO")
             continue
         token = _clean_token(item.get("name") or "")
         if token and (not tokens or tokens[-1].lower() != token.lower()):

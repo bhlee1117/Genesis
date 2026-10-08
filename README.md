@@ -139,13 +139,32 @@ plasmids, assembles the intended molecule, and validates it.
   runs are mapped back correctly, so an inverted DIO payload shows its ATG at
   the higher coordinate, which is where it really is.
 - **AAV packaging** — payload between ITRs against the ~4.7 kb limit.
-- **DIO / FLEX** — `DIO` is an architecture, not a part. A `DIO` module
-  wraps the coding sequence that follows it:
-  `lox2272 - loxP - [payload inverted] - lox2272' - loxP'`. The pairs are
-  interleaved, not nested, which is what makes the switch one-way. Genesis
-  builds the cassette, confirms the payload is **not** expressible as
-  deposited, simulates Cre, and confirms the forward ORF appears afterwards
-  with one lox2272 and one loxP retained.
+- **Cre-lox** — an architecture, not a part. A `Cre-lox` module wraps the
+  coding sequence that follows it in two heterotypic, antiparallel site
+  pairs: `outer - inner - [payload] - outer' - inner'`. The pairs are
+  interleaved rather than nested, which is what makes the switch one-way:
+  the first pair inverts the payload, which flips the second pair into the
+  same orientation so it excises, and the payload cannot flip back.
+
+  Four arrangements, set with `mode:`
+
+  | mode | sites | payload stored | Cre |
+  |---|---|---|---|
+  | `DIO` | lox2272 + loxP | inverted | switches **on** |
+  | `FLEX` | lox2272 + loxP | inverted | switches **on** |
+  | `FAS` | loxFAS + loxP | inverted | switches **on** |
+  | `DO` | lox2272 + loxP | forward | switches **off** |
+
+  `type: DIO` still works and means Cre-lox in its DIO arrangement. The
+  loxFAS sequence was taken from the lab's own plasmids, where it is
+  annotated "FAS SITE"; it carries mutated inverted repeats so it pairs only
+  with itself.
+
+  Because the payload is stored reverse-complemented, it is read off the
+  reverse strand throughout: translation, reading-frame checks and codon
+  markers all follow the strand the fusion is encoded on and map their
+  coordinates back, which is why a DIO payload shows its ATG at a *higher*
+  coordinate than its stop.
 - **Composite parts** — 14% of the CDS annotations on this share have
   another element fused into them: 51 already contain a 2A peptide, and 249
   carry a trafficking motif (Voltron-2, present in 55 plasmids, carries both
@@ -196,6 +215,24 @@ part of the junction. A tag on the end of a single protein is not a fusion
 and does not split. Of the CDS parts on this share, 100 split this way, and
 96 of the resulting pieces turned out to be parts the lab already had names
 for.
+
+### Reading the design back
+
+Everything else works forward: modules are resolved, concatenated, and a
+layout records where each one went. That bookkeeping is exactly what a bug
+would corrupt, so checking a design against it proves nothing.
+
+So every plan is also verified independently. The layout is discarded, the
+finished sequence is searched for each part's actual bases, and the molecule
+is re-annotated from scratch with the same motif scanner used on imported
+files. Only then is what was found compared with what was asked for. A
+module that was dropped, truncated, duplicated or placed backwards shows up
+here. For a Cre-lox construct the check runs twice, on the plasmid as it
+would be cloned and on the product of recombination, because only the second
+is expressed.
+
+The test suite injects each of those faults deliberately and asserts the
+verifier catches them; a verifier that only ever says "yes" is worth nothing.
 
 ### Designs
 
@@ -323,9 +360,10 @@ genesis/
   export.py      Stage 12: protocol, primer CSV, GenBank
   auth.py        accounts, password hashing, sessions, roles
   vectors.py     AAV / lentiviral families and their element sets
+  verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           149 tests, no lab share required
+tests/           163 tests, no lab share required
 ```
 
 ## Giving it to a labmate

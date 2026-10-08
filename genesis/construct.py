@@ -13,7 +13,8 @@ import sqlite3
 from dataclasses import dataclass, field, asdict
 
 from .seqtools import clean_seq, revcomp, translate, STOP_CODONS
-from .vocab import min_part_length, find_embedded_elements, trim_embedded
+from .vocab import (canonical_feature_type, find_embedded_elements,
+                    min_part_length, trim_embedded)
 
 
 @dataclass
@@ -30,6 +31,7 @@ class Module:
     preferred_sources: list = field(default_factory=list)
     part_id: int | None = None      # pinned part, if the user chose one
     seq: str = ""                   # literal sequence, if supplied directly
+    mode: str = ""                  # for Cre-lox: DIO, FLEX, FAS or DO
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -58,7 +60,14 @@ class ConstructSpec:
         mods = []
         for m in data.get("modules", []):
             known = {f for f in Module.__dataclass_fields__}
-            mods.append(Module(**{k: v for k, v in m.items() if k in known}))
+            fields = {k: v for k, v in m.items() if k in known}
+            raw_type = fields.get("type", "")
+            fields["type"] = canonical_feature_type(raw_type)
+            # "type: DIO" names both the family and the arrangement.
+            if (fields["type"] == "Cre-lox" and not fields.get("mode")
+                    and raw_type != "Cre-lox"):
+                fields["mode"] = raw_type
+            mods.append(Module(**fields))
         return cls(
             name=data.get("name", "untitled"),
             backbone=data.get("backbone", ""),
@@ -220,7 +229,8 @@ TRANSLATED_MODULE_TYPES = {"CDS", "trafficking_motif", "linker", "p2A", "tag"}
 def _module_types(spec: ConstructSpec) -> list[str]:
     out = []
     for m in spec.modules:
-        out.append(m["type"] if isinstance(m, dict) else m.type)
+        out.append(canonical_feature_type(
+            m["type"] if isinstance(m, dict) else m.type))
     return out
 
 
@@ -236,9 +246,10 @@ def resolve(conn: sqlite3.Connection, spec: ConstructSpec) -> list[ResolvedModul
         # DIO denotes an architecture that wraps the coding sequence after
         # it, not a part to look up. It is expanded into lox sites and an
         # inverted payload later, so it resolves to a marker here.
-        if mod.type == "DIO" and not mod.seq and not mod.part_id:
-            resolved.append(ResolvedModule(mod, None, mod.name or "DIO", "",
-                                           "DIO", [], []))
+        if mod.type in ("Cre-lox", "DIO") and not mod.seq and not mod.part_id:
+            resolved.append(ResolvedModule(
+                mod, None, mod.name or mod.mode or "Cre-lox", "", "Cre-lox",
+                [], []))
             continue
 
         if mod.seq:
@@ -457,48 +468,113 @@ def translated_span(construct: AssembledConstruct) -> list[dict]:
 
 LOXP_SEQ = "ATAACTTCGTATAATGTATGCTATACGAAGTTAT"
 LOX2272_SEQ = "ATAACTTCGTATAAAGTATCCTATACGAAGTTAT"
+LOXN_SEQ = "ATAACTTCGTATAATGTATACTATACGAAGTTAT"
+#: loxFAS has mutated inverted repeats, so it pairs only with itself.
+LOXFAS_SEQ = "ACAACTTCGTATATACCTTTCTATACGAAGTTGT"
 
-#: Module types a DIO cassette encloses. The cassette stops at the elements
-#: that stay outside it, such as the polyA and the WPRE.
-DIO_PAYLOAD_TYPES = {"CDS", "trafficking_motif", "linker", "p2A", "tag", "IRES"}
+#: Module types a recombinase cassette encloses. The cassette stops at the
+#: elements that stay outside it, such as the polyA and the WPRE.
+CASSETTE_PAYLOAD_TYPES = {"CDS", "trafficking_motif", "linker", "p2A", "tag",
+                          "IRES"}
+
+
+@dataclass(frozen=True)
+class RecombinaseMode:
+    """One arrangement of recombinase sites around a payload.
+
+    The two site types must be *heterotypic* - they must not recombine with
+    each other - or the cassette would collapse the moment the recombinase
+    arrived. Interleaving them rather than nesting them is what makes the
+    switch one-way: the first pair inverts the payload, which flips the
+    second pair into the same orientation so it excises, and the payload can
+    no longer flip back.
+    """
+    key: str
+    label: str
+    outer: tuple          # (name, sequence)
+    inner: tuple
+    inverted: bool        # is the payload stored reverse-complemented?
+    description: str
+
+
+RECOMBINASE_MODES = {m.key: m for m in (
+    RecombinaseMode(
+        "DIO", "DIO (double-floxed inverted orientation)",
+        ("lox2272", LOX2272_SEQ), ("loxP", LOXP_SEQ), True,
+        "payload stored inverted; Cre turns expression ON"),
+    RecombinaseMode(
+        "FLEX", "FLEX (flip-excision switch)",
+        ("lox2272", LOX2272_SEQ), ("loxP", LOXP_SEQ), True,
+        "payload stored inverted; Cre turns expression ON"),
+    RecombinaseMode(
+        "FAS", "FAS (loxP / loxFAS switch)",
+        ("loxFAS", LOXFAS_SEQ), ("loxP", LOXP_SEQ), True,
+        "payload stored inverted; Cre turns expression ON"),
+    RecombinaseMode(
+        "DO", "DO (double-floxed, Cre-OFF)",
+        ("lox2272", LOX2272_SEQ), ("loxP", LOXP_SEQ), False,
+        "payload stored forward and expressed until Cre inverts it away"),
+)}
+DEFAULT_MODE = "DIO"
+
+
+def resolve_mode(value: str) -> RecombinaseMode:
+    key = (value or DEFAULT_MODE).strip().upper().replace("-", "").replace("_", "")
+    aliases = {"CREON": "DIO", "CREOFF": "DO", "DOUBLEFLOXED": "DIO",
+               "DIO": "DIO", "FLEX": "FLEX", "FAS": "FAS", "DO": "DO",
+               "CRELOX": DEFAULT_MODE, "": DEFAULT_MODE}
+    key = aliases.get(key, key)
+    if key not in RECOMBINASE_MODES:
+        raise ValueError(
+            f"unknown Cre-lox mode {value!r}; use one of "
+            f"{', '.join(RECOMBINASE_MODES)}")
+    return RECOMBINASE_MODES[key]
 
 
 def expand_dio(resolved: list[ResolvedModule]) -> tuple[list[ResolvedModule], list[str]]:
-    """Turn a ``DIO`` module into the cassette it actually denotes.
+    """Turn a Cre-lox module into the cassette it actually denotes.
 
-    DIO is an architecture, not a part: it encloses the coding sequence that
-    follows it in two heterotypic, antiparallel lox pairs, with the payload
-    inverted so nothing is expressed until Cre flips it:
+    Cre-lox is an architecture, not a part. It encloses the coding sequence
+    that follows it in two heterotypic, antiparallel site pairs:
 
-        lox2272 - loxP - [payload reversed] - lox2272' - loxP'
+        outer - inner - [payload] - outer' - inner'
 
-    The pairs are interleaved rather than nested, which is what makes the
-    switch one-way: Cre first inverts the payload through one pair, and that
-    flips the other pair into the same orientation so it excises, locking the
-    payload in the expressed orientation. After recombination one lox2272 and
-    one loxP remain, flanking the now-forward gene.
+    In the DIO, FLEX and FAS arrangements the payload is stored inverted, so
+    nothing is expressed until Cre flips it. In the DO arrangement it is
+    stored forward and Cre switches it off instead. After recombination one
+    site of each type remains, flanking the payload.
     """
     out: list[ResolvedModule] = []
     notes: list[str] = []
     i = 0
     while i < len(resolved):
         rm = resolved[i]
-        if rm.feature_type != "DIO" or rm.seq:
+        # "DIO" is accepted as well as "Cre-lox": parts and annotations
+        # stored before the rename still carry the old type.
+        if rm.feature_type not in ("Cre-lox", "DIO") or rm.seq:
             out.append(rm)
+            i += 1
+            continue
+
+        try:
+            mode = resolve_mode(getattr(rm.module, "mode", "") or rm.module.name)
+        except ValueError as exc:
+            notes.append(str(exc))
             i += 1
             continue
 
         payload = []
         j = i + 1
-        while j < len(resolved) and resolved[j].feature_type in DIO_PAYLOAD_TYPES:
+        while j < len(resolved) and resolved[j].feature_type in CASSETTE_PAYLOAD_TYPES:
             if resolved[j].seq:
                 payload.append(resolved[j])
             j += 1
 
         if not payload:
             notes.append(
-                "a DIO module was given with no coding sequence after it; a "
-                "DIO cassette has to enclose something, so it was dropped")
+                f"a {mode.label} module was given with no coding sequence "
+                f"after it; the cassette has to enclose something, so it was "
+                f"dropped")
             i += 1
             continue
 
@@ -509,35 +585,38 @@ def expand_dio(resolved: list[ResolvedModule]) -> tuple[list[ResolvedModule], li
                                   seq if strand == 1 else revcomp(seq),
                                   "lox_site", [], [])
 
-        out.append(site("lox2272", LOX2272_SEQ, 1))
-        out.append(site("loxP", LOXP_SEQ, 1))
+        out.append(site(*mode.outer, 1))
+        out.append(site(*mode.inner, 1))
 
-        # The payload is inverted as one block, so the modules come back in
-        # reverse order, each on the opposite strand.
-        for rm_payload in reversed(payload):
+        # An inverted payload comes back in reverse order, each module on the
+        # opposite strand, because the whole block is flipped as one.
+        ordered = reversed(payload) if mode.inverted else payload
+        for rm_payload in ordered:
+            seq = revcomp(rm_payload.seq) if mode.inverted else rm_payload.seq
             flipped = ResolvedModule(
                 rm_payload.module, rm_payload.part_id, rm_payload.part_name,
-                revcomp(rm_payload.seq), rm_payload.feature_type,
-                rm_payload.sources, list(rm_payload.warnings))
-            flipped.module = Module(
-                **{**rm_payload.module.to_dict(), "orientation": "reverse"})
+                seq, rm_payload.feature_type, rm_payload.sources,
+                list(rm_payload.warnings))
+            if mode.inverted:
+                flipped.module = Module(
+                    **{**rm_payload.module.to_dict(), "orientation": "reverse"})
             out.append(flipped)
 
-        out.append(site("lox2272", LOX2272_SEQ, -1))
-        out.append(site("loxP", LOXP_SEQ, -1))
+        out.append(site(*mode.outer, -1))
+        out.append(site(*mode.inner, -1))
 
         notes.append(
-            "DIO expanded to lox2272 - loxP - [" +
+            f"{mode.label} expanded to {mode.outer[0]} - {mode.inner[0]} - [" +
             " + ".join(p.part_name for p in payload) +
-            " inverted] - lox2272' - loxP'; nothing is expressed until Cre "
-            "inverts the payload and excises one pair")
+            (" inverted" if mode.inverted else " forward") +
+            f"] - {mode.outer[0]}' - {mode.inner[0]}'; {mode.description}")
         i = j
     return out, notes
 
 
-# --------------------------------------------------------------------------
-# Start and stop codons
-# --------------------------------------------------------------------------
+#: Kept under the old name so existing imports continue to work.
+expand_recombinase = expand_dio
+
 
 def codon_markers(construct: AssembledConstruct) -> list[dict]:
     """Locate the start and stop codons of every translated run.

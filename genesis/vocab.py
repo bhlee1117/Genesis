@@ -26,13 +26,29 @@ from .seqtools import revcomp, translate, find_all
 
 FEATURE_TYPES = [
     "backbone", "promoter", "enhancer", "CDS", "trafficking_motif", "linker",
-    "p2A", "IRES", "DIO", "lox_site", "AAV_ITR", "resistance", "origin",
+    "p2A", "IRES", "Cre-lox", "lox_site", "AAV_ITR", "resistance", "origin",
     "tag", "polyA", "WPRE", "restriction_site", "primer_binding_site",
     "terminator", "intron", "unknown",
 ]
 
+#: "DIO" was the old name for the family. Specs and parts saved with it keep
+#: working; it now means Cre-lox in its DIO arrangement.
+FEATURE_TYPE_ALIASES = {"DIO": "Cre-lox", "FLEX": "Cre-lox", "DO": "Cre-lox",
+                        "FAS": "Cre-lox", "Cre_lox": "Cre-lox",
+                        "crelox": "Cre-lox"}
+
+
+def canonical_feature_type(value: str) -> str:
+    """Map an old or informal type name onto the current vocabulary."""
+    if not value:
+        return ""
+    if value in FEATURE_TYPES:
+        return value
+    return FEATURE_TYPE_ALIASES.get(value, FEATURE_TYPE_ALIASES.get(
+        value.replace("-", "_"), value))
+
 #: Feature types that must not be disrupted by a cut or a PCR boundary.
-PROTECTED_TYPES = {"AAV_ITR", "lox_site", "DIO", "origin", "resistance"}
+PROTECTED_TYPES = {"AAV_ITR", "lox_site", "Cre-lox", "origin", "resistance"}
 
 #: Shortest length at which an annotation of each type is a believable part.
 #: Lab files contain stray annotations such as an 8 bp feature labelled with
@@ -57,7 +73,8 @@ def min_part_length(feature_type: str) -> int:
 _LABEL_RULES: list[tuple[str, str]] = [
     (r"\bITR\b|inverted terminal repeat", "AAV_ITR"),
     (r"\blox(P|2272|N|511|66|71)?\b|\bFRT\b|\brox\b", "lox_site"),
-    (r"\bDIO\b|\bDO\b|double[- ]?floxed|\bFLEX\b|\bCreOn\b|\bCreOff\b", "DIO"),
+    (r"\bDIO\b|\bDO\b|double[- ]?floxed|\bFLEX\b|\bCreOn\b|\bCreOff\b"
+     r"|\bFAS\b", "Cre-lox"),
     (r"\bWPRE\b|woodchuck", "WPRE"),
     (r"poly[- ]?A|polyadenylation|\bbGH\b|\bSV40 ?pA\b", "polyA"),
     (r"\bIRES\b", "IRES"),
@@ -128,6 +145,11 @@ DNA_MOTIFS: list[Motif] = [
     Motif("lox2272", "lox_site", "ATAACTTCGTATAAAGTATCCTATACGAAGTTAT"),
     Motif("loxN", "lox_site", "ATAACTTCGTATAATGTATACTATACGAAGTTAT"),
     Motif("lox511", "lox_site", "ATAACTTCGTATAATGTATACTATACGAAGTTAT"),
+    # loxFAS carries mutated inverted repeats (ACAACTTCGTATA / TATACGAAGTTGT)
+    # so it recombines with itself but not with loxP. Lab files label it
+    # "FAS SITE".
+    Motif("loxFAS", "lox_site", "ACAACTTCGTATATACCTTTCTATACGAAGTTGT"),
+    Motif("F5", "lox_site", "GAAGTTCCTATTCTTCAAAAGGTATAGGAACTTC"),
     Motif("FRT", "lox_site", "GAAGTTCCTATTCTCTAGAAAGTATAGGAACTTC"),
     Motif("Kozak", "primer_binding_site", "GCCACCATGG", note="strong Kozak context"),
     # AAV2 ITR: match the invariant A-A' stem rather than the whole hairpin,
@@ -320,7 +342,7 @@ def find_embedded_elements(seq: str, feature_type: str = "CDS") -> list[dict]:
     Matching is done on the translation in all three frames, because the
     peptide is conserved where the codons are not.
     """
-    if feature_type not in ("CDS", "DIO") or len(seq) < 30:
+    if feature_type not in ("CDS", "Cre-lox", "DIO") or len(seq) < 30:
         return []
 
     found: list[dict] = []

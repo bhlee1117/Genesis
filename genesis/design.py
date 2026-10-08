@@ -17,6 +17,7 @@ from .planner import (group_contiguous, plan_hifi_route, plan_restriction_route,
                       rank_routes, failure_history)
 from .swap import analyse_swap, build_scheme, rank_parents
 from .vectors import classify_vector, describe, missing_elements
+from .verify import verify_plan
 from .validate import Issue, summarize, validate_construct
 
 
@@ -177,6 +178,14 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                 "info", "packaging",
                 f"carries the full {completeness['label']} element set"))
 
+    # Read the finished molecule back independently of the layout that built
+    # it, and check it is the construct that was asked for.
+    verification = verify_plan(construct, resolved, spec.circular)
+    for problem in verification["problems"]:
+        issues.append(Issue("error", "verification", problem))
+    if verification["passed"]:
+        issues.append(Issue("info", "verification", verification["summary"]))
+
     validation = summarize(issues)
 
     # Build the module list first; the swap planner works from it.
@@ -223,7 +232,8 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # The order the user specified, before DIO expansion inverts the payload.
     # A construct name should describe this, not the assembled DNA order.
     spec_order = [{"type": (m["type"] if isinstance(m, dict) else m.type),
-                   "name": (m["name"] if isinstance(m, dict) else m.name)}
+                   "name": (m["name"] if isinstance(m, dict) else m.name),
+                   "mode": (m.get("mode") if isinstance(m, dict) else m.mode)}
                   for m in spec.modules]
 
     plan = {
@@ -258,6 +268,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         } for f in fragments],
         "validation": validation,
         "vector": vector_info,
+        "verification": verification,
         "swap": analysis.to_dict() if analysis else None,
         "scheme": scheme,
         "closest_parents": [p.to_dict() for p in rank_parents(
