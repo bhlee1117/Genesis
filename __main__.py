@@ -1,0 +1,219 @@
+"""Genesis command line.
+
+    python3 -m genesis init                  write a config file
+    python3 -m genesis scan [--limit N]      index the shared DNA folder
+    python3 -m genesis stats                 what is in the inventory
+    python3 -m genesis find <term>           search plasmids
+    python3 -m genesis parts [--type CDS]    browse reusable parts
+    python3 -m genesis design spec.yaml      plan a construct
+    python3 -m genesis serve                 start the web interface
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from .config import Config
+from .construct import ConstructSpec
+from .db import connect
+from .design import design as run_design, save_design
+from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
+                     to_genbank)
+from .importer import import_tree
+
+CONFIG_PATH = Path("~/.genesis/config.json").expanduser()
+
+
+def _conn(cfg: Config, override: str | None = None):
+    return connect(override or cfg.resolved_db)
+
+
+def cmd_init(args, cfg: Config):
+    if args.root:
+        cfg.dna_root = args.root
+    cfg.save(CONFIG_PATH)
+    print(f"wrote {CONFIG_PATH}")
+    print(f"  dna_root : {cfg.dna_root}")
+    print(f"  database : {cfg.resolved_db}")
+    root = Path(cfg.dna_root)
+    print(f"  root reachable: {'yes' if root.exists() else 'NO - mount the share first'}")
+
+
+def cmd_scan(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    seen = {"n": 0}
+
+    def progress(st):
+        print(f"  {st.scanned:6d} files | {st.plasmids:5d} plasmids | "
+              f"{st.reads:5d} reads | {st.duplicates:4d} duplicates",
+              file=sys.stderr)
+
+    print(f"scanning {cfg.dna_root}", file=sys.stderr)
+    stats = import_tree(conn, cfg, limit=args.limit, progress=progress,
+                        motif_scan=not args.no_motifs)
+    d = stats.as_dict()
+    print(json.dumps(d, indent=2))
+    if d["errors"]:
+        print(f"\n{len(d['errors'])} file(s) could not be read; first few:",
+              file=sys.stderr)
+        for e in d["errors"][:5]:
+            print(f"  {e}", file=sys.stderr)
+
+
+def cmd_stats(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    q = lambda s: conn.execute(s).fetchall()
+    n = lambda s, *a: conn.execute(s, a).fetchone()[0]
+    print(f"files indexed   : {n('SELECT COUNT(*) FROM source_file')}")
+    print(f"  sequencing reads: "
+          f"{n('SELECT COUNT(*) FROM source_file WHERE role = ?', 'read')}")
+    print(f"plasmids        : {n('SELECT COUNT(*) FROM plasmid')}")
+    print(f"annotations     : {n('SELECT COUNT(*) FROM annotation')}")
+    print(f"reusable parts  : {n('SELECT COUNT(*) FROM part')}")
+    print(f"people          : {n('SELECT COUNT(DISTINCT owner) FROM plasmid')}")
+    print(f"designs saved   : {n('SELECT COUNT(*) FROM design')}")
+    print("\nparts by type:")
+    for r in q("""SELECT feature_type, COUNT(*) n FROM part
+                  GROUP BY 1 ORDER BY n DESC"""):
+        print(f"  {r['feature_type']:20s} {r['n']}")
+
+
+def cmd_find(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    term = f"%{args.term}%"
+    rows = conn.execute(
+        """SELECT p.id, p.name, p.owner, p.seq_length, p.circular, p.verified,
+                  (SELECT COUNT(*) FROM annotation a WHERE a.plasmid_id = p.id) nf
+           FROM plasmid p
+           WHERE p.name LIKE ? COLLATE NOCASE
+              OR EXISTS (SELECT 1 FROM annotation a WHERE a.plasmid_id = p.id
+                         AND a.name LIKE ? COLLATE NOCASE)
+           ORDER BY p.name LIMIT ?""", (term, term, args.limit)).fetchall()
+    if not rows:
+        print("no matches")
+        return
+    print(f"{'id':>5}  {'name':40s} {'owner':20s} {'bp':>7} {'feat':>5}  topology")
+    for r in rows:
+        print(f"{r['id']:>5}  {r['name'][:40]:40s} {(r['owner'] or '')[:20]:20s} "
+              f"{r['seq_length']:>7} {r['nf']:>5}  "
+              f"{'circular' if r['circular'] else 'linear'}")
+
+
+def cmd_parts(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    sql = """SELECT p.id, p.name, p.feature_type, p.seq_length,
+                    COUNT(o.id) n FROM part p
+             LEFT JOIN part_occurrence o ON o.part_id = p.id WHERE 1=1"""
+    a: list = []
+    if args.type:
+        sql += " AND p.feature_type = ?"
+        a.append(args.type)
+    if args.term:
+        sql += " AND p.name LIKE ? COLLATE NOCASE"
+        a.append(f"%{args.term}%")
+    sql += " GROUP BY p.id ORDER BY n DESC, p.name LIMIT ?"
+    a.append(args.limit)
+    rows = conn.execute(sql, a).fetchall()
+    print(f"{'id':>5}  {'type':18s} {'name':34s} {'bp':>6} {'sources':>8}")
+    for r in rows:
+        print(f"{r['id']:>5}  {r['feature_type']:18s} {r['name'][:34]:34s} "
+              f"{r['seq_length']:>6} {r['n']:>8}")
+
+
+def cmd_design(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    text = Path(args.spec).read_text()
+    spec = (ConstructSpec.from_dict(json.loads(text))
+            if args.spec.endswith(".json") else ConstructSpec.from_yaml(text))
+
+    plan = run_design(conn, spec, cfg)
+    v = plan["validation"]
+
+    if args.json:
+        print(json.dumps(plan, indent=2, default=str))
+        return
+
+    print(protocol_markdown(plan, cfg, args.route))
+
+    if args.primers:
+        Path(args.primers).write_text(primer_table_csv(plan, args.route))
+        print(f"\n<!-- primer table written to {args.primers} -->")
+    if args.genbank:
+        Path(args.genbank).write_text(to_genbank(plan))
+        print(f"<!-- GenBank written to {args.genbank} -->")
+    if args.pdf:
+        Path(args.pdf).write_bytes(protocol_pdf(plan, cfg, args.route))
+        print(f"<!-- PDF protocol written to {args.pdf} -->")
+    if args.save:
+        did = save_design(conn, spec, plan, cfg.design_visibility)
+        print(f"<!-- saved as design {did} -->")
+
+    if v["errors"]:
+        sys.exit(2)
+
+
+def cmd_serve(args, cfg: Config):
+    from .server import serve
+    if args.port:
+        cfg.port = args.port
+    if args.host:
+        cfg.host = args.host
+    serve(cfg, args.db)
+
+
+def main(argv=None):
+    cfg = Config.load(CONFIG_PATH)
+    p = argparse.ArgumentParser(
+        prog="genesis",
+        description="Genesis - shared cloning designer for the lab's plasmid inventory")
+    p.add_argument("--db", help="override the database path")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="write a configuration file")
+    s.add_argument("--root", help="path to the shared DNA folder")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("scan", help="index the shared DNA folder")
+    s.add_argument("--limit", type=int, help="stop after N files")
+    s.add_argument("--no-motifs", action="store_true",
+                   help="skip de-novo motif annotation (faster)")
+    s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("stats", help="summarise the inventory")
+    s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("find", help="search plasmids by name or feature")
+    s.add_argument("term")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_find)
+
+    s = sub.add_parser("parts", help="browse reusable parts")
+    s.add_argument("term", nargs="?", default="")
+    s.add_argument("--type", help="filter by feature type, e.g. CDS")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_parts)
+
+    s = sub.add_parser("design", help="plan a construct from a spec file")
+    s.add_argument("spec", help="YAML or JSON construct specification")
+    s.add_argument("--route", help="route id to detail (default: best ranked)")
+    s.add_argument("--json", action="store_true", help="emit the raw plan")
+    s.add_argument("--primers", help="also write a primer CSV here")
+    s.add_argument("--genbank", help="also write the construct GenBank here")
+    s.add_argument("--pdf", help="also write a printable PDF protocol here")
+    s.add_argument("--save", action="store_true", help="store this design")
+    s.set_defaults(fn=cmd_design)
+
+    s = sub.add_parser("serve", help="start the internal web interface")
+    s.add_argument("--port", type=int)
+    s.add_argument("--host")
+    s.set_defaults(fn=cmd_serve)
+
+    args = p.parse_args(argv)
+    return args.fn(args, cfg)
+
+
+if __name__ == "__main__":
+    main()
