@@ -169,9 +169,13 @@ origin and resistance outside. A lentiviral one needs LTRs, the packaging
 signal, RRE and cPPT instead. Set `vector:` in the specification to `AAV`,
 `lentiviral` or `plasmid` and Genesis will only accept a backbone of that
 family and will check the finished molecule against the full element list,
-reporting anything absent. Left blank, the family is inferred from the
-features the backbone actually carries, with ITR count outweighing whatever
-the file happens to be named. A plasmid showing both AAV and lentiviral
+reporting anything absent. Asking for a family that the backbone does not belong to reports the
+mismatch and names the evidence, rather than quietly leaving the construct
+without a backbone. Left blank, the family is inferred from the features the
+backbone actually carries, with ITR count outweighing whatever the file
+happens to be named. Only a real plasmid's name counts as evidence: the name
+someone types for the construct they intend to build is a wish, not an
+observation, so a construct called `LENTI-test` is not a lentivirus. A plasmid showing both AAV and lentiviral
 evidence is reported as a conflict rather than silently resolved.
 
 ### Fused coding sequences
@@ -321,7 +325,7 @@ genesis/
   vectors.py     AAV / lentiviral families and their element sets
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           143 tests, no lab share required
+tests/           149 tests, no lab share required
 ```
 
 ## Giving it to a labmate

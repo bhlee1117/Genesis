@@ -167,6 +167,118 @@ function errorBox(message) {
     h('strong', null, 'Request failed'), h('span', null, message));
 }
 
+/* ------------------------------------------------------------------ */
+/* Modal dialogs                                                       */
+/* ------------------------------------------------------------------ */
+
+/* One dialog at a time, built into #modal-host. Used for the two places
+ * where a stray click must not be enough on its own: naming a Save as…, and
+ * confirming a delete. Both are deliberately *not* window.confirm/prompt,
+ * because the text has to spell out exactly what is about to be lost and a
+ * failed save has to be able to re-ask without losing what was typed. */
+
+var openModal = null;   // { close } for the dialog currently on screen
+
+/**
+ * opts: { title, body (Node|[Node]), confirmLabel, danger, onConfirm(close),
+ *         focus (element to focus), confirmDisabled }
+ * onConfirm receives a `close` callback and may keep the dialog open (for
+ * instance to show a server error and let the user try again).
+ */
+function modal(opts) {
+  if (openModal) openModal.close();
+
+  var host = $('modal-host');
+  var errorLine = h('p', { class: 'modal-error', hidden: true });
+  var busy = false;
+
+  var confirmBtn = h('button', {
+    type: 'button',
+    class: opts.danger ? 'danger-solid' : 'primary',
+    onclick: function () { fire(); }
+  }, opts.confirmLabel || 'Confirm');
+
+  var cancelBtn = h('button', {
+    type: 'button', class: 'secondary', onclick: function () { close(); }
+  }, opts.cancelLabel || 'Cancel');
+
+  var card = h('div', {
+    class: 'modal-card', role: 'dialog', 'aria-modal': 'true',
+    'aria-label': opts.title || 'Confirm',
+    // A click inside must not reach the backdrop handler below.
+    onclick: function (e) { e.stopPropagation(); }
+  },
+    h('h3', { class: 'modal-title' }, opts.title || ''),
+    h('div', { class: 'modal-body' }, opts.body || null),
+    errorLine,
+    h('div', { class: 'modal-foot' }, cancelBtn, confirmBtn));
+
+  var backdrop = h('div', { class: 'modal-backdrop', onclick: function () { close(); } }, card);
+
+  var previous = document.activeElement;
+
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+    if (e.key !== 'Tab') return;
+    // Keep focus inside the dialog.
+    var focusable = card.querySelectorAll(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)');
+    if (!focusable.length) return;
+    var first = focusable[0];
+    var last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault(); last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault(); first.focus();
+    }
+  }
+
+  function close() {
+    if (openModal !== api_) return;
+    document.removeEventListener('keydown', onKey, true);
+    clear(host);
+    host.hidden = true;
+    openModal = null;
+    if (previous && previous.focus) previous.focus();
+  }
+
+  function setError(message) {
+    clear(errorLine);
+    errorLine.hidden = !message;
+    if (message) errorLine.appendChild(document.createTextNode(message));
+  }
+
+  function setBusy(on) {
+    busy = on;
+    confirmBtn.disabled = on;
+    cancelBtn.disabled = on;
+  }
+
+  function fire() {
+    if (busy || confirmBtn.disabled) return;
+    var result = opts.onConfirm ? opts.onConfirm(api_) : null;
+    if (result && typeof result.then === 'function') {
+      setBusy(true);
+      result.then(function () { setBusy(false); },
+                  function () { setBusy(false); });
+    }
+  }
+
+  var api_ = {
+    close: close, setError: setError, setBusy: setBusy,
+    confirmButton: confirmBtn, card: card
+  };
+
+  clear(host);
+  host.hidden = false;
+  host.appendChild(backdrop);
+  document.addEventListener('keydown', onKey, true);
+  openModal = api_;
+  (opts.focus || confirmBtn).focus();
+  if (opts.focus && opts.focus.select) opts.focus.select();
+  return api_;
+}
+
 /** POST a plan and save the returned attachment to disk. */
 async function downloadExport(kind, payload, fallbackName) {
   var res = await fetch('/api/export/' + kind, {
@@ -577,12 +689,17 @@ var state = {
   plan: null,
   spec: null,
   routeId: null,
-  appliedSuggestion: null   // suggested_name the user (or we) already accepted
+  appliedSuggestion: null,  // suggested_name the user (or we) already accepted
+  /* The saved design the plan on screen is tied to, if any: set when a design
+   * is loaded from the Designs tab and when a save returns a row. Overwrite
+   * is only possible while this is known, because the server replaces a
+   * version by id and there is nothing to replace without one. */
+  saved: null               // { design_id, construct_id, version, name }
 };
 
 /** A builder row. `part_id` pins an exact inventory part when one was picked. */
 function newModule(type) {
-  return { type: type, name: '', part_id: null };
+  return { type: type, name: '', part_id: null, form: 'all' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -781,13 +898,42 @@ var PART_CACHE = {};
 var COMBO_SEQ = 0;
 var COMBO_LIMIT = 50;      // rows shown; the endpoint itself caps at 300
 
-function fetchParts(type, query) {
-  var key = type + '\u0000' + query.toLowerCase();
+function fetchParts(type, query, form) {
+  var key = type + '\u0000' + query.toLowerCase() + '\u0000' + form;
   if (!PART_CACHE[key]) {
-    PART_CACHE[key] = api('/api/parts' + qs({ type: type, q: query }))
+    PART_CACHE[key] = api('/api/parts' + qs({ type: type, q: query, form: form }))
       .catch(function (err) { delete PART_CACHE[key]; throw err; });
   }
   return PART_CACHE[key];
+}
+
+var SEGMENT_CACHE = {};
+
+function fetchSegments(partId) {
+  if (!SEGMENT_CACHE[partId]) {
+    SEGMENT_CACHE[partId] = api('/api/part/' + partId + '/segments')
+      .catch(function (err) { delete SEGMENT_CACHE[partId]; throw err; });
+  }
+  return SEGMENT_CACHE[partId];
+}
+
+/**
+ * Split a generated segment name into its stem and its "[1 of 2]" suffix.
+ *
+ * The suffix is the whole point of the row — it says which protein of the
+ * fusion this is — so it is rendered as its own element that never wraps or
+ * truncates; the long stem is what gives way when the list is narrow.
+ */
+function splitSegmentName(name) {
+  var m = /^(.*?)\s*(\[\s*\d+\s+of\s+\d+\s*\])\s*$/.exec(String(name || ''));
+  return m ? { stem: m[1], suffix: m[2] } : { stem: String(name || ''), suffix: '' };
+}
+
+/** How a /api/parts row relates to a fusion: 'fusion', 'piece' or ''. */
+function partForm(row) {
+  if (Number(row.n_segments) > 0) return 'fusion';
+  if (row.derived_from) return 'piece';
+  return '';
 }
 
 /**
@@ -797,6 +943,11 @@ function fetchParts(type, query) {
  * reordered or removed (no index lookups). Choosing a row writes both the
  * name and `part_id`; typing by hand drops `part_id` again, because the text
  * no longer necessarily names that part.
+ *
+ * Many lab CDS annotations are fusions, and the inventory catalogues both the
+ * fusion and the proteins it splits into. Both are legitimate things to pin,
+ * so the list marks which is which, a fusion row can be opened to show its
+ * own proteins, and a `form` filter narrows the list to one or the other.
  */
 function partPicker(mod) {
   var listId = 'combo-list-' + (++COMBO_SEQ);
@@ -811,23 +962,46 @@ function partPicker(mod) {
   var node = h('div', { class: 'combo' }, input, list);
   var chip = h('span', { class: 'pin-chip', hidden: true });
 
-  var items = [];      // rows currently shown
+  var formSel = h('select', {
+    class: 'form-filter',
+    title: 'Show whole fusions, the individual proteins they split into, or both',
+    'aria-label': 'Part form filter',
+    onchange: function (e) {
+      mod.form = e.target.value;
+      refresh();
+      // Only re-open the list if the user is still in the text box; changing
+      // the filter must not pop a dropdown over whatever else is on screen.
+      if (document.activeElement === input && input.value.trim()) search();
+    }
+  },
+    h('option', { value: 'all' }, 'all forms'),
+    h('option', { value: 'whole' }, 'whole only'),
+    h('option', { value: 'split' }, 'pieces only'));
+  formSel.value = mod.form || 'all';
+
+  var items = [];      // rows currently shown; see rowFor() for the shape
   var active = -1;     // highlighted row, -1 for none
   var timer = null;
   var reqId = 0;
+  var view = 'parts';  // 'parts' | 'segments'
+  var segmentsOf = null;
 
   function renderChip() {
     clear(chip);
     if (!mod.part_id) { chip.hidden = true; return; }
     chip.hidden = false;
+    var extra = mod.pin_note ? ' ' + mod.pin_note : '';
     chip.appendChild(h('span', {
       class: 'pin-label',
       title: 'This module is pinned to inventory part ' + mod.part_id +
+             (mod.pin_note ? ' (' + mod.pin_note + ' of its fusion)' : '') +
              '. The server will use exactly this part instead of guessing.'
-    }, 'pinned #' + mod.part_id));
+    }, 'pinned #' + mod.part_id + extra));
     chip.appendChild(h('button', {
       type: 'button', class: 'pin-clear', title: 'Unpin — match this name loosely again',
-      onclick: function () { mod.part_id = null; renderChip(); input.focus(); }
+      onclick: function () {
+        mod.part_id = null; mod.pin_note = ''; renderChip(); input.focus();
+      }
     }, '×'));
   }
 
@@ -836,6 +1010,8 @@ function partPicker(mod) {
     input.setAttribute('aria-expanded', 'false');
     input.removeAttribute('aria-activedescendant');
     active = -1;
+    view = 'parts';
+    segmentsOf = null;
   }
 
   function paint() {
@@ -854,11 +1030,14 @@ function partPicker(mod) {
     }
   }
 
+  /** Pin one row — a whole part, a fusion, or one segment of a fusion. */
   function choose(i) {
     var row = items[i];
     if (!row) return;
+    if (row.kind === 'back') { showParts(); return; }
     mod.name = row.name || '';
     mod.part_id = row.id;
+    mod.pin_note = row.note || '';
     input.value = mod.name;
     renderChip();
     close();
@@ -871,35 +1050,155 @@ function partPicker(mod) {
     input.setAttribute('aria-expanded', 'true');
   }
 
-  function draw(rows, query) {
-    items = rows;
-    active = -1;
-    if (!rows.length) {
-      show(h('div', { class: 'combo-empty muted' },
-        'No ' + mod.type + ' part matching “' + query + '”'));
-      return;
-    }
+  /** Render `items` into the dropdown. Each item supplies its own cells. */
+  function paintList() {
     clear(list);
-    rows.forEach(function (r, i) {
-      var n = Number(r.n_sources || 0);
-      list.appendChild(h('div', {
-        class: 'combo-item', role: 'option', id: listId + '-' + i,
-        'aria-selected': 'false',
+    items.forEach(function (r, i) {
+      var el = h('div', {
+        class: 'combo-item' + (r.kind === 'back' ? ' combo-back' : '') +
+               (r.kind === 'segment' ? ' combo-segment' : ''),
+        role: 'option', id: listId + '-' + i, 'aria-selected': 'false',
         // mousedown fires before blur, and preventDefault keeps focus in the
         // input, so the click always lands on a list that is still open.
         onmousedown: function (e) { e.preventDefault(); choose(i); },
         onmousemove: function () { if (active !== i) { active = i; paint(); } }
-      },
-        h('span', { class: 'combo-name' }, r.name || '(unnamed)'),
-        h('span', { class: 'combo-len mono' }, bp(r.seq_length)),
-        h('span', {
-          class: 'combo-sources' + (n ? '' : ' zero'),
-          title: n + ' plasmid' + (n === 1 ? '' : 's') + ' in the inventory carry this part'
-        }, n + ' src')));
+      }, r.cells());
+      list.appendChild(el);
     });
     list.scrollTop = 0;
     list.hidden = false;
     input.setAttribute('aria-expanded', 'true');
+  }
+
+  function segBadge(kind, text, title) {
+    return h('span', { class: 'seg-badge seg-badge-' + kind, title: title }, text);
+  }
+
+  function nameCell(name) {
+    var parts = splitSegmentName(name);
+    return h('span', { class: 'combo-name' },
+      h('span', { class: 'combo-stem' }, parts.stem || '(unnamed)'),
+      parts.suffix
+        ? h('span', {
+            class: 'seg-suffix',
+            title: 'this is one protein of a fusion CDS'
+          }, parts.suffix)
+        : null);
+  }
+
+  function sourcesCell(n) {
+    n = Number(n || 0);
+    return h('span', {
+      class: 'combo-sources' + (n ? '' : ' zero'),
+      title: n + ' plasmid' + (n === 1 ? '' : 's') + ' in the inventory carry this part'
+    }, n + ' src');
+  }
+
+  /** One /api/parts row. */
+  function rowFor(r) {
+    var form = partForm(r);
+    return {
+      kind: 'part', id: r.id, name: r.name || '', source: r,
+      note: form === 'piece'
+        ? '[' + r.segment_index + ' of ' + r.segment_of + ']' : '',
+      cells: function () {
+        return [
+          nameCell(r.name),
+          form === 'fusion'
+            ? segBadge('fusion', 'fusion · ' + r.n_segments,
+                'a fusion CDS catalogued as ' + r.n_segments +
+                ' separate proteins — open it to pin one of them')
+            : null,
+          form === 'piece'
+            ? segBadge('piece',
+                'piece ' + r.segment_index + ' of ' + r.segment_of,
+                'protein ' + r.segment_index + ' of ' + r.segment_of +
+                ' of a fusion CDS')
+            : null,
+          h('span', { class: 'combo-len mono' }, bp(r.seq_length)),
+          sourcesCell(r.n_sources),
+          form === 'fusion'
+            ? h('button', {
+                type: 'button', class: 'seg-open',
+                title: 'Show the ' + r.n_segments + ' proteins this fusion splits into',
+                tabindex: '-1',
+                onmousedown: function (e) {
+                  e.preventDefault(); e.stopPropagation(); showSegments(r);
+                }
+              }, 'split ▸')
+            : null
+        ];
+      }
+    };
+  }
+
+  function showParts() {
+    view = 'parts';
+    segmentsOf = null;
+    search();
+  }
+
+  /** Swap the dropdown for the proteins `fusion` splits into. */
+  function showSegments(fusion) {
+    var mine = ++reqId;
+    view = 'segments';
+    segmentsOf = fusion;
+    show(h('div', { class: 'combo-empty muted' }, 'Loading the parts of this fusion…'));
+    fetchSegments(fusion.id).then(function (data) {
+      if (mine !== reqId) return;
+      var whole = data.whole || {};
+      var segs = data.segments || [];
+      items = [{
+        kind: 'back', cells: function () {
+          return [h('span', { class: 'combo-name' }, '◂ back to the search results')];
+        }
+      }, {
+        kind: 'part', id: whole.id, name: whole.name || '', note: '',
+        cells: function () {
+          return [nameCell(whole.name),
+            segBadge('fusion', 'whole fusion', 'pin the fusion as one part'),
+            h('span', { class: 'combo-len mono' }, bp(whole.seq_length))];
+        }
+      }].concat(segs.map(function (s) {
+        return {
+          kind: 'segment', id: s.id, name: s.name || '',
+          note: '[' + s.segment_index + ' of ' + s.segment_of + ']',
+          cells: function () {
+            return [nameCell(s.name),
+              segBadge('piece', 'piece ' + s.segment_index + ' of ' + s.segment_of,
+                'pin only this protein'),
+              h('span', { class: 'combo-len mono' }, bp(s.seq_length))];
+          }
+        };
+      }));
+      active = segs.length ? 2 : 1;
+      paintList();
+      if ((data.separators || []).length) {
+        list.appendChild(h('div', { class: 'combo-foot muted' },
+          'split at ' + data.separators.map(function (s) {
+            return (s.name || s.feature_type || '?');
+          }).join(', ')));
+      }
+      paint();
+    }).catch(function (err) {
+      if (mine !== reqId) return;
+      items = [];
+      show(h('div', { class: 'combo-empty inline-warn' },
+        'could not load the parts of this fusion: ' + err.message));
+    });
+  }
+
+  function draw(rows, query) {
+    items = rows.map(rowFor);
+    active = -1;
+    if (!rows.length) {
+      var filter = (mod.form === 'whole') ? ' whole' :
+        (mod.form === 'split' ? ' fusion-piece' : '');
+      show(h('div', { class: 'combo-empty muted' },
+        'No' + filter + ' ' + mod.type + ' part matching “' + query + '”'));
+      return;
+    }
+    paintList();
   }
 
   function search() {
@@ -907,7 +1206,10 @@ function partPicker(mod) {
     if (query.length < 1) { items = []; close(); return; }
     var mine = ++reqId;
     var type = mod.type;
-    fetchParts(type, query).then(function (rows) {
+    var form = mod.form || 'all';
+    view = 'parts';
+    segmentsOf = null;
+    fetchParts(type, query, form).then(function (rows) {
       // Ignore a slow response that a later keystroke or type change replaced.
       if (mine !== reqId || type !== mod.type) return;
       draw(rows.slice(0, COMBO_LIMIT), query);
@@ -923,9 +1225,16 @@ function partPicker(mod) {
     timer = setTimeout(search, 180);
   }
 
+  function refresh() {
+    if (timer) clearTimeout(timer);
+    reqId++;
+    items = [];
+    close();
+  }
+
   input.addEventListener('input', function () {
     mod.name = input.value;
-    if (mod.part_id) { mod.part_id = null; renderChip(); }
+    if (mod.part_id) { mod.part_id = null; mod.pin_note = ''; renderChip(); }
     schedule();
   });
   input.addEventListener('focus', function () {
@@ -942,9 +1251,25 @@ function partPicker(mod) {
       if (list.hidden || !items.length) return;
       active = (active <= 0 ? items.length : active) - 1;
       paint();
+    } else if (e.key === 'ArrowRight') {
+      // Only hijack → when the caret is already at the end of the text, so
+      // it still moves the cursor while the user is editing.
+      if (list.hidden || view !== 'parts' || active < 0) return;
+      if (input.selectionStart !== input.value.length) return;
+      var row = items[active];
+      if (!row || row.kind !== 'part') return;
+      var source = row.source;
+      if (!source || !(Number(source.n_segments) > 0)) return;
+      e.preventDefault();
+      showSegments(source);
+    } else if (e.key === 'ArrowLeft') {
+      if (!list.hidden && view === 'segments') { e.preventDefault(); showParts(); }
     } else if (e.key === 'Enter') {
       if (!list.hidden && active >= 0) { e.preventDefault(); choose(active); }
     } else if (e.key === 'Escape') {
+      if (!list.hidden && view === 'segments') {
+        e.preventDefault(); e.stopPropagation(); showParts(); return;
+      }
       if (!list.hidden) { e.preventDefault(); e.stopPropagation(); close(); }
     }
   });
@@ -953,13 +1278,11 @@ function partPicker(mod) {
   return {
     node: node,
     chip: chip,
+    formFilter: formSel,
     // The feature_type select owns the `type` filter: when it changes the old
     // suggestions are for the wrong table slice and must be thrown away.
     refresh: function () {
-      if (timer) clearTimeout(timer);
-      reqId++;
-      items = [];
-      close();
+      refresh();
       if (document.activeElement === input && input.value.trim()) search();
     }
   };
@@ -985,6 +1308,7 @@ function renderModules() {
       h('span', { class: 'module-index' }, String(i + 1)),
       typeSel,
       picker.node,
+      picker.formFilter,
       picker.chip,
       h('div', { class: 'row-buttons' },
         h('button', {
@@ -1023,6 +1347,8 @@ function collectSpec() {
     name: $('spec-name').value.trim() || 'untitled',
     owner: $('spec-owner').value.trim(),
     circular: $('spec-circular').checked,
+    // "" means Auto: the server infers the family from the backbone.
+    vector: $('spec-vector').value,
     modules: state.modules.map(function (m) {
       var out = { type: m.type, name: (m.name || '').trim() };
       // Only send a pin when the row actually carries one; an absent part_id
@@ -1035,6 +1361,89 @@ function collectSpec() {
   if (/^\d+$/.test(backbone)) spec.backbone_plasmid_id = parseInt(backbone, 10);
   else spec.backbone = backbone;
   return spec;
+}
+
+/** Fill the builder from a stored spec, so a loaded design can be edited. */
+function applySpecToBuilder(spec) {
+  if (!spec || typeof spec !== 'object') return false;
+  $('spec-name').value = spec.name || '';
+  $('spec-backbone').value = spec.backbone_plasmid_id
+    ? String(spec.backbone_plasmid_id) : (spec.backbone || '');
+  $('spec-owner').value = spec.owner || '';
+  $('spec-circular').checked = spec.circular !== false;
+  // Designs saved before the vector field existed have no `vector` key; those
+  // fall back to Auto, which is what they were planned with.
+  var vec = $('spec-vector');
+  var wanted = spec.vector || '';
+  vec.value = Array.prototype.some.call(vec.options, function (o) {
+    return o.value === wanted;
+  }) ? wanted : '';
+  state.modules = (spec.modules || []).map(function (m) {
+    return {
+      type: m.type || 'unknown',
+      name: m.name || '',
+      part_id: m.part_id || null,
+      pin_note: '',
+      form: 'all'
+    };
+  });
+  if (!state.modules.length) state.modules = [newModule('promoter')];
+  // The builder is the only view that can show a parsed spec.
+  var builderRadio = document.querySelector('input[name="spec-mode"][value="builder"]');
+  if (builderRadio && !builderRadio.checked) {
+    builderRadio.checked = true;
+    $('builder-pane').hidden = false;
+    $('yaml-pane').hidden = true;
+  }
+  renderModules();
+  return true;
+}
+
+/**
+ * Enable/disable the three save buttons and describe what they would do.
+ *
+ * Overwrite needs a design_id — the server replaces a stored version by id —
+ * so it stays disabled, with a tooltip saying why, until the plan on screen
+ * is tied to a saved design (loaded from the Designs tab, or just saved).
+ */
+function refreshSaveButtons() {
+  var version = $('save-version');
+  var overwrite = $('save-overwrite');
+  var saveAs = $('save-as');
+  var link = $('save-link');
+
+  var hasPlan = !!(state.plan && state.spec);
+  version.disabled = !hasPlan;
+  saveAs.disabled = !hasPlan;
+
+  if (!hasPlan) {
+    var why = state.plan
+      ? 'This plan was loaded without its specification, so there is nothing to re-save. Generate a plan first.'
+      : 'Generate a plan first.';
+    version.title = why;
+    saveAs.title = why;
+  } else {
+    version.title = 'Save a new version under this construct name';
+    saveAs.title = 'Store this plan under a different construct name, leaving the original alone';
+  }
+
+  var saved = state.saved;
+  overwrite.disabled = !(hasPlan && saved && saved.design_id);
+  overwrite.title = overwrite.disabled
+    ? (hasPlan
+        ? 'Overwrite replaces a stored version in place, so it needs a saved ' +
+          'design to replace. This plan has not been saved yet and was not ' +
+          'loaded from the Designs tab — use Save, which adds version 1.'
+        : 'Generate a plan first.')
+    : 'Replace version ' + saved.version + ' of “' + saved.name +
+      '” (design #' + saved.design_id + ') in place, without adding a version';
+
+  clear(link);
+  if (hasPlan && saved && saved.design_id) {
+    link.appendChild(document.createTextNode(
+      'Linked to design #' + saved.design_id + ' — version ' + saved.version +
+      ' of “' + saved.name + '”. Overwrite replaces that version; Save adds a new one.'));
+  }
 }
 
 async function generatePlan() {
@@ -1051,7 +1460,9 @@ async function generatePlan() {
     state.plan = plan;
     state.appliedSuggestion = null;   // a fresh plan may suggest a new name
     state.routeId = (plan.routes && plan.routes.length) ? plan.routes[0].id : null;
-    $('save-design').disabled = false;
+    // `state.saved` is deliberately kept: regenerating after loading design #5
+    // is exactly the case Overwrite exists for.
+    refreshSaveButtons();
     renderPlan();
     setStatus(status, 'plan ready', 'ok');
   } catch (err) {
@@ -1061,21 +1472,138 @@ async function generatePlan() {
   }
 }
 
-async function saveDesign() {
+/** Name of the construct this plan would be saved under. */
+function specName(spec) {
+  if (typeof spec === 'string') {
+    var m = /^\s*name:\s*(.+)$/m.exec(spec);
+    return m ? m[1].trim().replace(/^["']|["']$/g, '') : 'untitled';
+  }
+  return (spec && spec.name) || 'untitled';
+}
+
+/** Return a copy of the spec with a different construct name. */
+function specWithName(spec, name) {
+  if (typeof spec === 'string') {
+    return /^\s*name:/m.test(spec)
+      ? spec.replace(/^\s*name:.*$/m, 'name: ' + name)
+      : 'name: ' + name + '\n' + spec;
+  }
+  var copy = {};
+  Object.keys(spec).forEach(function (k) { copy[k] = spec[k]; });
+  copy.name = name;
+  return copy;
+}
+
+/**
+ * POST /api/save. `mode` is version | overwrite | save_as.
+ *
+ * Throws on failure so callers that need to react (Save as… re-asking after a
+ * 409) can, rather than only seeing a status line.
+ */
+async function postSave(spec, mode) {
+  var payload = { spec: spec, plan: state.plan, mode: mode };
+  if (mode === 'overwrite') payload.design_id = state.saved.design_id;
+  var res = await postJSON('/api/save', payload);
+  state.spec = spec;
+  state.saved = {
+    design_id: res.design_id,
+    construct_id: res.construct_id,
+    version: res.version,
+    name: specName(spec)
+  };
+  refreshSaveButtons();
+  loadStats();   // the design count in the header is now stale
+  if (LOADED.designs) renderDesigns();
+  return res;
+}
+
+function savedMessage(res, name) {
+  if (res.mode === 'overwrite') {
+    return 'overwrote version ' + res.version + ' of “' + name +
+           '” (design #' + res.design_id + ')';
+  }
+  return 'saved version ' + res.version + ' of “' + name +
+         '” (design #' + res.design_id + ')';
+}
+
+async function saveDesign(mode) {
   var status = $('design-status');
   if (!state.plan) { setStatus(status, 'generate a plan first', 'error'); return; }
   if (!state.spec) {
-    setStatus(status, 'this plan was loaded from storage; regenerate to save a new version', 'error');
+    setStatus(status,
+      'this plan was loaded without its specification; regenerate it to save',
+      'error');
     return;
   }
-  setStatus(status, 'saving…', 'busy');
+  if (mode === 'overwrite' && !(state.saved && state.saved.design_id)) {
+    setStatus(status, 'there is no saved design to overwrite', 'error');
+    return;
+  }
+  setStatus(status, mode === 'overwrite' ? 'overwriting…' : 'saving…', 'busy');
   try {
-    var res = await postJSON('/api/save', { spec: state.spec, plan: state.plan });
-    setStatus(status, 'saved as design ' + res.design_id, 'ok');
-    loadStats();   // the design count in the header is now stale
+    var res = await postSave(state.spec, mode);
+    setStatus(status, savedMessage(res, specName(state.spec)), 'ok');
   } catch (err) {
     setStatus(status, 'save failed: ' + err.message, 'error');
   }
+}
+
+/**
+ * Save as…: ask for a name, and keep asking if the server rejects it.
+ *
+ * The server answers 409 when the name is taken, which is the whole reason
+ * this dialog stays open on failure: the message names the clash and the
+ * typed name is still there to edit.
+ */
+function saveAsDesign() {
+  var status = $('design-status');
+  if (!state.plan || !state.spec) {
+    setStatus(status, 'generate a plan first', 'error');
+    return;
+  }
+  var current = specName(state.spec);
+  var field = h('input', {
+    type: 'text', class: 'modal-input', value: current + ' copy',
+    spellcheck: 'false', autocomplete: 'off', 'aria-label': 'New construct name'
+  });
+
+  var dlg = modal({
+    title: 'Save as a new construct',
+    confirmLabel: 'Save as',
+    focus: field,
+    body: [
+      h('p', null,
+        'Store this plan under a new construct name as version 1. ' +
+        '“' + current + '” is left untouched.'),
+      field,
+      h('p', { class: 'muted small' },
+        'The name has to be free — the server refuses to merge into an ' +
+        'existing construct’s history.')
+    ],
+    onConfirm: function (api_) {
+      var name = field.value.trim();
+      if (!name) { api_.setError('Give the new construct a name.'); field.focus(); return; }
+      api_.setError('');
+      setStatus(status, 'saving as “' + name + '”…', 'busy');
+      return postSave(specWithName(state.spec, name), 'save_as').then(function (res) {
+        // Reflect the new name in the builder, since that is what is now on
+        // screen and what a following Save/Overwrite would act on.
+        if (!usingYaml()) $('spec-name').value = name;
+        api_.close();
+        setStatus(status, savedMessage(res, name), 'ok');
+      }, function (err) {
+        // 409 and anything else: stay open, say why, let them pick again.
+        api_.setError(err.message);
+        setStatus(status, 'save as failed', 'error');
+        field.focus();
+        field.select();
+      });
+    }
+  });
+
+  field.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); dlg.confirmButton.click(); }
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1173,6 +1701,9 @@ function renderPlan() {
   }
   out.appendChild(summary);
 
+  /* --- vector family ----------------------------------------------- */
+  if (plan.vector) out.appendChild(renderVector(plan.vector, plan));
+
   /* --- validation -------------------------------------------------- */
   out.appendChild(renderValidation(plan.validation || {}));
 
@@ -1185,6 +1716,135 @@ function renderPlan() {
 
   /* --- export ------------------------------------------------------ */
   out.appendChild(renderExports());
+}
+
+/* ------------------------------------------------------------------ */
+/* Plan: vector family                                                 */
+/* ------------------------------------------------------------------ */
+
+var VECTOR_LABELS = {
+  AAV: 'AAV', lentiviral: 'lentiviral', plasmid: 'plain plasmid'
+};
+
+function vectorLabel(key) { return VECTOR_LABELS[key] || key || 'unknown'; }
+
+/**
+ * One line of detection evidence.
+ *
+ * The server reports a name match as the regular expression it matched
+ * (`the name matches '\bpAAV'`). The pattern is still the honest answer, so
+ * it is shown rather than reworded — but set in monospace, so a lab reader
+ * sees at a glance that the backslashes belong to a pattern and not to the
+ * plasmid's name.
+ */
+function evidenceText(line) {
+  var m = /^(.*?)('[^']*')(.*)$/.exec(String(line));
+  if (!m) return String(line);
+  return h('span', null, m[1], h('span', { class: 'mono' }, m[2]), m[3]);
+}
+
+/** A row of element names, e.g. the required features that are absent. */
+function elementChips(names, kind) {
+  return h('span', { class: 'elements' }, (names || []).map(function (n) {
+    return h('span', { class: 'element element-' + kind }, n);
+  }));
+}
+
+/**
+ * What family this construct is, why, and whether it carries the full set.
+ *
+ * The validation panel already spells out each missing element as a
+ * `packaging` issue, so this is deliberately a summary: the family, the
+ * evidence behind it, and the element names grouped by severity. A conflict
+ * between AAV and lentiviral evidence is shown first and loudest, because it
+ * means the family underneath everything else may be wrong.
+ */
+function renderVector(vector, plan) {
+  var done = vector.completeness || {};
+  var spec = vector.spec || {};
+  var complete = !!done.complete;
+  var missingRequired = (done.missing_required || []).concat(done.missing_named || []);
+  var missingExpected = done.missing_expected || [];
+
+  var card = h('div', {
+    class: 'card vector' + (vector.warning ? ' has-conflict' :
+      (complete ? ' is-complete' : (missingRequired.length ? ' has-gaps' : '')))
+  },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'Vector family'),
+      h('span', { class: 'muted small' },
+        vector.requested
+          ? 'requested: ' + vectorLabel(vector.requested)
+          : 'family inferred from the backbone')));
+
+  if (vector.warning) {
+    card.appendChild(h('div', { class: 'conflict' },
+      h('strong', null, 'Conflicting vector evidence'),
+      h('span', null, vector.warning)));
+  }
+
+  card.appendChild(h('dl', { class: 'vector-facts' },
+    statPair('checked as', spec.label || vectorLabel(vector.family)),
+    statPair('detected', vectorLabel(vector.detected)),
+    vector.requested && vector.requested !== vector.detected
+      ? statPair('mismatch',
+          'you asked for ' + vectorLabel(vector.requested) +
+          ', the molecule looks like ' + vectorLabel(vector.detected))
+      : null));
+
+  var evidence = vector.detected_evidence || [];
+  card.appendChild(h('p', { class: 'vector-evidence' + (evidence.length ? '' : ' muted') },
+    h('span', { class: 'muted small' }, 'evidence: '),
+    evidence.length
+      ? evidence.map(function (e, i) {
+          return [i ? ' · ' : null, evidenceText(e)];
+        })
+      : 'none — nothing in the backbone name or the annotations names a viral family'));
+
+  // A requested family filters the backbone search, so asking for AAV and
+  // naming a lentiviral backbone leaves the design with no backbone at all.
+  if (vector.requested && !plan.backbone) {
+    card.appendChild(h('p', { class: 'vector-note inline-warn' },
+      'No backbone was loaded: when a vector family is requested, only a ' +
+      'backbone of that family is accepted. Give a plasmid id to use one ' +
+      'anyway, or set Vector to Auto.'));
+  }
+
+  if (complete) {
+    card.appendChild(h('p', { class: 'vector-verdict ok' },
+      h('span', { class: 'pill pill-ok' }, 'complete'),
+      'This construct carries the full ' +
+      (spec.label || vectorLabel(vector.family)) + ' element set.'));
+  } else {
+    card.appendChild(h('p', { class: 'vector-verdict' },
+      h('span', { class: 'pill pill-' + (missingRequired.length ? 'bad' : 'warn') },
+        'incomplete'),
+      'Some of the ' + (spec.label || vectorLabel(vector.family)) +
+      ' element set is absent; each one is listed under ' +
+      'packaging in Validation below.'));
+    if (missingRequired.length) {
+      card.appendChild(h('div', { class: 'vector-missing' },
+        h('span', { class: 'lvl lvl-error' },
+          plural(missingRequired.length, 'required element') + ' missing'),
+        elementChips(missingRequired, 'required')));
+    }
+    if (missingExpected.length) {
+      card.appendChild(h('div', { class: 'vector-missing' },
+        h('span', { class: 'lvl lvl-warning' },
+          plural(missingExpected.length, 'expected element') + ' missing'),
+        elementChips(missingExpected, 'expected')));
+    }
+  }
+
+  card.appendChild(h('details', { class: 'vector-set' },
+    h('summary', null, 'The full ' + (spec.label || vectorLabel(vector.family)) +
+      ' element set'),
+    h('dl', { class: 'vector-facts' },
+      statPair('required', (spec.required || []).join(', ') || '—'),
+      statPair('expected', (spec.expected || []).join(', ') || '—')),
+    spec.note ? h('p', { class: 'muted small' }, spec.note) : null));
+
+  return card;
 }
 
 function selectedRoute() {
@@ -1401,6 +2061,22 @@ function renderExports() {
 /* Tab 4: Designs                                                      */
 /* ------------------------------------------------------------------ */
 
+/* The listing is capped at 100 rows server-side, so a version count taken
+ * from it is a count of what is listed. At the cap the confirmation says
+ * "at least", because an irreversible action must not overstate what it
+ * knows. */
+var DESIGNS_LIMIT = 100;
+
+/** Group the listing by construct: { construct_id: [rows, newest first] }. */
+function groupByConstruct(rows) {
+  var by = {};
+  rows.forEach(function (r) {
+    var key = String(r.construct_id);
+    (by[key] = by[key] || []).push(r);
+  });
+  return by;
+}
+
 async function renderDesigns() {
   var out = $('designs-table');
   var status = $('designs-status');
@@ -1409,13 +2085,37 @@ async function renderDesigns() {
   out.appendChild(h('p', { class: 'muted' }, 'Loading saved designs…'));
   try {
     var rows = await api('/api/designs');
+    var by = groupByConstruct(rows);
+    var capped = rows.length >= DESIGNS_LIMIT;
     clear(out);
     out.appendChild(table([
       { label: 'Design', numeric: true, key: 'id' },
       { label: 'Construct', key: 'name' },
       { label: 'Version', numeric: true, key: 'version' },
       { label: 'Owner', key: 'owner' },
-      { label: 'Created', key: 'created_at' }
+      { label: 'Created', key: 'created_at' },
+      {
+        label: 'Delete',
+        cell: function (r) {
+          var siblings = by[String(r.construct_id)] || [r];
+          return h('span', {
+            class: 'row-delete',
+            // The row itself opens the design; the controls must not.
+            onclick: function (e) { e.stopPropagation(); }
+          },
+            h('button', {
+              type: 'button', class: 'danger',
+              title: 'Delete version ' + r.version + ' of “' + r.name + '”',
+              onclick: function () { confirmDeleteDesign(r, siblings, capped); }
+            }, 'version'),
+            h('button', {
+              type: 'button', class: 'danger',
+              title: 'Delete “' + r.name + '” and every version of it',
+              onclick: function () { confirmDeleteConstruct(r, siblings, capped); }
+            }, 'construct' + (siblings.length > 1
+              ? ' (' + siblings.length + ')' : '')));
+        }
+      }
     ], rows, { onRow: function (r) { openDesign(r.id); } }));
     setStatus(status, plural(rows.length, 'design'));
   } catch (err) {
@@ -1425,6 +2125,111 @@ async function renderDesigns() {
   }
 }
 
+/** "versions 1, 2 and 3" — the exact list, so nothing is deleted vaguely. */
+function versionList(rows) {
+  var vs = rows.map(function (r) { return r.version; })
+    .sort(function (a, b) { return a - b; });
+  if (vs.length === 1) return 'version ' + vs[0];
+  return 'versions ' + vs.slice(0, -1).join(', ') + ' and ' + vs[vs.length - 1];
+}
+
+/** Run a delete and refresh everything the deleted rows could be showing. */
+async function runDelete(payload) {
+  var result = await postJSON('/api/delete-design', payload);
+  // A plan on screen that pointed at a deleted design is no longer saved.
+  if (state.saved) {
+    var gone = (payload.design_id && state.saved.design_id === payload.design_id) ||
+      (payload.construct_id && state.saved.construct_id === payload.construct_id);
+    if (gone) { state.saved = null; refreshSaveButtons(); }
+  }
+  loadStats();
+  // Awaited, so the caller's "deleted …" line is written after the reload's
+  // own "N designs" status rather than being overwritten by it.
+  await renderDesigns();
+  return result;
+}
+
+function confirmDeleteDesign(row, siblings, capped) {
+  var status = $('designs-status');
+  var last = siblings.length <= 1;
+  var others = siblings.length - 1;
+
+  modal({
+    title: 'Delete one version',
+    danger: true,
+    confirmLabel: 'Delete version ' + row.version,
+    body: [
+      h('p', null,
+        'This permanently deletes ',
+        h('b', null, 'version ' + row.version + ' of “' + row.name + '”'),
+        ' (design #' + row.id + ') and any experimental outcomes recorded ' +
+        'against it.'),
+      h('p', { class: last ? 'modal-stress' : '' }, last
+        ? 'It is the only version, so the construct “' + row.name +
+          '” is removed along with it.'
+        : (capped
+            ? 'At least ' + plural(others, 'other version') +
+              ' of “' + row.name + '” remain' + (others === 1 ? 's' : '') + '.'
+            : plural(others, 'other version') + ' of “' + row.name +
+              '” remain' + (others === 1 ? 's' : '') + ': ' +
+              versionList(siblings.filter(function (s) { return s.id !== row.id; })) + '.')),
+      h('p', { class: 'modal-stress' }, 'This cannot be undone.')
+    ],
+    onConfirm: function (api_) {
+      setStatus(status, 'deleting design ' + row.id + '…', 'busy');
+      return runDelete({ design_id: row.id }).then(function (res) {
+        api_.close();
+        setStatus(status,
+          'deleted version ' + res.version + ' of “' + res.name + '”' +
+          (res.versions_left
+            ? ' (' + plural(res.versions_left, 'version') + ' left)'
+            : ' (the construct is gone too)'), 'ok');
+      }, function (err) {
+        api_.setError(err.message);
+        setStatus(status, 'delete failed', 'error');
+      });
+    }
+  });
+}
+
+function confirmDeleteConstruct(row, siblings, capped) {
+  var status = $('designs-status');
+  var n = siblings.length;
+
+  modal({
+    title: 'Delete a whole construct',
+    danger: true,
+    confirmLabel: 'Delete “' + row.name + '” and ' +
+      (capped ? 'every version' : plural(n, 'version')),
+    body: [
+      h('p', null,
+        'This permanently deletes the construct ',
+        h('b', null, '“' + row.name + '”'),
+        ' and ',
+        h('b', null, capped
+          ? 'every version of it (at least ' + n + ' listed here)'
+          : 'all ' + plural(n, 'version') + ' of it'),
+        ', together with any experimental outcomes recorded against them.'),
+      capped ? null : h('p', null,
+        'Going: ' + versionList(siblings) + ' — design' + (n === 1 ? ' ' : 's ') +
+        siblings.map(function (s) { return '#' + s.id; }).join(', ') + '.'),
+      h('p', { class: 'modal-stress' }, 'This cannot be undone.')
+    ],
+    onConfirm: function (api_) {
+      setStatus(status, 'deleting construct ' + row.construct_id + '…', 'busy');
+      return runDelete({ construct_id: row.construct_id }).then(function (res) {
+        api_.close();
+        setStatus(status,
+          'deleted “' + res.name + '” and ' +
+          plural(res.versions_deleted, 'version'), 'ok');
+      }, function (err) {
+        api_.setError(err.message);
+        setStatus(status, 'delete failed', 'error');
+      });
+    }
+  });
+}
+
 async function openDesign(id) {
   var status = $('designs-status');
   setStatus(status, 'loading design ' + id + '…', 'busy');
@@ -1432,16 +2237,26 @@ async function openDesign(id) {
     var d = await api('/api/design/' + id);
     state.plan = d.plan;
     state.appliedSuggestion = null;
-    // The stored row carries the plan, not the spec, so saving a new version
-    // from here would be ambiguous; disable it until a plan is regenerated.
-    state.spec = null;
+    // The stored row carries the spec as well as the plan, so the design can
+    // be edited, re-saved as a new version, or overwritten in place.
+    state.spec = d.spec || null;
+    state.saved = {
+      design_id: d.id,
+      construct_id: d.construct_id,
+      version: d.version,
+      name: d.construct_name || specName(d.spec || {})
+    };
     state.routeId = (d.plan && d.plan.routes && d.plan.routes.length)
       ? d.plan.routes[0].id : null;
-    $('save-design').disabled = true;
+    var filled = applySpecToBuilder(d.spec);
+    refreshSaveButtons();
     selectTab('design');
     renderPlan();
     setStatus($('design-status'),
-      'loaded design ' + d.id + ' (version ' + d.version + ')', 'ok');
+      'loaded design ' + d.id + ' (version ' + d.version + ' of “' +
+      state.saved.name + '”)' +
+      (filled ? '' : ' — no stored specification, so it cannot be re-saved'),
+      filled ? 'ok' : 'error');
     setStatus(status, '');
   } catch (err) {
     setStatus(status, 'failed: ' + err.message, 'error');
@@ -1467,7 +2282,7 @@ function selectTab(name) {
   // Each list tab loads once on first view; the buttons reload on demand.
   if (name === 'inventory' && !LOADED.inventory) { LOADED.inventory = true; renderInventory(); }
   if (name === 'parts' && !LOADED.parts) { LOADED.parts = true; renderParts(); }
-  if (name === 'designs') renderDesigns();
+  if (name === 'designs') { LOADED.designs = true; renderDesigns(); }
 }
 
 function init() {
@@ -1492,7 +2307,9 @@ function init() {
     renderModules();
   });
   $('generate').addEventListener('click', generatePlan);
-  $('save-design').addEventListener('click', saveDesign);
+  $('save-version').addEventListener('click', function () { saveDesign('version'); });
+  $('save-overwrite').addEventListener('click', function () { saveDesign('overwrite'); });
+  $('save-as').addEventListener('click', saveAsDesign);
   $('designs-go').addEventListener('click', renderDesigns);
 
   document.querySelectorAll('input[name="spec-mode"]').forEach(function (radio) {
@@ -1505,6 +2322,7 @@ function init() {
   });
 
   renderModules();
+  refreshSaveButtons();
   loadStats();
   loadOwners();
   selectTab('design');
@@ -1519,6 +2337,8 @@ function specToYaml() {
   }
   var owner = $('spec-owner').value.trim();
   if (owner) lines.push('owner: ' + owner);
+  var vector = $('spec-vector').value;
+  if (vector) lines.push('vector: ' + vector);
   lines.push('circular: ' + ($('spec-circular').checked ? 'true' : 'false'));
   lines.push('modules:');
   state.modules.forEach(function (m) {

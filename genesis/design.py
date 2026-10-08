@@ -65,17 +65,19 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None
                  seq_length DESC
                LIMIT 25""",
             (f"%{spec.backbone}%", MIN_BACKBONE_LENGTH)).fetchall()
-        # When a vector family was asked for, only a backbone of that family
-        # will do: an AAV payload in a lentiviral backbone is not an AAV.
+        # When a vector family was asked for, prefer a backbone of that
+        # family. If the name search finds none, fall back to the best match
+        # anyway: "you asked for AAV but this backbone is lentiviral" is a
+        # far more useful answer than silently having no backbone and a
+        # cascade of missing-element errors that never names the cause.
+        row = None
         if spec.vector:
             for candidate in rows:
                 if plasmid_family(conn, candidate["id"],
                                   candidate["name"]) == spec.vector:
                     row = candidate
                     break
-            else:
-                row = None
-        else:
+        if row is None:
             row = rows[0] if rows else None
     return dict(row) if row else None
 
@@ -110,12 +112,15 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                 "SELECT feature_type, name FROM annotation WHERE plasmid_id = ?",
                 (backbone["id"],))]
 
+    # Only a real plasmid's name is evidence. The name someone typed for the
+    # construct they intend to build is a wish, not an observation, and
+    # letting it vote makes "LENTI-TEST" detect as lentiviral on its own.
     inferred = classify_vector(construct_annotations,
-                               backbone["name"] if backbone else spec.name)
+                               backbone["name"] if backbone else "")
     family = spec.vector or inferred["family"]
     completeness = missing_elements(
         construct_annotations, family,
-        backbone["name"] if backbone else spec.name)
+        backbone["name"] if backbone else "")
 
     vector_info = {
         "requested": spec.vector or None,
@@ -134,6 +139,13 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     expected = [rm.feature_type for rm in resolved if rm.seq] or None
     issues = validate_construct(construct, expected_order=expected,
                                 stocked_enzymes=list(cfg.stocked_enzymes))
+
+    if spec.vector and backbone is None:
+        issues.append(Issue(
+            "error", "packaging",
+            f"you asked for {describe(spec.vector)['label']} but no backbone "
+            f"was found, so the construct is only the payload; name a "
+            f"backbone, or pin one with backbone_plasmid_id"))
 
     if spec.vector and inferred["family"] not in (spec.vector, "plasmid"):
         issues.append(Issue(
@@ -283,6 +295,11 @@ def save_design(conn: sqlite3.Connection, spec: ConstructSpec, plan: dict,
 
     existing = conn.execute("SELECT id FROM construct WHERE name = ?",
                             (spec.name,)).fetchone()
+
+    # Keep the stored plan's own label in step with the construct it is
+    # saved under, or a renamed design shows its old name in every export.
+    if plan.get("construct", {}).get("name") != spec.name:
+        plan = {**plan, "construct": {**plan["construct"], "name": spec.name}}
 
     if mode == "save_as" and existing:
         raise ValueError(

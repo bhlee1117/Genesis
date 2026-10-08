@@ -1698,3 +1698,119 @@ class TestVectorFamilies(unittest.TestCase):
     def test_an_unknown_vector_is_refused(self):
         with self.assertRaises(ValueError):
             ConstructSpec.from_dict({"name": "x", "vector": "adenovirus"})
+
+    def test_evidence_is_readable_not_a_regex(self):
+        """Nobody should be shown a backslash as a reason."""
+        from genesis.vectors import classify_vector
+        for annotations, name in (
+                ([{"feature_type": "AAV_ITR", "name": "AAV2 ITR"}] * 2, "pAAV-hSyn"),
+                ([{"feature_type": "promoter", "name": "5' LTR"},
+                  {"feature_type": "m", "name": "RRE"},
+                  {"feature_type": "m", "name": "cPPT"}], "pLJM1")):
+            for reason in classify_vector(annotations, name)["evidence"]:
+                # No regex syntax. An apostrophe is fine: "5' LTR" has one.
+                for token in ("\\b", "\\d", "[", "]", "(?", "|", "+"):
+                    self.assertNotIn(token, reason, reason)
+
+
+# --------------------------------------------------------------------------
+class TestVectorDesignIntegration(unittest.TestCase):
+    """Behaviour of the vector option inside a whole design."""
+
+    def setUp(self):
+        import hashlib
+        self.conn = connect(":memory:")
+        self.cfg = Config()
+        self.seq = orf(150, 800)
+        chk = hashlib.sha256(self.seq.encode()).hexdigest()
+        pid = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','gene',?,?,?)""",
+            (self.seq, chk, len(self.seq))).lastrowid
+        self.part_id = pid
+
+    def _plasmid(self, name, annotations):
+        """A plasmid carrying the given (type, label) annotations."""
+        body = self.seq + rand_seq(4000, 801)
+        pl = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES (?,'t',?,?,?,1,'sequence_verified')""",
+            (name, body, len(body), name)).lastrowid
+        for ftype, label in annotations:
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,0,10,1)""",
+                (pl, ftype, label))
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,0,?,1)""",
+            (self.part_id, pl, len(self.seq)))
+        self.conn.commit()
+        return pl
+
+    AAV_SET = [("AAV_ITR", "AAV2 ITR"), ("AAV_ITR", "AAV2 ITR"),
+               ("promoter", "hSyn"), ("WPRE", "WPRE"),
+               ("polyA", "bGH polyA"), ("origin", "ori"),
+               ("resistance", "AmpR")]
+    LENTI_SET = [("promoter", "5' LTR"), ("misc", "HIV-1 psi pack"),
+                 ("misc", "RRE"), ("misc", "cPPT"), ("polyA", "bGH polyA"),
+                 ("origin", "ori"), ("resistance", "AmpR")]
+
+    def test_complete_aav_reports_complete(self):
+        self._plasmid("pAAV-test", self.AAV_SET)
+        plan = design(self.conn, ConstructSpec.from_dict(
+            {"name": "x", "vector": "AAV", "backbone": "pAAV",
+             "modules": [{"type": "CDS", "name": "gene"}]}), self.cfg)
+        self.assertTrue(plan["vector"]["completeness"]["complete"],
+                        plan["vector"]["completeness"])
+
+    def test_mismatch_names_the_cause_instead_of_dropping_the_backbone(self):
+        """Asking for AAV with a lentiviral backbone must say exactly that."""
+        self._plasmid("pLenti-test", self.LENTI_SET)
+        plan = design(self.conn, ConstructSpec.from_dict(
+            {"name": "x", "vector": "AAV", "backbone": "pLenti",
+             "modules": [{"type": "CDS", "name": "gene"}]}), self.cfg)
+        self.assertIsNotNone(plan["backbone"],
+                             "the backbone must still be loaded, so the "
+                             "mismatch can be reported")
+        messages = [i["message"] for i in plan["validation"]["issues"]
+                    if i["level"] == "error"]
+        self.assertTrue(any("asked for" in m and "lentiviral" in m
+                            for m in messages), messages)
+
+    def test_construct_name_is_not_evidence(self):
+        """A construct called LENTI-anything is not a lentivirus."""
+        plan = design(self.conn, ConstructSpec.from_dict(
+            {"name": "LENTI-MISMATCH-CHECK",
+             "modules": [{"type": "CDS", "name": "gene"}]}), self.cfg)
+        self.assertEqual(plan["vector"]["detected"], "plasmid")
+        self.assertEqual(plan["vector"]["detected_evidence"], [])
+
+    def test_requesting_a_family_with_no_backbone_is_an_error(self):
+        plan = design(self.conn, ConstructSpec.from_dict(
+            {"name": "x", "vector": "AAV",
+             "modules": [{"type": "CDS", "name": "gene"}]}), self.cfg)
+        messages = [i["message"] for i in plan["validation"]["issues"]
+                    if i["level"] == "error"]
+        self.assertTrue(any("no backbone was found" in m for m in messages),
+                        messages)
+
+    def test_save_as_renames_the_stored_plan(self):
+        from genesis.design import save_design
+        import json as _json
+        self._plasmid("pAAV-test", self.AAV_SET)
+        spec = ConstructSpec("original", modules=[Module("CDS", "gene")])
+        plan = design(self.conn, spec, self.cfg)
+        save_design(self.conn, spec, plan)
+        renamed = ConstructSpec("renamed", modules=[Module("CDS", "gene")])
+        result = save_design(self.conn, renamed, plan, mode="save_as")
+
+        stored = _json.loads(self.conn.execute(
+            "SELECT plan FROM design WHERE id = ?",
+            (result["design_id"],)).fetchone()["plan"])
+        self.assertEqual(stored["construct"]["name"], "renamed")
+        # and the original is left alone
+        first = _json.loads(self.conn.execute(
+            "SELECT plan FROM design WHERE id = 1").fetchone()["plan"])
+        self.assertEqual(first["construct"]["name"], "original")

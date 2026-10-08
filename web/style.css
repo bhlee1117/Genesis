@@ -737,3 +737,256 @@ ol.steps li::marker { color: var(--text-muted); font-variant-numeric: tabular-nu
 /* ---------------- exports ---------------- */
 
 .exports .button-row { margin-top: 2px; }
+
+/* ---------------- save modes ---------------- */
+
+.save-group { display: inline-flex; gap: 6px; }
+.save-link { margin: 6px 0 0; }
+.save-link:empty { display: none; }
+
+/* ---------------- modal dialogs ---------------- */
+
+#modal-host[hidden] { display: none; }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(16, 20, 26, 0.45);
+}
+@media (prefers-color-scheme: dark) {
+  .modal-backdrop { background: rgba(0, 0, 0, 0.62); }
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 460px;
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--overlay-shadow);
+  padding: 14px 16px 12px;
+}
+.modal-title { margin-bottom: 8px; font-size: 14px; }
+.modal-body p { margin: 0 0 8px; font-size: 12px; line-height: 1.5; }
+.modal-body p:last-child { margin-bottom: 0; }
+.modal-stress { color: var(--error-text); font-weight: 600; }
+.modal-input {
+  width: 100%;
+  margin: 2px 0 8px;
+  font-family: var(--mono);
+}
+.modal-error {
+  margin: 8px 0 0;
+  padding: 7px 9px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: var(--radius);
+  color: var(--error-text);
+}
+.modal-error[hidden] { display: none; }
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+button.danger-solid {
+  background: var(--error-border);
+  border-color: var(--error-border);
+  color: #ffffff;
+  font-weight: 600;
+}
+button.danger-solid:hover:not(:disabled) { filter: brightness(1.1); }
+@media (prefers-color-scheme: dark) {
+  button.danger-solid { color: #1a0d0d; }
+}
+
+/* ---------------- designs: delete controls ---------------- */
+
+.row-delete { display: inline-flex; gap: 5px; white-space: nowrap; }
+.row-delete button { padding: 1px 7px; font-size: 11px; line-height: 1.4; }
+
+/* ---------------- vector family ---------------- */
+
+.card.vector.has-conflict { border-left: 3px solid var(--warn-border); }
+.card.vector.has-gaps { border-left: 3px solid var(--error-border); }
+.card.vector.is-complete { border-left: 3px solid var(--ok-border); }
+
+.vector .conflict {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 10px;
+  padding: 9px 11px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: var(--radius);
+  color: var(--warn-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.vector .conflict strong { font-size: 12px; }
+
+dl.vector-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+dl.vector-facts dt { color: var(--text-muted); white-space: nowrap; }
+dl.vector-facts dd { margin: 0; overflow-wrap: anywhere; }
+
+.vector-evidence {
+  margin: 0 0 9px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.vector-note { margin: 0 0 9px; font-size: 11.5px; line-height: 1.5; }
+
+.vector-verdict {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.vector-verdict.ok { color: var(--ok-text); }
+
+.vector-missing {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+}
+.vector-missing .lvl { font-weight: 600; white-space: nowrap; }
+
+.elements { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.element {
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.7;
+  white-space: nowrap;
+}
+.element-required {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+  color: var(--error-text);
+}
+.element-expected {
+  background: var(--warn-bg);
+  border-color: var(--warn-border);
+  color: var(--warn-text);
+}
+
+.vector-set { margin-top: 4px; }
+.vector-set summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+.vector-set[open] summary { margin-bottom: 7px; }
+
+/* ---------------- part picker: fusions and their pieces ---------------- */
+
+.module-row select.form-filter {
+  flex: none;
+  min-width: 104px;
+  width: 104px;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+
+/* The "[1 of 2]" suffix is the useful part of a generated segment name, so
+   it is its own element: it never wraps or shrinks, and the long stem is
+   what gives way when the row is narrow. */
+.combo-name { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+.combo-stem {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.seg-suffix {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.seg-badge {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-2);
+  font-size: 10px;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.seg-badge-fusion {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.seg-badge-piece {
+  border-color: var(--ok-border);
+  color: var(--ok-text);
+  background: var(--ok-bg);
+}
+
+.seg-open {
+  flex: none;
+  padding: 0 6px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--accent);
+  border-color: var(--border);
+  opacity: 0.55;
+}
+.combo-item:hover .seg-open,
+.combo-item.active .seg-open { opacity: 1; border-color: var(--accent); }
+.seg-open-demo {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--accent);
+  font-size: 10.5px;
+}
+
+.combo-back { color: var(--text-muted); font-size: 11.5px; }
+.combo-segment { padding-left: 18px; }
+.combo-foot {
+  padding: 4px 8px;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+}
+
+kbd {
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}

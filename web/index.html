@@ -93,6 +93,14 @@
           <label>Owner
             <input type="text" id="spec-owner" placeholder="optional">
           </label>
+          <label>Vector <span class="hint">element set to check against</span>
+            <select id="spec-vector">
+              <option value="">Auto (infer from backbone)</option>
+              <option value="AAV">AAV</option>
+              <option value="lentiviral">Lentiviral</option>
+              <option value="plasmid">Plain plasmid</option>
+            </select>
+          </label>
           <label class="checkbox"><input type="checkbox" id="spec-circular" checked> Circular</label>
         </div>
         <p class="hint builder-hint">
@@ -100,6 +108,10 @@
           Picking a suggestion pins that exact part by id (shown as a
           <span class="pin-chip pin-chip-demo">pinned&nbsp;#</span> chip);
           clear the box or the chip&rsquo;s &times; to let the planner choose.
+          A row marked <span class="seg-badge seg-badge-fusion">fusion</span> is a
+          multi-protein CDS: open it with <kbd>&rarr;</kbd> (or the
+          <span class="seg-open-demo">split</span> button) to pin one of its
+          proteins instead.
         </p>
         <div id="modules"></div>
         <button type="button" id="add-module" class="secondary">Add module</button>
@@ -112,9 +124,14 @@
 
       <div class="card-foot">
         <button type="button" id="generate" class="primary">Generate plan</button>
-        <button type="button" id="save-design" class="secondary" disabled>Save design</button>
+        <span class="save-group">
+          <button type="button" id="save-version" class="secondary" disabled>Save</button>
+          <button type="button" id="save-overwrite" class="secondary" disabled>Overwrite</button>
+          <button type="button" id="save-as" class="secondary" disabled>Save as&hellip;</button>
+        </span>
         <span class="status" id="design-status"></span>
       </div>
+      <p class="save-link muted small" id="save-link"></p>
     </div>
 
     <div id="plan-out"></div>
@@ -130,6 +147,9 @@
   </section>
 
 </main>
+
+<!-- Confirmation / prompt dialogs are built into this host by app.js. -->
+<div id="modal-host" hidden></div>
 
 <script src="app.js"></script>
 </body>

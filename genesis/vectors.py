@@ -29,6 +29,8 @@ class VectorFamily:
     expected: tuple
     #: Label patterns that identify this family when the feature types alone
     #: are ambiguous.
+    #: (pattern, plain-English description) pairs. The description is what
+    #: a person reads; nobody should be shown a regex as evidence.
     signatures: tuple
     note: str = ""
 
@@ -39,8 +41,11 @@ AAV = VectorFamily(
     label="AAV transfer plasmid",
     required=("AAV_ITR", "promoter", "polyA", "origin", "resistance"),
     expected=("WPRE",),
-    signatures=(r"\bITR\b", r"inverted terminal repeat", r"\bAAV\d?\b",
-                r"\bpAAV"),
+    signatures=((r"\bITR\b", "the name mentions an ITR"),
+                (r"inverted terminal repeat", "the name mentions an inverted "
+                                              "terminal repeat"),
+                (r"\bpAAV", "the name begins pAAV"),
+                (r"\bAAV\d?\b", "the name mentions AAV")),
     note="payload between the ITRs must stay under about 4.7 kb",
 )
 
@@ -49,9 +54,14 @@ LENTI = VectorFamily(
     label="lentiviral transfer plasmid",
     required=("promoter", "polyA", "origin", "resistance"),
     expected=("WPRE",),
-    signatures=(r"\bLTR\b", r"\bRRE\b", r"\bcPPT\b", r"\bpsi\b", r"\bRSV\b",
-                r"lenti", r"\bFUGW\b", r"\bFCK\b", r"pLJM", r"pHR",
-                r"\bHIV-?1\b"),
+    signatures=((r"lenti", "the name says lenti"),
+                (r"\bHIV-?1\b", "the name mentions HIV-1"),
+                (r"\bFUGW\b|\bFUW\b", "the name is a FUGW-family vector"),
+                (r"\bFCK\b", "the name is an FCK-family vector"),
+                (r"pLJM|pHR", "the name is a known lentiviral backbone"),
+                (r"\bLTR\b", "the name mentions an LTR"),
+                (r"\bRRE\b|\bcPPT\b|\bpsi\b", "the name mentions a "
+                                                  "packaging element")),
     note="LTRs, the packaging signal, RRE and cPPT are what make it package",
 )
 
@@ -111,21 +121,23 @@ def classify_vector(annotations: list[dict], name: str = "") -> dict:
     if lenti_hits:
         lenti_evidence.append("lentiviral elements: " + ", ".join(lenti_hits))
 
-    for pattern in AAV.signatures:
+    for pattern, description in AAV.signatures:
         if re.search(pattern, name, re.IGNORECASE):
-            aav_evidence.append(f"the name matches {pattern!r}")
+            aav_evidence.append(description)
             break
-    for pattern in LENTI.signatures:
+    for pattern, description in LENTI.signatures:
         if re.search(pattern, name, re.IGNORECASE):
-            lenti_evidence.append(f"the name matches {pattern!r}")
+            lenti_evidence.append(description)
             break
 
     # Weight structural evidence above names: an annotation describes the
     # molecule, a filename describes whatever someone typed.
+    aav_name_hit = any(e.startswith("the name") for e in aav_evidence)
+    lenti_name_hit = any(e.startswith("the name") for e in lenti_evidence)
     aav_score = (2 if n_itr >= 2 else 0) + (1 if n_itr == 1 else 0) \
-        + (1 if len(aav_evidence) > (1 if n_itr else 0) else 0)
+        + (1 if aav_name_hit else 0)
     lenti_score = 2 * (len(lenti_hits) >= 2) + (1 if len(lenti_hits) == 1 else 0) \
-        + (1 if any("name matches" in e for e in lenti_evidence) else 0)
+        + (1 if lenti_name_hit else 0)
 
     conflict = aav_score >= 2 and lenti_score >= 2
     if aav_score > lenti_score:
