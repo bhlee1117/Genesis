@@ -170,6 +170,50 @@ def _prompt_password(confirm: bool = True) -> str:
         return pw
 
 
+def cmd_setup(args, cfg: Config):
+    """Get a new machine running in one command.
+
+    Copying a prepared database is much faster than re-scanning the share,
+    and it means everyone sees the same inventory.
+    """
+    import shutil
+    target = cfg.resolved_db
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.source:
+        source = Path(args.source).expanduser()
+        if not source.exists():
+            sys.exit(f"error: no database at {source}")
+        if target.exists() and not args.force:
+            sys.exit(f"error: {target} already exists; pass --force to replace it")
+        size_mb = source.stat().st_size / 1024 / 1024
+        print(f"copying {size_mb:.0f} MB inventory from {source}")
+        shutil.copy2(source, target)
+        # A copied database may carry stale write-ahead logs.
+        for suffix in ("-wal", "-shm"):
+            stray = Path(str(target) + suffix)
+            if stray.exists():
+                stray.unlink()
+    elif not target.exists():
+        print("no database given and none exists yet; scanning the share "
+              "(this takes a few minutes)", file=sys.stderr)
+        conn = connect(target)
+        stats = import_tree(conn, cfg)
+        print(f"  indexed {stats.plasmids} plasmids")
+
+    conn = connect(target)
+    n = conn.execute("SELECT COUNT(*) FROM plasmid").fetchone()[0]
+    parts = conn.execute("SELECT COUNT(*) FROM part").fetchone()[0]
+    cfg.save(CONFIG_PATH)
+
+    print(f"\nready: {n:,} plasmids, {parts:,} parts")
+    print(f"  database : {target}")
+    print("\nStart it with:")
+    print("  python3 -m genesis serve")
+    print(f"then open  http://127.0.0.1:{cfg.port}  in a browser on this "
+          f"computer.")
+
+
 def cmd_useradd(args, cfg: Config):
     conn = _conn(cfg, args.db)
     auth.ensure_schema(conn)
@@ -277,6 +321,14 @@ def main(argv=None):
     s.add_argument("--pdf", help="also write a printable PDF protocol here")
     s.add_argument("--save", action="store_true", help="store this design")
     s.set_defaults(fn=cmd_design)
+
+    s = sub.add_parser(
+        "setup", help="prepare this machine (copy an inventory, or scan)")
+    s.add_argument("--from", dest="source",
+                   help="path to a prepared genesis.db to copy")
+    s.add_argument("--force", action="store_true",
+                   help="replace an existing database")
+    s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("useradd", help="create an account")
     s.add_argument("username")

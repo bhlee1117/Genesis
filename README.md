@@ -282,6 +282,38 @@ web/             single-page UI (vanilla JS, no build step)
 tests/           119 tests, no lab share required
 ```
 
+## Giving it to a labmate
+
+`http://127.0.0.1:8777` means *this computer*. It is not an address other
+people can open — on their machine it points at their machine. So the
+simplest way to share Genesis is for each person to run their own copy,
+which is also the safest: a loopback server is reachable by nobody else, so
+it needs no login and no passwords.
+
+Copy the prepared inventory somewhere on the lab share, then each person
+runs three commands:
+
+```bash
+git clone https://github.com/bhlee1117/Genesis.git
+cd Genesis
+python3 -m genesis setup --from "/Volumes/cohen_lab/.../genesis.db"
+python3 -m genesis serve
+```
+
+and opens **http://127.0.0.1:8777**. Copying the database takes seconds and
+skips the scan entirely, and everyone sees the same inventory. They do not
+need the DNA share mounted unless they want to re-scan it themselves.
+
+To refresh later, re-copy the database, or run `python3 -m genesis scan`.
+
+### If you would rather run one shared server
+
+Set `host` to `0.0.0.0` in `~/.genesis/config.json` and people open
+`http://<your-machine's-address>:8777` instead. That address is not
+127.0.0.1. Genesis will refuse to start that way until accounts exist,
+because an open server on the network exposes every unpublished construct
+in the lab to anyone who can reach it. See the next section.
+
 ## Accounts and sharing with the lab
 
 Genesis starts local-only and open. Create an account and the login turns on:
