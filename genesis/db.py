@@ -107,7 +107,10 @@ CREATE TABLE IF NOT EXISTS part (
     variants_ok  INTEGER DEFAULT 1,
     confidence   REAL DEFAULT 1.0,
     notes        TEXT,
-    contains     TEXT          -- JSON: elements embedded inside this part
+    contains     TEXT,         -- JSON: elements embedded inside this part
+    derived_from INTEGER,       -- part this was split out of, if any
+    segment_index INTEGER,      -- its position within that parent
+    segment_of    INTEGER       -- how many segments the parent split into
 );
 CREATE INDEX IF NOT EXISTS idx_part_type ON part(feature_type);
 CREATE INDEX IF NOT EXISTS idx_part_name ON part(name);
@@ -194,7 +197,12 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 #: Columns added after the first release, applied on open so existing
 #: databases keep working without a re-import.
-_ADDED_COLUMNS = (("part", "contains", "TEXT"),)
+_ADDED_COLUMNS = (
+    ("part", "contains", "TEXT"),
+    ("part", "derived_from", "INTEGER"),
+    ("part", "segment_index", "INTEGER"),
+    ("part", "segment_of", "INTEGER"),
+)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

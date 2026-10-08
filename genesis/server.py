@@ -11,14 +11,14 @@ GET  /api/auth-status                   whether a login is needed\nGET  /api/me 
 GET  /api/owners                        people with plasmids
 GET  /api/plasmids?q=&owner=&limit=     search the inventory
 GET  /api/plasmid/<id>                  sequence + annotations
-GET  /api/parts?type=&q=&limit=&all=    browse parts (no sequence)
+GET  /api/parts?type=&q=&limit=&all=&form=  browse parts\n                     form: all | whole | split\nGET  /api/part/<id>/segments            a fusion and its proteins
 GET  /api/part/<id>                     one part, with its sequence
 GET  /api/part/<id>/sources             source plasmids for a part
 GET  /api/enzymes                       enzyme catalogue
 GET  /api/vocab                         controlled feature vocabulary
 GET  /api/config                        effective configuration
 POST /api/design        {spec}          run Stages 4-10, return a plan
-POST /api/save          {spec, plan}    version a design
+POST /api/save   {spec, plan, mode, design_id}\n                     mode: version | overwrite | save_as\nPOST /api/delete-design {design_id} or {construct_id}
 GET  /api/designs                       stored designs
 POST /api/outcome       {...}           record an experimental result
 POST /api/export/<kind> {plan, route_id}  protocol | pdf | primers | genbank
@@ -41,7 +41,7 @@ from . import auth
 from .config import Config
 from .construct import ConstructSpec
 from .db import connect
-from .design import design, save_design
+from .design import delete_construct, delete_design, design, save_design
 from .enzymes import CATALOG
 from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
                      to_genbank)
@@ -72,6 +72,7 @@ class Handler(BaseHTTPRequestHandler):
     #: Minimum role for the endpoints that change something.
     WRITE_ENDPOINTS = {
         "/api/save": "member", "/api/outcome": "member",
+        "/api/delete-design": "member",
         "/api/import": "admin", "/api/users": "admin",
     }
 
@@ -300,12 +301,24 @@ class Handler(BaseHTTPRequestHandler):
             # returns hundreds of parts and the full DNA makes the response
             # hundreds of kilobytes per keystroke in a typeahead. Fetch one
             # part's sequence from /api/part/<id> when it is actually needed.
+            # `form` lets the caller choose between a fused CDS and the
+            # proteins it splits into. Both are legitimate answers, so the
+            # default shows both and marks which is which.
+            form = (q.get("form") or ["all"])[0]
             sql = """SELECT p.id, p.feature_type, p.name, p.seq_length,
                             p.translated, p.exact_required, p.confidence,
-                            p.contains, COUNT(o.id) AS n_sources
+                            p.contains, p.derived_from, p.segment_index,
+                            p.segment_of,
+                            (SELECT COUNT(*) FROM part k
+                             WHERE k.derived_from = p.id) AS n_segments,
+                            COUNT(o.id) AS n_sources
                      FROM part p
                      LEFT JOIN part_occurrence o ON o.part_id = p.id
                      WHERE 1=1"""
+            if form == "whole":
+                sql += " AND p.derived_from IS NULL"
+            elif form == "split":
+                sql += " AND p.derived_from IS NOT NULL"
             args: list = []
             if ftype:
                 sql += " AND p.feature_type = ?"
@@ -327,6 +340,38 @@ class Handler(BaseHTTPRequestHandler):
             if row is None:
                 return self.json({"error": "not found"}, 404)
             return self.json(dict(row))
+
+        if path.startswith("/api/part/") and path.endswith("/segments"):
+            pid = int(path.split("/")[3])
+            parent = one("""SELECT id, name, feature_type, seq_length, contains,
+                                   derived_from FROM part WHERE id = ?""", pid)
+            if parent is None:
+                return self.json({"error": "not found"}, 404)
+            # If this part is itself a segment, describe the fusion it came
+            # from; otherwise describe what it splits into.
+            root_id = parent["derived_from"] or parent["id"]
+            root = one("""SELECT id, name, feature_type, seq_length, contains
+                          FROM part WHERE id = ?""", root_id)
+            segments = rows(
+                """SELECT id, name, seq_length, segment_index, segment_of
+                   FROM part WHERE derived_from = ? ORDER BY segment_index""",
+                root_id)
+            import json as _json
+            try:
+                contains = _json.loads(root["contains"]) if root["contains"] else []
+            except (ValueError, TypeError):
+                contains = []
+            return self.json({
+                "whole": dict(root),
+                "segments": segments,
+                "separators": [
+                    {"name": e.get("name"), "feature_type": e.get("feature_type"),
+                     "start": e.get("start"), "end": e.get("end")}
+                    for e in contains
+                    if e.get("feature_type") in ("p2A", "IRES", "linker",
+                                                 "trafficking_motif")],
+                "this_is": "segment" if parent["derived_from"] else "whole",
+            })
 
         if path.startswith("/api/part/") and path.endswith("/sources"):
             pid = int(path.split("/")[3])
@@ -467,8 +512,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/save":
             spec = ConstructSpec.from_dict(body["spec"]) if isinstance(
                 body.get("spec"), dict) else ConstructSpec.from_yaml(body["spec"])
-            did = save_design(c, spec, body["plan"], body.get("owner", ""))
-            return self.json({"design_id": did})
+            user = self.current_user()
+            try:
+                result = save_design(
+                    c, spec, body["plan"],
+                    owner=body.get("owner") or (user.username if user else ""),
+                    mode=body.get("mode", "version"),
+                    design_id=body.get("design_id"))
+            except ValueError as exc:
+                return self.json({"error": str(exc)}, 409)
+            return self.json(result)
+
+        if path == "/api/delete-design":
+            try:
+                if body.get("construct_id") is not None:
+                    return self.json(delete_construct(c, int(body["construct_id"])))
+                return self.json(delete_design(c, int(body["design_id"])))
+            except (ValueError, KeyError, TypeError) as exc:
+                return self.json({"error": str(exc)}, 400)
 
         if path == "/api/outcome":
             c.execute(

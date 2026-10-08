@@ -16,7 +16,8 @@ from .planner import (group_contiguous, plan_hifi_route, plan_restriction_route,
                       plan_swap_hifi_route, plan_swap_restriction_route,
                       rank_routes, failure_history)
 from .swap import analyse_swap, build_scheme, rank_parents
-from .validate import summarize, validate_construct
+from .vectors import classify_vector, describe, missing_elements
+from .validate import Issue, summarize, validate_construct
 
 
 #: Shortest sequence that could plausibly act as a cloning vector. The
@@ -24,6 +25,23 @@ from .validate import summarize, validate_construct
 #: search term, and silently picking a 23 bp fragment as the vector produces
 #: a nonsense plan.
 MIN_BACKBONE_LENGTH = 1500
+
+
+def _article(phrase: str) -> str:
+    """'an AAV transfer plasmid' / 'a lentiviral transfer plasmid'."""
+    return ("an " if phrase[:1].upper() in "AEIOU" else "a ") + phrase
+
+
+def plasmid_family(conn: sqlite3.Connection, plasmid_id: int,
+                   name: str = "") -> str:
+    ann = [dict(r) for r in conn.execute(
+        "SELECT feature_type, name FROM annotation WHERE plasmid_id = ?",
+        (plasmid_id,))]
+    if not name:
+        row = conn.execute("SELECT name FROM plasmid WHERE id = ?",
+                           (plasmid_id,)).fetchone()
+        name = row["name"] if row else ""
+    return classify_vector(ann, name)["family"]
 
 
 def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None:
@@ -35,7 +53,7 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None
     elif spec.backbone:
         # Name search: a vector must be big enough to be one, and a circular,
         # verified plasmid carrying an origin beats a bare fragment.
-        row = conn.execute(
+        rows = conn.execute(
             """SELECT * FROM plasmid
                WHERE name LIKE ? COLLATE NOCASE AND seq_length >= ?
                ORDER BY
@@ -45,8 +63,20 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None
                   WHERE a.plasmid_id = plasmid.id
                     AND a.feature_type IN ('origin', 'resistance')) DESC,
                  seq_length DESC
-               LIMIT 1""",
-            (f"%{spec.backbone}%", MIN_BACKBONE_LENGTH)).fetchone()
+               LIMIT 25""",
+            (f"%{spec.backbone}%", MIN_BACKBONE_LENGTH)).fetchall()
+        # When a vector family was asked for, only a backbone of that family
+        # will do: an AAV payload in a lentiviral backbone is not an AAV.
+        if spec.vector:
+            for candidate in rows:
+                if plasmid_family(conn, candidate["id"],
+                                  candidate["name"]) == spec.vector:
+                    row = candidate
+                    break
+            else:
+                row = None
+        else:
+            row = rows[0] if rows else None
     return dict(row) if row else None
 
 
@@ -67,12 +97,74 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                          circular=spec.circular)
     construct.warnings.extend(dio_notes)
 
+    # --- vector family ---------------------------------------------------
+    # Either the family was asked for, or it is inferred. Either way the
+    # finished molecule is checked against what that family actually needs,
+    # because a payload on its own is not a vector.
+    construct_annotations = [{"feature_type": i["type"], "name": i["name"]}
+                             for i in construct.layout]
+    if backbone:
+        construct_annotations += [
+            {"feature_type": r["feature_type"], "name": r["name"]}
+            for r in conn.execute(
+                "SELECT feature_type, name FROM annotation WHERE plasmid_id = ?",
+                (backbone["id"],))]
+
+    inferred = classify_vector(construct_annotations,
+                               backbone["name"] if backbone else spec.name)
+    family = spec.vector or inferred["family"]
+    completeness = missing_elements(
+        construct_annotations, family,
+        backbone["name"] if backbone else spec.name)
+
+    vector_info = {
+        "requested": spec.vector or None,
+        "detected": inferred["family"],
+        "detected_evidence": inferred["evidence"],
+        "family": family,
+        "spec": describe(family),
+        "completeness": completeness,
+    }
+    if inferred.get("warning"):
+        vector_info["warning"] = inferred["warning"]
+
     # Stage 5: validate before planning anything
     # Compare against the expanded architecture: after a DIO expansion the
     # assembled order legitimately differs from the order that was typed.
     expected = [rm.feature_type for rm in resolved if rm.seq] or None
     issues = validate_construct(construct, expected_order=expected,
                                 stocked_enzymes=list(cfg.stocked_enzymes))
+
+    if spec.vector and inferred["family"] not in (spec.vector, "plasmid"):
+        issues.append(Issue(
+            "error", "packaging",
+            f"you asked for {describe(spec.vector)['label']} but the backbone "
+            f"and payload look like {inferred['label']}"
+            + (f" ({'; '.join(inferred['evidence'])})"
+               if inferred["evidence"] else "")))
+
+    if family in ("AAV", "lentiviral"):
+        for element in completeness["missing_required"]:
+            issues.append(Issue(
+                "error", "packaging",
+                f"{_article(completeness['label'])} needs {element}, which "
+                f"this construct does not have"))
+        for element in completeness["missing_named"]:
+            issues.append(Issue(
+                "error", "packaging",
+                f"{_article(completeness['label'])} needs its {element}, "
+                f"which is not annotated anywhere in this construct"))
+        for element in completeness["missing_expected"]:
+            issues.append(Issue(
+                "warning", "packaging",
+                f"no {element} found; {_article(completeness['label'])} "
+                f"normally carries one and expression is usually lower "
+                f"without it"))
+        if completeness["complete"]:
+            issues.append(Issue(
+                "info", "packaging",
+                f"carries the full {completeness['label']} element set"))
+
     validation = summarize(issues)
 
     # Build the module list first; the swap planner works from it.
@@ -153,6 +245,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
             "modules": [m["name"] for m in f.modules],
         } for f in fragments],
         "validation": validation,
+        "vector": vector_info,
         "swap": analysis.to_dict() if analysis else None,
         "scheme": scheme,
         "closest_parents": [p.to_dict() for p in rank_parents(
@@ -169,12 +262,56 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
 
 
 def save_design(conn: sqlite3.Connection, spec: ConstructSpec, plan: dict,
-                owner: str = "") -> int:
-    """Store a versioned design (Stage 11)."""
-    row = conn.execute("SELECT id FROM construct WHERE name = ?",
-                       (spec.name,)).fetchone()
-    if row:
-        construct_id = row["id"]
+                owner: str = "", mode: str = "version",
+                design_id: int | None = None) -> dict:
+    """Store a design (Stage 11).
+
+    Three ways to save, because they mean different things to the person
+    doing it:
+
+    * ``version``   keep the previous one and add a new version. The default,
+      and the only one that never loses work.
+    * ``overwrite`` replace an existing version in place. Used when fixing a
+      design that was just saved, where a new version would be noise.
+    * ``save_as``   store under a new name, leaving the original untouched.
+
+    ``save_as`` requires that ``spec.name`` is free, so it cannot silently
+    merge into an existing construct's history.
+    """
+    if mode not in ("version", "overwrite", "save_as"):
+        raise ValueError(f"unknown save mode {mode!r}")
+
+    existing = conn.execute("SELECT id FROM construct WHERE name = ?",
+                            (spec.name,)).fetchone()
+
+    if mode == "save_as" and existing:
+        raise ValueError(
+            f"a construct called {spec.name!r} already exists; choose another "
+            f"name, or save a new version of that one instead")
+
+    if mode == "overwrite":
+        if design_id is None:
+            raise ValueError("overwrite needs the design to replace")
+        row = conn.execute(
+            "SELECT construct_id, version FROM design WHERE id = ?",
+            (design_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"no design with id {design_id}")
+        construct_id, version = row["construct_id"], row["version"]
+        conn.execute("UPDATE construct SET name = ?, spec = ? WHERE id = ?",
+                     (spec.name, json.dumps(spec.to_dict()), construct_id))
+        conn.execute(
+            """UPDATE design SET plan = ?, final_seq = ?, validation = ?,
+                      owner = ?, created_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (json.dumps(plan), plan["construct"]["sequence"],
+             json.dumps(plan["validation"]), owner or spec.owner, design_id))
+        conn.commit()
+        return {"design_id": design_id, "construct_id": construct_id,
+                "version": version, "mode": "overwrite"}
+
+    if existing:
+        construct_id = existing["id"]
         conn.execute("UPDATE construct SET spec = ? WHERE id = ?",
                      (json.dumps(spec.to_dict()), construct_id))
     else:
@@ -183,7 +320,7 @@ def save_design(conn: sqlite3.Connection, spec: ConstructSpec, plan: dict,
             (spec.name, owner or spec.owner, json.dumps(spec.to_dict())))
         construct_id = cur.lastrowid
 
-    ver = conn.execute(
+    version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) + 1 AS v FROM design WHERE construct_id = ?",
         (construct_id,)).fetchone()["v"]
 
@@ -191,7 +328,46 @@ def save_design(conn: sqlite3.Connection, spec: ConstructSpec, plan: dict,
         """INSERT INTO design(construct_id, version, owner, plan, final_seq,
                               validation)
            VALUES (?,?,?,?,?,?)""",
-        (construct_id, ver, owner or spec.owner, json.dumps(plan),
+        (construct_id, version, owner or spec.owner, json.dumps(plan),
          plan["construct"]["sequence"], json.dumps(plan["validation"])))
     conn.commit()
-    return cur.lastrowid
+    return {"design_id": cur.lastrowid, "construct_id": construct_id,
+            "version": version, "mode": mode}
+
+
+def delete_design(conn: sqlite3.Connection, design_id: int) -> dict:
+    """Delete one version. The construct goes too once nothing is left."""
+    row = conn.execute(
+        """SELECT d.construct_id, d.version, c.name
+           FROM design d JOIN construct c ON c.id = d.construct_id
+           WHERE d.id = ?""", (design_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no design with id {design_id}")
+
+    conn.execute("DELETE FROM outcome WHERE design_id = ?", (design_id,))
+    conn.execute("DELETE FROM design WHERE id = ?", (design_id,))
+    remaining = conn.execute(
+        "SELECT COUNT(*) c FROM design WHERE construct_id = ?",
+        (row["construct_id"],)).fetchone()["c"]
+    if remaining == 0:
+        conn.execute("DELETE FROM construct WHERE id = ?", (row["construct_id"],))
+    conn.commit()
+    return {"deleted": design_id, "name": row["name"],
+            "version": row["version"], "versions_left": remaining}
+
+
+def delete_construct(conn: sqlite3.Connection, construct_id: int) -> dict:
+    """Delete a construct and every version of it."""
+    row = conn.execute("SELECT name FROM construct WHERE id = ?",
+                       (construct_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no construct with id {construct_id}")
+    ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM design WHERE construct_id = ?", (construct_id,))]
+    for did in ids:
+        conn.execute("DELETE FROM outcome WHERE design_id = ?", (did,))
+    conn.execute("DELETE FROM design WHERE construct_id = ?", (construct_id,))
+    conn.execute("DELETE FROM construct WHERE id = ?", (construct_id,))
+    conn.commit()
+    return {"deleted_construct": construct_id, "name": row["name"],
+            "versions_deleted": len(ids)}

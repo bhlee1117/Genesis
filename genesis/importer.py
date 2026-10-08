@@ -24,7 +24,7 @@ from .seqio import (READABLE_EXT, ParseError, Record, classify_role,
                     is_hidden_or_sidecar, read_record, sniff_format)
 from .seqtools import revcomp
 from .vocab import (classify_label, find_embedded_elements,
-                    find_motifs, min_part_length)
+                    find_motifs, min_part_length, split_at_elements)
 
 
 @dataclass
@@ -229,6 +229,7 @@ def extract_parts(conn: sqlite3.Connection, plasmid_id: int, rec: Record,
             part_id = row["id"]
         else:
             embedded = find_embedded_elements(sub, a["feature_type"])
+            pieces = split_at_elements(sub, embedded)
             cur = conn.execute(
                 """INSERT INTO part(feature_type, name, seq, seq_checksum,
                                     seq_length, translated, exact_required,
@@ -247,6 +248,65 @@ def extract_parts(conn: sqlite3.Connection, plasmid_id: int, rec: Record,
                (part_id, plasmid_id, start, end, strand) VALUES (?,?,?,?,?)""",
             (part_id, plasmid_id, a["start"], a["end"], a["strand"]),
         )
+
+        # A fused CDS is catalogued twice: whole, and split into the proteins
+        # it actually contains. Both are real answers to "what part is this",
+        # so neither replaces the other.
+        if row is None and pieces:
+            created += _store_segments(conn, plasmid_id, a, sub, pieces,
+                                       part_id)
+    return created
+
+
+def _store_segments(conn: sqlite3.Connection, plasmid_id: int, annotation: dict,
+                    parent_seq: str, pieces: list[dict],
+                    parent_id: int) -> int:
+    """Catalogue the pieces a fused CDS splits into.
+
+    A segment whose sequence already exists as a part is linked to that part
+    rather than duplicated, which is how the split pieces inherit the names
+    the lab already uses for them.
+    """
+    created = 0
+    coding = [p for p in pieces if p["kind"] == "segment"]
+    total = len(coding)
+    index = 0
+
+    for piece in pieces:
+        if piece["kind"] != "segment":
+            continue
+        index += 1
+        seq = piece["seq"]
+        if len(seq) < min_part_length("CDS"):
+            continue
+        chk = hashlib.sha256(seq.upper().encode()).hexdigest()
+        existing = conn.execute("SELECT id FROM part WHERE seq_checksum = ?",
+                                (chk,)).fetchone()
+        if existing:
+            part_id = existing["id"]
+        else:
+            cur = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length, translated, confidence, derived_from,
+                        segment_index, segment_of)
+                   VALUES (?,?,?,?,?,1,?,?,?,?)""",
+                ("CDS",
+                 f"{annotation['name']} [{index} of {total}]",
+                 seq, chk, len(seq), 0.8, parent_id, index, total))
+            part_id = cur.lastrowid
+            created += 1
+
+        # Position of this piece within the plasmid, honouring strand.
+        if annotation["strand"] == 1:
+            start = annotation["start"] + piece["start"]
+            end = annotation["start"] + piece["end"]
+        else:
+            start = annotation["end"] - piece["end"]
+            end = annotation["end"] - piece["start"]
+        conn.execute(
+            """INSERT OR IGNORE INTO part_occurrence
+               (part_id, plasmid_id, start, end, strand) VALUES (?,?,?,?,?)""",
+            (part_id, plasmid_id, start, end, annotation["strand"]))
     return created
 
 

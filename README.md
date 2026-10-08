@@ -161,6 +161,47 @@ plasmids, assembles the intended molecule, and validates it.
   switch); only sites with identical spacers recombine. The checked product
   is the one the neuron actually expresses, not the deposited plasmid.
 
+### Vector families
+
+A payload is not a vector. An AAV transfer plasmid needs two ITRs around
+the payload, a polyA and normally a WPRE inside them, and the bacterial
+origin and resistance outside. A lentiviral one needs LTRs, the packaging
+signal, RRE and cPPT instead. Set `vector:` in the specification to `AAV`,
+`lentiviral` or `plasmid` and Genesis will only accept a backbone of that
+family and will check the finished molecule against the full element list,
+reporting anything absent. Left blank, the family is inferred from the
+features the backbone actually carries, with ITR count outweighing whatever
+the file happens to be named. A plasmid showing both AAV and lentiviral
+evidence is reported as a conflict rather than silently resolved.
+
+### Fused coding sequences
+
+Many CDS annotations on this share are really several proteins joined
+together: `LR-Voltron2-LR-CheRiff_eYFP` is Voltron2 (with its own KGC and
+ER2 tags), then a P2A, then CheRiff-eYFP. Genesis catalogues the fusion
+**and** the proteins it splits into, because both are legitimate answers to
+"which part is this", and marks which is which so the picker can offer the
+choice.
+
+Boundaries are taken at 2A peptides, IRES elements and at linkers or
+trafficking signals that sit between two full-length coding blocks.
+Separators that sit next to each other count as one boundary, and where a
+cluster contains a 2A that element is the boundary — so Voltron2's
+C-terminal KGC and ER2 stay with Voltron2 rather than being mistaken for
+part of the junction. A tag on the end of a single protein is not a fusion
+and does not split. Of the CDS parts on this share, 100 split this way, and
+96 of the resulting pieces turned out to be parts the lab already had names
+for.
+
+### Designs
+
+Saving offers three modes, because they mean different things: `version`
+keeps the previous one and adds another, `overwrite` replaces a version in
+place, and `save_as` stores under a new name and refuses to merge into an
+existing construct's history. Deleting removes one version, or a construct
+and all of its versions; the construct record goes when its last version
+does.
+
 ### Routes
 
 Four routes are generated as first-class alternatives and costed with the
@@ -277,9 +318,10 @@ genesis/
   design.py      orchestration
   export.py      Stage 12: protocol, primer CSV, GenBank
   auth.py        accounts, password hashing, sessions, roles
+  vectors.py     AAV / lentiviral families and their element sets
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           119 tests, no lab share required
+tests/           143 tests, no lab share required
 ```
 
 ## Giving it to a labmate

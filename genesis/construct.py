@@ -44,6 +44,8 @@ class ConstructSpec:
     owner: str = ""
     circular: bool = True
     notes: str = ""
+    #: "AAV", "lentiviral", "plasmid", or "" to infer from the backbone.
+    vector: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -65,6 +67,7 @@ class ConstructSpec:
             owner=data.get("owner", ""),
             circular=data.get("circular", True),
             notes=data.get("notes", ""),
+            vector=_normalise_vector(data.get("vector", "")),
         )
 
     @classmethod
@@ -108,6 +111,24 @@ class ConstructSpec:
                 k, v = stripped.split(":", 1)
                 data[k.strip()] = _coerce(v.strip())
         return cls.from_dict(data)
+
+
+#: Accept the shorthand people actually type.
+_VECTOR_ALIASES = {
+    "aav": "AAV", "paav": "AAV", "aav2": "AAV",
+    "lenti": "lentiviral", "lentivirus": "lentiviral",
+    "lentiviral": "lentiviral", "lv": "lentiviral", "plenti": "lentiviral",
+    "plasmid": "plasmid", "none": "", "auto": "", "": "",
+}
+
+
+def _normalise_vector(value) -> str:
+    key = str(value or "").strip().lower()
+    if key in _VECTOR_ALIASES:
+        return _VECTOR_ALIASES[key]
+    raise ValueError(
+        f"unknown vector {value!r}; use AAV, lentiviral, plasmid, or leave it "
+        f"blank to infer from the backbone")
 
 
 def _coerce(v: str):

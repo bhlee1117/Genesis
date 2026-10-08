@@ -374,3 +374,92 @@ def trim_embedded(seq: str, elements: list[dict], feature_type: str) -> tuple[st
             trimmed = trimmed[e["end"]:]
             removed.append(e)
     return trimmed, removed
+
+
+#: Elements that separate one protein from the next inside a fused CDS.
+#: A 2A peptide genuinely ends one protein and starts another; a linker or
+#: trafficking signal between two coding blocks is doing the same job in
+#: practice, which is why lab annotations run them all together.
+SPLIT_TYPES = ("p2A", "linker", "trafficking_motif")
+
+#: Below this a segment is a fragment, not a protein worth cataloguing.
+MIN_SEGMENT_BP = 150
+
+
+def split_at_elements(seq: str, elements: list[dict],
+                      split_types: tuple = SPLIT_TYPES,
+                      min_segment: int = MIN_SEGMENT_BP) -> list[dict]:
+    """Cut a fused coding sequence into its separate proteins.
+
+    ``LR-Voltron2-LR-CheRiff_eYFP`` is annotated as one CDS but is really
+    two proteins joined by a 2A peptide. Cutting at that boundary recovers
+    both, while the uncut original stays in the catalogue because sometimes
+    the whole fusion is exactly what you want.
+
+    Separators that sit next to each other are treated as one boundary.
+    Voltron2 ends in KGC, then ER2, then the 2A: those are its own
+    C-terminal trafficking tags followed by the real protein boundary, not
+    three boundaries with slivers of protein between them. A boundary is
+    only taken where a full-length coding block lies on each side.
+
+    Returns pieces in order, each ``{kind, feature_type, name, start, end,
+    seq}`` with ``kind`` of ``"segment"`` or ``"separator"``. Returns
+    nothing unless at least two real coding segments come out, since a
+    single tag on the end of one protein is not a fusion.
+    """
+    candidates = sorted(
+        (e for e in elements if e["feature_type"] in split_types),
+        key=lambda e: e["start"])
+    if not candidates:
+        return []
+
+    # Group separators that are adjacent, or separated by less coding
+    # sequence than could be a protein, into a single boundary.
+    clusters: list[list[dict]] = []
+    for element in candidates:
+        if clusters and element["start"] - clusters[-1][-1]["end"] < min_segment:
+            clusters[-1].append(element)
+        else:
+            clusters.append([element])
+
+    pieces: list[dict] = []
+    cursor = 0
+    for cluster in clusters:
+        # Where a cluster contains a 2A or an IRES, that element is the real
+        # protein boundary and anything beside it belongs to the protein it
+        # is attached to: Voltron2's KGC and ER2 are its own C-terminal
+        # trafficking tags, not part of the junction to the next protein.
+        hard = [e for e in cluster if e["feature_type"] in ("p2A", "IRES")]
+        if hard:
+            lo, hi = hard[0]["start"], hard[-1]["end"]
+            cluster = hard
+        else:
+            lo = cluster[0]["start"]
+            hi = cluster[-1]["end"]
+        before = lo - cursor
+        after = len(seq) - hi
+        # Only a boundary if a whole protein sits on each side of it.
+        if before < min_segment or after < min_segment:
+            continue
+        pieces.append({"kind": "segment", "feature_type": "CDS", "name": "",
+                       "start": cursor, "end": lo, "seq": seq[cursor:lo]})
+        pieces.append({
+            "kind": "separator",
+            "feature_type": cluster[0]["feature_type"],
+            "name": " + ".join(dict.fromkeys(e["name"] for e in cluster)),
+            "start": lo, "end": hi, "seq": seq[lo:hi],
+            "elements": [e["name"] for e in cluster],
+        })
+        cursor = hi
+
+    if not pieces:
+        return []
+    if cursor < len(seq):
+        pieces.append({"kind": "segment", "feature_type": "CDS", "name": "",
+                       "start": cursor, "end": len(seq), "seq": seq[cursor:]})
+
+    coding = [p for p in pieces if p["kind"] == "segment"
+              and len(p["seq"]) >= min_segment]
+    if len(coding) < 2:
+        return []
+    return pieces

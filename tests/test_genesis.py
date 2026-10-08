@@ -1440,3 +1440,261 @@ class TestUnsafeBindRefusal(unittest.TestCase):
         """Local-only use must not require anyone to set up accounts."""
         from genesis.server import LOOPBACK
         self.assertIn("127.0.0.1", LOOPBACK)
+
+
+# --------------------------------------------------------------------------
+class TestSaveModesAndDelete(unittest.TestCase):
+    """Versioning, overwriting, saving under a new name, and deleting."""
+
+    def setUp(self):
+        import hashlib
+        self.conn = connect(":memory:")
+        self.cfg = Config()
+        seq = orf(150, 700)
+        pl = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'sv',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 701), len(seq) + 2000)).lastrowid
+        pid = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(), len(seq))).lastrowid
+        self.conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                             start, end, strand) VALUES (?,?,0,?,1)""",
+                          (pid, pl, len(seq)))
+        self.conn.commit()
+        self.spec = ConstructSpec("design A", modules=[Module("CDS", "gene")])
+        self.plan = design(self.conn, self.spec, self.cfg)
+
+    def _count(self, table):
+        return self.conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+
+    def test_default_save_adds_a_version(self):
+        from genesis.design import save_design
+        a = save_design(self.conn, self.spec, self.plan)
+        b = save_design(self.conn, self.spec, self.plan)
+        self.assertEqual((a["version"], b["version"]), (1, 2))
+        self.assertEqual(a["construct_id"], b["construct_id"])
+        self.assertEqual(self._count("design"), 2)
+
+    def test_overwrite_replaces_in_place(self):
+        from genesis.design import save_design
+        a = save_design(self.conn, self.spec, self.plan)
+        b = save_design(self.conn, self.spec, self.plan, mode="overwrite",
+                        design_id=a["design_id"])
+        self.assertEqual(b["design_id"], a["design_id"])
+        self.assertEqual(b["version"], a["version"])
+        self.assertEqual(self._count("design"), 1)
+
+    def test_overwrite_needs_a_target(self):
+        from genesis.design import save_design
+        with self.assertRaises(ValueError):
+            save_design(self.conn, self.spec, self.plan, mode="overwrite")
+        with self.assertRaises(ValueError):
+            save_design(self.conn, self.spec, self.plan, mode="overwrite",
+                        design_id=9999)
+
+    def test_save_as_creates_a_separate_construct(self):
+        from genesis.design import save_design
+        save_design(self.conn, self.spec, self.plan)
+        other = ConstructSpec("design B", modules=[Module("CDS", "gene")])
+        b = save_design(self.conn, other, self.plan, mode="save_as")
+        self.assertEqual(b["version"], 1)
+        self.assertEqual(self._count("construct"), 2)
+
+    def test_save_as_refuses_an_existing_name(self):
+        from genesis.design import save_design
+        save_design(self.conn, self.spec, self.plan)
+        with self.assertRaises(ValueError) as ctx:
+            save_design(self.conn, self.spec, self.plan, mode="save_as")
+        self.assertIn("already exists", str(ctx.exception))
+
+    def test_deleting_the_last_version_removes_the_construct(self):
+        from genesis.design import save_design, delete_design
+        a = save_design(self.conn, self.spec, self.plan)
+        result = delete_design(self.conn, a["design_id"])
+        self.assertEqual(result["versions_left"], 0)
+        self.assertEqual(self._count("construct"), 0)
+
+    def test_deleting_one_version_keeps_the_others(self):
+        from genesis.design import save_design, delete_design
+        a = save_design(self.conn, self.spec, self.plan)
+        save_design(self.conn, self.spec, self.plan)
+        delete_design(self.conn, a["design_id"])
+        self.assertEqual(self._count("design"), 1)
+        self.assertEqual(self._count("construct"), 1)
+
+    def test_delete_construct_removes_every_version_and_outcome(self):
+        from genesis.design import save_design, delete_construct
+        a = save_design(self.conn, self.spec, self.plan)
+        save_design(self.conn, self.spec, self.plan)
+        self.conn.execute(
+            "INSERT INTO outcome(design_id, result) VALUES (?, 'success')",
+            (a["design_id"],))
+        self.conn.commit()
+        result = delete_construct(self.conn, a["construct_id"])
+        self.assertEqual(result["versions_deleted"], 2)
+        self.assertEqual(self._count("design"), 0)
+        self.assertEqual(self._count("outcome"), 0)
+
+    def test_deleting_something_that_is_not_there(self):
+        from genesis.design import delete_design
+        with self.assertRaises(ValueError):
+            delete_design(self.conn, 4242)
+
+
+# --------------------------------------------------------------------------
+class TestSplittingFusedParts(unittest.TestCase):
+    """A fused CDS is catalogued whole and split; both stay available."""
+
+    @staticmethod
+    def _bt(peptide):
+        back = {}
+        for codon, aa in st.CODON_TABLE.items():
+            back.setdefault(aa, codon)
+        return "".join(back[a] for a in peptide)
+
+    def setUp(self):
+        self.p2a = self._bt("ATNFSLLKQAGDVEENPGP")
+        self.ts = self._bt("KSRITSEGEYIPLDQIDINV")
+        self.er2 = self._bt("FCYENEV")
+
+    def test_splits_at_a_2a(self):
+        from genesis.vocab import find_embedded_elements, split_at_elements
+        fused = "ATG" + "GCT" * 200 + self.p2a + "GCT" * 200 + "TAA"
+        pieces = split_at_elements(fused, find_embedded_elements(fused, "CDS"))
+        kinds = [p["kind"] for p in pieces]
+        self.assertEqual(kinds, ["segment", "separator", "segment"])
+        self.assertEqual(pieces[1]["feature_type"], "p2A")
+
+    def test_splits_at_a_trafficking_signal_between_two_proteins(self):
+        from genesis.vocab import find_embedded_elements, split_at_elements
+        fused = "ATG" + "GCT" * 200 + self.ts + "GCT" * 200 + "TAA"
+        pieces = split_at_elements(fused, find_embedded_elements(fused, "CDS"))
+        self.assertEqual(len([p for p in pieces if p["kind"] == "segment"]), 2)
+
+    def test_terminal_tags_do_not_split(self):
+        """A trafficking motif on the end of one protein is not a boundary."""
+        from genesis.vocab import find_embedded_elements, split_at_elements
+        fused = "ATG" + "GCT" * 200 + self.ts
+        self.assertEqual(
+            split_at_elements(fused, find_embedded_elements(fused, "CDS")), [])
+
+    def test_tags_beside_a_2a_stay_with_their_own_protein(self):
+        """Voltron2's KGC and ER2 belong to Voltron2, not to the junction."""
+        from genesis.vocab import find_embedded_elements, split_at_elements
+        first = "ATG" + "GCT" * 200 + self.ts + self.er2
+        fused = first + self.p2a + "GCT" * 200 + "TAA"
+        pieces = split_at_elements(fused, find_embedded_elements(fused, "CDS"))
+        segments = [p for p in pieces if p["kind"] == "segment"]
+        separators = [p for p in pieces if p["kind"] == "separator"]
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(len(separators), 1)
+        # the boundary is the 2A alone, and the tags went with protein one
+        self.assertEqual(separators[0]["feature_type"], "p2A")
+        self.assertEqual(len(segments[0]["seq"]), len(first))
+
+    def test_a_plain_cds_does_not_split(self):
+        from genesis.vocab import find_embedded_elements, split_at_elements
+        plain = "ATG" + "GCT" * 300 + "TAA"
+        self.assertEqual(
+            split_at_elements(plain, find_embedded_elements(plain, "CDS")), [])
+
+    def test_importer_keeps_the_whole_and_the_pieces(self):
+        from genesis.importer import extract_parts
+        from genesis.seqio import Record
+        conn = connect(":memory:")
+        fused = "ATG" + "GCT" * 200 + self.p2a + "GCT" * 200 + "TAA"
+        pl = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular) VALUES ('p','t',?,?,'x',1)""",
+            (fused, len(fused))).lastrowid
+        rec = Record(name="p", seq=fused, circular=True)
+        extract_parts(conn, pl, rec, [{
+            "feature_type": "CDS", "name": "FusionGene", "start": 0,
+            "end": len(fused), "strand": 1, "confidence": 1.0}])
+        conn.commit()
+        whole = conn.execute(
+            "SELECT id FROM part WHERE derived_from IS NULL").fetchall()
+        pieces = conn.execute(
+            "SELECT name, seq_length FROM part WHERE derived_from IS NOT NULL"
+            " ORDER BY segment_index").fetchall()
+        self.assertEqual(len(whole), 1, "the fusion must stay catalogued")
+        self.assertEqual(len(pieces), 2, "and its proteins must be too")
+        self.assertIn("1 of 2", pieces[0]["name"])
+
+
+# --------------------------------------------------------------------------
+class TestVectorFamilies(unittest.TestCase):
+
+    def _ann(self, *pairs):
+        return [{"feature_type": t, "name": n} for t, n in pairs]
+
+    def test_two_itrs_identify_an_aav(self):
+        from genesis.vectors import classify_vector
+        v = classify_vector(self._ann(("AAV_ITR", "AAV2 ITR"),
+                                      ("AAV_ITR", "AAV2 ITR"),
+                                      ("promoter", "hSyn")), "pAAV-hSyn")
+        self.assertEqual(v["family"], "AAV")
+
+    def test_lentiviral_elements_identify_a_lentivirus(self):
+        from genesis.vectors import classify_vector
+        v = classify_vector(self._ann(("promoter", "5' LTR"),
+                                      ("misc", "HIV-1 psi pack"),
+                                      ("misc", "RRE"), ("misc", "cPPT")),
+                            "pLenti-EF1a")
+        self.assertEqual(v["family"], "lentiviral")
+
+    def test_a_plain_plasmid_is_neither(self):
+        from genesis.vectors import classify_vector
+        v = classify_vector(self._ann(("origin", "ColE1"),
+                                      ("resistance", "AmpR")), "pUC19")
+        self.assertEqual(v["family"], "plasmid")
+
+    def test_conflicting_evidence_is_reported(self):
+        from genesis.vectors import classify_vector
+        v = classify_vector(self._ann(("AAV_ITR", "AAV2 ITR"),
+                                      ("AAV_ITR", "AAV2 ITR"),
+                                      ("promoter", "5' LTR"), ("misc", "RRE"),
+                                      ("misc", "cPPT")), "pLenti-thing")
+        self.assertTrue(v["conflict"])
+        self.assertIn("both AAV and lentiviral", v["warning"])
+
+    def test_aav_needs_two_itrs(self):
+        from genesis.vectors import missing_elements
+        one = missing_elements(self._ann(("AAV_ITR", "AAV2 ITR"),
+                                         ("promoter", "hSyn"),
+                                         ("polyA", "bGH"), ("origin", "ori"),
+                                         ("resistance", "AmpR")), "AAV")
+        self.assertIn("second AAV_ITR", one["missing_required"])
+        self.assertFalse(one["complete"])
+
+    def test_a_complete_aav_passes(self):
+        from genesis.vectors import missing_elements
+        full = missing_elements(self._ann(
+            ("AAV_ITR", "AAV2 ITR"), ("AAV_ITR", "AAV2 ITR"),
+            ("promoter", "hSyn"), ("CDS", "EGFP"), ("WPRE", "WPRE"),
+            ("polyA", "bGH polyA"), ("origin", "ori"),
+            ("resistance", "AmpR")), "AAV")
+        self.assertTrue(full["complete"], full)
+
+    def test_missing_wpre_is_a_warning_not_an_error(self):
+        from genesis.vectors import missing_elements
+        result = missing_elements(self._ann(
+            ("AAV_ITR", "ITR"), ("AAV_ITR", "ITR"), ("promoter", "hSyn"),
+            ("polyA", "bGH"), ("origin", "ori"), ("resistance", "AmpR")), "AAV")
+        self.assertIn("WPRE", result["missing_expected"])
+        self.assertEqual(result["missing_required"], [])
+
+    def test_spec_accepts_the_usual_shorthand(self):
+        for text, expected in (("AAV", "AAV"), ("aav", "AAV"),
+                               ("lenti", "lentiviral"), ("LV", "lentiviral"),
+                               ("plasmid", "plasmid"), ("", ""),
+                               ("auto", "")):
+            spec = ConstructSpec.from_dict({"name": "x", "vector": text})
+            self.assertEqual(spec.vector, expected, text)
+
+    def test_an_unknown_vector_is_refused(self):
+        with self.assertRaises(ValueError):
+            ConstructSpec.from_dict({"name": "x", "vector": "adenovirus"})
