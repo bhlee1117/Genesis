@@ -2485,3 +2485,203 @@ class TestParentSelection(unittest.TestCase):
             "modules": [{"type": "CDS", "name": "g"}]})
         self.assertEqual(spec.recipient_plasmid_id, 11)
         self.assertEqual(spec.donor_plasmid_id, 22)
+
+
+# --------------------------------------------------------------------------
+class TestPromoterSlot(unittest.TestCase):
+    """The promoter is its own slot, not part of the payload or the vector."""
+
+    def _backbone(self):
+        parts, ann, pos = [], [], 0
+
+        def add(seq, ftype, name):
+            nonlocal pos
+            parts.append(seq)
+            ann.append({"feature_type": ftype, "name": name, "start": pos,
+                        "end": pos + len(seq), "strand": 1})
+            pos += len(seq)
+
+        add(rand_seq(141, 1500), "AAV_ITR", "ITR")
+        add(rand_seq(450, 1501), "promoter", "hSyn")
+        add(orf(120, 1502), "CDS", "old gene")
+        add(rand_seq(589, 1503), "WPRE", "WPRE")
+        add(rand_seq(141, 1504), "AAV_ITR", "ITR")
+        add(rand_seq(600, 1505), "origin", "ori")
+        add(rand_seq(860, 1506), "resistance", "AmpR")
+        return "".join(parts), ann
+
+    def _build(self, modules, spec_types):
+        from genesis.construct import ResolvedModule, assemble_into_backbone
+        seq, ann = self._backbone()
+        resolved = [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s,
+                                   t, [], []) for t, n, s in modules]
+        return assemble_into_backbone(resolved, seq, ann, set(spec_types), True)
+
+    def _promoters(self, construct):
+        return [i["name"] for i in construct.layout if i["type"] == "promoter"]
+
+    def test_the_backbones_promoter_is_kept_when_none_is_asked_for(self):
+        c = self._build([("CDS", "newGene", orf(150, 1510))], {"CDS"})
+        self.assertEqual(self._promoters(c), ["hSyn"])
+
+    def test_a_specified_promoter_replaces_it_rather_than_joining_it(self):
+        c = self._build([("promoter", "CAG", rand_seq(400, 1511)),
+                         ("CDS", "newGene", orf(150, 1512))],
+                        {"promoter", "CDS"})
+        self.assertEqual(self._promoters(c), ["CAG"],
+                         "a construct asking for CAG must not also carry hSyn")
+
+    def test_the_old_coding_sequence_still_goes(self):
+        c = self._build([("promoter", "CAG", rand_seq(400, 1513)),
+                         ("CDS", "newGene", orf(150, 1514))],
+                        {"promoter", "CDS"})
+        names = [i["name"] for i in c.layout]
+        self.assertNotIn("old gene", names)
+        self.assertIn("newGene", names)
+
+    def test_the_vector_survives_either_way(self):
+        for modules, types in (
+                ([("CDS", "g", orf(150, 1515))], {"CDS"}),
+                ([("promoter", "CAG", rand_seq(400, 1516)),
+                  ("CDS", "g", orf(150, 1517))], {"promoter", "CDS"})):
+            c = self._build(modules, types)
+            present = {i["type"] for i in c.layout}
+            for required in ("AAV_ITR", "WPRE", "origin", "resistance"):
+                self.assertIn(required, present, f"{required} with {types}")
+
+
+# --------------------------------------------------------------------------
+class TestRecipientTiers(unittest.TestCase):
+    """Recipients are ranked by how far down the architecture they match."""
+
+    def setUp(self):
+        import hashlib
+        self.conn = connect(":memory:")
+        self.prom = rand_seq(400, 1600)
+        self.first = orf(200, 1601)
+        self.second = orf(180, 1602)
+        self.modules = []
+        for ftype, name, seq in (("promoter", "hSyn", self.prom),
+                                 ("CDS", "first", self.first),
+                                 ("CDS", "second", self.second)):
+            pid = self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ftype, name, seq, hashlib.sha256(seq.encode()).hexdigest(),
+                 len(seq))).lastrowid
+            self.modules.append({"type": ftype, "part_id": pid,
+                                 "part_name": name, "seq": seq})
+
+    def _plasmid(self, name, pieces):
+        body = "".join(pieces) + rand_seq(2000, 1603)
+        return self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,1,'unverified')""",
+            (name, body, len(body), name)).lastrowid
+
+    def test_a_longer_leading_run_wins(self):
+        from genesis.swap import architecture_tiers
+        prom_only = self._plasmid("prom-only", [self.prom])
+        prom_first = self._plasmid("prom-first", [self.prom, self.first])
+        self.conn.commit()
+        self.assertEqual(
+            architecture_tiers(self.conn, prom_only, self.modules)["prefix"], 1)
+        self.assertEqual(
+            architecture_tiers(self.conn, prom_first, self.modules)["prefix"], 2)
+
+    def test_parts_out_of_order_do_not_count_as_a_run(self):
+        """Holding the promoter and the last gene is not the same as holding
+        the promoter and the first one."""
+        from genesis.swap import architecture_tiers
+        skipped = self._plasmid("prom-and-last", [self.prom, self.second])
+        self.conn.commit()
+        tiers = architecture_tiers(self.conn, skipped, self.modules)
+        self.assertEqual(tiers["prefix"], 1)
+        self.assertEqual(tiers["total"], 2)
+        self.assertEqual(tiers["first_missing"], "first")
+
+    def test_an_inverted_payload_still_counts_as_present(self):
+        from genesis.swap import architecture_tiers
+        flipped = self._plasmid("flipped", [self.prom,
+                                            st.revcomp(self.first)])
+        self.conn.commit()
+        self.assertEqual(
+            architecture_tiers(self.conn, flipped, self.modules)["prefix"], 2)
+
+    def test_the_ranking_prefers_the_longer_run(self):
+        from genesis.swap import ParentMatch, rank_recipients
+        a = self._plasmid("prom-only", [self.prom])
+        b = self._plasmid("prom-first", [self.prom, self.first])
+        self.conn.commit()
+        candidates = [
+            ParentMatch(a, "prom-only", "t", 2400, True, "unverified"),
+            ParentMatch(b, "prom-first", "t", 2600, True, "unverified")]
+        ranked = rank_recipients(self.conn, candidates, self.modules)
+        self.assertEqual(ranked[0].name, "prom-first")
+        self.assertTrue(any("already has" in r for r in ranked[0].reasons))
+
+
+# --------------------------------------------------------------------------
+class TestDpnINecessity(unittest.TestCase):
+    """DpnI is about the template, not about the assembly chemistry."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+
+    def _plasmid(self, name, marker):
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular) VALUES (?,'t','ACGT',4,?,1)""",
+            (name, name)).lastrowid
+        if marker:
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,'resistance',?,0,10,1)""",
+                (pid, marker))
+        self.conn.commit()
+        return pid
+
+    def test_same_marker_column_purified_needs_dpni(self):
+        from genesis.planner import dpni_decision
+        product = self._plasmid("product", "AmpR")
+        template = self._plasmid("template", "bla (ampicillin)")
+        result = dpni_decision(self.conn, [template], product,
+                               gel_purified=False)
+        self.assertTrue(result["needed"])
+        self.assertIn("same selection marker", result["reason"])
+
+    def test_a_different_marker_makes_it_unnecessary(self):
+        """The plate removes the parent, so DpnI has nothing to add."""
+        from genesis.planner import dpni_decision
+        product = self._plasmid("product", "AmpR")
+        template = self._plasmid("template", "KanR")
+        result = dpni_decision(self.conn, [template], product,
+                               gel_purified=False)
+        self.assertFalse(result["needed"])
+        self.assertIn("different antibiotic", result["reason"])
+
+    def test_gel_purification_makes_it_unnecessary(self):
+        from genesis.planner import dpni_decision
+        product = self._plasmid("product", "AmpR")
+        template = self._plasmid("template", "AmpR")
+        result = dpni_decision(self.conn, [template], product,
+                               gel_purified=True)
+        self.assertFalse(result["needed"])
+        self.assertIn("gel purified", result["reason"])
+
+    def test_an_unannotated_marker_is_treated_as_a_risk(self):
+        """Not knowing what a template selects on is not evidence it is safe."""
+        from genesis.planner import dpni_decision
+        product = self._plasmid("product", "AmpR")
+        template = self._plasmid("template", None)
+        self.assertTrue(dpni_decision(self.conn, [template], product,
+                                      gel_purified=False)["needed"])
+
+    def test_markers_are_recognised_by_their_usual_labels(self):
+        from genesis.planner import resistance_marker
+        for label, expected in (("bla", "AmpR"), ("AmpR", "AmpR"),
+                                ("Ampicillin resistance gene", "AmpR"),
+                                ("KanR", "KanR"), ("neoR/KanR", "KanR"),
+                                ("CmR", "CmR"), ("aacC1", "GentR")):
+            pid = self._plasmid("p" + label, label)
+            self.assertEqual(resistance_marker(self.conn, pid), expected, label)

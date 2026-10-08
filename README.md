@@ -239,12 +239,30 @@ origin of the coordinate system: in one of this lab's backbones the promoter
 sits at 9441 and its own first CDS at 0, so the payload cannot be described
 as a single `start..end` slice at all.
 
+### Slots
+
+A recipient is not one undifferentiated block. The promoter is its own slot:
+a recipient brings one, and it is only replaced when the specification names
+one, or a construct asking for CAG ends up carrying the backbone's hSyn as
+well. The payload is a separate slot, and lands inside the recipient's
+recombinase cassette when it has one.
+
 ### Choosing a recipient and a donor
 
 The plasmid being built into is the first candidate recipient. Proposing a
 swap out of one plasmid while assembling into another describes two
 different experiments, which is how a plan to build a DIO Voltron construct
 came to start from a plasmid holding neither.
+
+Candidates are ranked by how far down the target's architecture they
+already match, tier by tier: the right vector family, then the right
+promoter, then the first coding sequence, and so on. The leading run matters
+more than the total, because a plasmid holding the promoter and the *last*
+reporter needs its middle rebuilt, while one holding the promoter and the
+*first* coding sequence needs only its tail changed. Tiers are measured in
+the order the construct was written, not the order it ends up on the DNA -
+a Cre-lox payload is stored inverted, and scoring against that would rank
+plasmids by how well they match the reverse of the request.
 
 What a recipient already has is judged by sequence, not by catalogue
 identity. The same protein is catalogued several times over at different
@@ -314,6 +332,17 @@ place, and `save_as` stores under a new name and refuses to merge into an
 existing construct's history. Deleting removes one version, or a construct
 and all of its versions; the construct record goes when its last version
 does.
+
+### DpnI
+
+DpnI cuts dam-methylated DNA, so its only job is destroying the circular
+parental plasmid that came in with the template and would otherwise
+transform and grow. That is a question about the template, not about which
+assembly chemistry follows: Gibson and HiFi are no more tolerant of a
+surviving parent than ligation is. Genesis includes the step only when the
+parent could actually produce a colony, and says why when it leaves it out -
+a gel-purified amplicon is already separated from its template, and a
+template selecting on a different antibiotic is removed by the plate.
 
 ### Routes
 
@@ -458,7 +487,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           198 tests, no lab share required
+tests/           212 tests, no lab share required
 ```
 
 ## Giving it to a labmate

@@ -177,6 +177,13 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
 
     # Expand any DIO module into its cassette before assembling, so the
     # molecule that gets validated is the one that would actually be built.
+    # The architecture in the order the user wrote it, kept before the
+    # cassette expansion inverts the payload.
+    logical_modules = [{
+        "type": r.feature_type, "part_id": r.part_id,
+        "part_name": r.part_name, "seq": r.seq,
+    } for r in resolved if r.seq]
+
     # When the recipient already carries lox sites, the cassette is the
     # vector's and the payload goes inside it.
     from .construct import backbone_cassette
@@ -314,7 +321,8 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                             require_family=spec.vector,
                             prefer_plasmid_id=backbone["id"] if backbone else None,
                             pin_recipient_id=spec.recipient_plasmid_id,
-                            pin_donor_id=spec.donor_plasmid_id)
+                            pin_donor_id=spec.donor_plasmid_id,
+                            tier_modules=logical_modules)
     # Only draw a scheme for a swap that is actually on offer; a rejected
     # analysis still carries a recipient, and drawing it would illustrate
     # a plan nobody should follow.

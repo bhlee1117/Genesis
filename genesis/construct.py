@@ -760,6 +760,15 @@ def codon_markers(construct: AssembledConstruct) -> list[dict]:
 CASSETTE_TYPES = {"promoter", "enhancer", "CDS", "Cre-lox", "DIO", "lox_site",
                   "p2A", "trafficking_motif", "tag", "linker", "IRES"}
 
+#: Coding elements, always replaced when a payload is put in.
+PAYLOAD_TYPES = {"CDS", "p2A", "trafficking_motif", "tag", "linker", "IRES"}
+
+#: Regulatory elements that sit outside the payload. A recipient brings its
+#: own, and they are only replaced when the specification names one: a
+#: construct asking for CAG should end up with CAG, not with the backbone's
+#: hSyn *and* CAG.
+REGULATORY_TYPES = {"promoter", "enhancer"}
+
 #: Element types that belong to the vector itself and are never replaced:
 #: the ITRs that make an AAV packageable, and the origin and resistance that
 #: let the plasmid be grown at all.
@@ -828,166 +837,202 @@ def cassette_span(annotations: list[dict], replace_types: set) -> tuple | None:
     return (start, end) if end > start else None
 
 
+def _splice(seq: str, annotations: list[dict], edits: list[dict]) -> tuple:
+    """Apply several replacements to a sequence in one pass.
+
+    Edits are applied right to left so that earlier coordinates stay valid,
+    and every annotation that survives is carried across with its position
+    corrected. Doing it in one place is what keeps the promoter swap and the
+    payload swap from each invalidating the other's offsets.
+    """
+    edits = sorted([e for e in edits if e["end"] >= e["start"]],
+                   key=lambda e: e["start"])
+    out_seq = seq
+    layout: list[dict] = []
+    dropped: list[str] = []
+
+    # Build the new sequence right to left.
+    for edit in reversed(edits):
+        out_seq = out_seq[:edit["start"]] + edit["seq"] + out_seq[edit["end"]:]
+
+    def shift_for(pos: int) -> int | None:
+        """Where `pos` lands afterwards, or None if it was replaced."""
+        delta = 0
+        for edit in edits:
+            if pos >= edit["end"]:
+                delta += len(edit["seq"]) - (edit["end"] - edit["start"])
+            elif pos > edit["start"]:
+                return None
+            # pos == edit["start"] is the boundary itself, not inside it:
+            # a feature ending exactly where the edit begins survives.
+        return pos + delta
+
+    def replaced(a: dict) -> bool:
+        return any(e["end"] > e["start"]
+                   and a["start"] >= e["start"] and a["end"] <= e["end"]
+                   for e in edits)
+
+    for a in annotations:
+        if replaced(a):
+            continue                          # went with the old cassette
+        start, end = shift_for(a["start"]), shift_for(a["end"])
+        if start is None or end is None or end <= start:
+            dropped.append(a["name"])
+            continue
+        layout.append({"name": a["name"], "type": a["feature_type"],
+                       "start": start, "end": end,
+                       "strand": a.get("strand", 1), "from_backbone": True})
+
+    for edit in edits:
+        offset = shift_for(edit["start"])
+        if offset is None:
+            offset = edit["start"]
+            for earlier in edits:
+                if earlier["start"] < edit["start"]:
+                    offset += len(earlier["seq"]) - (earlier["end"] - earlier["start"])
+        for item in edit.get("layout", []):
+            layout.append({**item, "start": item["start"] + offset,
+                           "end": item["end"] + offset,
+                           "from_backbone": False})
+
+    layout.sort(key=lambda i: (i["start"], i["end"]))
+    return out_seq, layout, dropped
+
+
 def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                            backbone_annotations: list[dict],
                            spec_types: set, circular: bool = True
                            ) -> AssembledConstruct:
     """Put the payload where it belongs inside the recipient plasmid.
 
-    Concatenating the payload onto the end of a backbone gives a sequence of
-    the right length that is completely wrong: in an AAV it leaves the whole
-    cassette outside the ITRs, where it cannot be packaged.
+    Two slots are filled, not one. The payload goes where the recipient's
+    coding sequence is - inside its recombinase cassette when it has one.
+    The promoter is separate: a recipient brings its own, and it is only
+    replaced when the specification names one, or a construct asking for CAG
+    ends up carrying the backbone's hSyn as well.
 
-    What a transfer plasmid actually needs kept is everything except the
-    expression cassette itself - the ITRs, the WPRE and polyA that follow
-    the coding sequence, the origin and the resistance marker. Only the
-    promoter-to-CDS stretch is replaced, and only up to the first WPRE or
-    polyA after it, unless the specification supplies its own.
-
-    The backbone is rotated so the payload region is contiguous before any
-    of this is worked out, because in a real pAAV the cassette frequently
-    wraps the origin of the coordinate system - in one of this lab's
-    backbones the promoter sits at 9441 and its own CDS at 0.
+    The backbone is rotated first so the payload region is contiguous, since
+    a real pAAV cassette usually wraps the coordinate origin.
     """
     warnings: list[str] = []
     missing_required: list[dict] = []
 
-    payload_parts: list[str] = []
-    payload_layout: list[dict] = []
-    cursor = 0
+    # --- split the request into its slots --------------------------------
+    regulatory: list[ResolvedModule] = []
+    payload: list[ResolvedModule] = []
+    seen_payload = False
     for rm in resolved:
         if not rm.seq:
             if rm.module.required:
                 missing_required.append({"type": rm.module.type,
                                          "name": rm.module.name})
             continue
-        payload_parts.append(rm.seq)
-        payload_layout.append({
-            "name": rm.part_name, "type": rm.feature_type,
-            "start": cursor, "end": cursor + len(rm.seq),
-            "strand": -1 if rm.module.orientation == "reverse" else 1,
-            "part_id": rm.part_id,
-        })
-        cursor += len(rm.seq)
+        if rm.feature_type in REGULATORY_TYPES and not seen_payload:
+            regulatory.append(rm)
+        else:
+            seen_payload = True
+            payload.append(rm)
         warnings.extend(f"{rm.part_name}: {w}" for w in rm.warnings)
-    payload = "".join(payload_parts)
 
+    def block(modules: list[ResolvedModule]) -> tuple:
+        parts, layout, cursor = [], [], 0
+        for rm in modules:
+            parts.append(rm.seq)
+            layout.append({
+                "name": rm.part_name, "type": rm.feature_type,
+                "start": cursor, "end": cursor + len(rm.seq),
+                "strand": -1 if rm.module.orientation == "reverse" else 1,
+                "part_id": rm.part_id})
+            cursor += len(rm.seq)
+        return "".join(parts), layout
+
+    payload_seq, payload_layout = block(payload)
+    regulatory_seq, regulatory_layout = block(regulatory)
+
+    # --- rotate so the payload region is contiguous ----------------------
     total = len(backbone_seq)
     arc = payload_arc(backbone_annotations, total)
-
     if arc is None:
-        rotation = 0
-        arc_end = total
+        rotation, arc_end = 0, total
         warnings.append(
             "the backbone has no origin or resistance annotated, so the "
             "insertion point was taken from its annotated cassette alone; "
             "check it before building this")
     else:
-        # Rotate so the payload arc starts at 0 and the vector machinery
-        # sits at the end, which makes the arc contiguous even when it
-        # wrapped the coordinate origin.
         rotation = arc[0]
         arc_end = (arc[1] - arc[0]) % total or total
-
-    def rot(pos: int) -> int:
-        return (pos - rotation) % total
 
     rotated_seq = backbone_seq[rotation:] + backbone_seq[:rotation]
     rotated = []
     for a in backbone_annotations:
-        start, end = rot(a["start"]), rot(a["end"])
-        # A feature ending exactly at the rotation point maps to 0, which
-        # would look like a wrap. It is the last thing in the molecule, not
-        # the first - and in a pAAV it is usually an ITR, which must not be
-        # lost.
+        start, end = (a["start"] - rotation) % total, (a["end"] - rotation) % total
         if end == 0 and start > 0:
             end = total
         if end <= start:
-            # straddles the rotation point; it cannot be carried over cleanly
             warnings.append(
                 f"the backbone feature {a['name']!r} spans the insertion "
                 f"boundary and was not carried over")
             continue
         rotated.append({**a, "start": start, "end": end})
 
-    # If the backbone already has a recombinase cassette, the payload
-    # belongs inside it: the lox sites are part of the vector and stay.
+    edits: list[dict] = []
+
+    # --- the payload slot -------------------------------------------------
     existing = backbone_cassette(rotated)
-    if existing is not None and existing["end"] <= arc_end:
-        seq = (rotated_seq[:existing["start"]] + payload
-               + rotated_seq[existing["end"]:])
-        shift = len(payload) - (existing["end"] - existing["start"])
-        layout: list[dict] = []
-        for a in rotated:
-            if a["start"] >= existing["start"] and a["end"] <= existing["end"]:
-                continue
-            offset = shift if a["start"] >= existing["end"] else 0
-            if a["end"] <= existing["start"] or a["start"] >= existing["end"]:
-                layout.append({"name": a["name"], "type": a["feature_type"],
-                               "start": a["start"] + offset,
-                               "end": a["end"] + offset,
-                               "strand": a.get("strand", 1),
-                               "from_backbone": True})
-        for item in payload_layout:
-            layout.append({**item,
-                           "start": item["start"] + existing["start"],
-                           "end": item["end"] + existing["start"],
-                           "from_backbone": False})
-        layout.sort(key=lambda i: (i["start"], i["end"]))
-        warnings.append(
-            "the payload was placed inside the backbone's existing "
-            + " / ".join(dict.fromkeys(existing["flanks"])) + " cassette")
-        return AssembledConstruct(seq, circular, layout, warnings,
-                                  missing_required)
-
-    # The stretch to replace: from the first cassette feature in the payload
-    # region, up to the first terminator element after it.
-    keeps_own_terminators = not (spec_types & {"polyA", "WPRE"})
-    cassette = [a for a in rotated
-                if a["feature_type"] in CASSETTE_TYPES
-                and a["feature_type"] not in VECTOR_TYPES
-                and a["start"] < arc_end]
-
-    if cassette:
-        replace_start = min(a["start"] for a in cassette)
-        replace_end = arc_end
-        if keeps_own_terminators:
-            after = [a["start"] for a in rotated
-                     if a["feature_type"] in ("polyA", "WPRE")
-                     and a["start"] >= replace_start and a["start"] < arc_end]
-            if after:
-                replace_end = min(after)
-    else:
-        replace_start = replace_end = 0
-        warnings.append(
-            "the backbone has no annotated expression cassette, so the "
-            "payload was inserted at the start of the payload region rather "
-            "than replacing anything")
-
-    seq = rotated_seq[:replace_start] + payload + rotated_seq[replace_end:]
-    shift = len(payload) - (replace_end - replace_start)
-
-    layout: list[dict] = []
-    for a in rotated:
-        if a["start"] >= replace_start and a["end"] <= replace_end:
-            continue                        # replaced along with the cassette
-        if a["start"] >= replace_end:
-            layout.append({"name": a["name"], "type": a["feature_type"],
-                           "start": a["start"] + shift, "end": a["end"] + shift,
-                           "strand": a.get("strand", 1), "from_backbone": True})
-        elif a["end"] <= replace_start:
-            layout.append({"name": a["name"], "type": a["feature_type"],
-                           "start": a["start"], "end": a["end"],
-                           "strand": a.get("strand", 1), "from_backbone": True})
-        else:
+    if payload_seq:
+        if existing is not None and existing["end"] <= arc_end:
+            edits.append({"start": existing["start"], "end": existing["end"],
+                          "seq": payload_seq, "layout": payload_layout})
             warnings.append(
-                f"the backbone feature {a['name']!r} straddles the insertion "
-                f"point and was disrupted")
+                "the payload was placed inside the backbone's existing "
+                + " / ".join(dict.fromkeys(existing["flanks"])) + " cassette")
+        else:
+            replace = set(PAYLOAD_TYPES) | (spec_types & {"polyA", "WPRE"}) \
+                | (spec_types & {"Cre-lox", "lox_site"} and {"lox_site"})
+            cassette = [a for a in rotated
+                        if a["feature_type"] in replace
+                        and a["feature_type"] not in VECTOR_TYPES
+                        and a["start"] < arc_end]
+            if cassette:
+                lo = min(a["start"] for a in cassette)
+                hi = arc_end
+                if not (spec_types & {"polyA", "WPRE"}):
+                    after = [a["start"] for a in rotated
+                             if a["feature_type"] in ("polyA", "WPRE")
+                             and lo <= a["start"] < arc_end]
+                    if after:
+                        hi = min(after)
+                edits.append({"start": lo, "end": hi, "seq": payload_seq,
+                              "layout": payload_layout})
+            else:
+                warnings.append(
+                    "the backbone has no annotated coding sequence to "
+                    "replace, so the payload was inserted at the start of "
+                    "the payload region rather than replacing anything")
+                edits.append({"start": 0, "end": 0, "seq": payload_seq,
+                              "layout": payload_layout})
 
-    for item in payload_layout:
-        layout.append({**item, "start": item["start"] + replace_start,
-                       "end": item["end"] + replace_start,
-                       "from_backbone": False})
+    # --- the regulatory slot ---------------------------------------------
+    if regulatory_seq:
+        lower = min((e["start"] for e in edits), default=arc_end)
+        own = [a for a in rotated
+               if a["feature_type"] in REGULATORY_TYPES
+               and a["end"] <= lower and a["start"] < arc_end]
+        if own:
+            edits.append({"start": min(a["start"] for a in own),
+                          "end": max(a["end"] for a in own),
+                          "seq": regulatory_seq, "layout": regulatory_layout})
+        else:
+            edits.append({"start": lower, "end": lower, "seq": regulatory_seq,
+                          "layout": regulatory_layout})
+            warnings.append(
+                "the backbone has no promoter upstream of its cassette, so "
+                "the one specified was inserted rather than replacing one")
 
-    layout.sort(key=lambda i: (i["start"], i["end"]))
+    seq, layout, dropped = _splice(rotated_seq, rotated, edits)
+    for name in dropped:
+        warnings.append(
+            f"the backbone feature {name!r} straddles an insertion point "
+            f"and was disrupted")
+
     return AssembledConstruct(seq, circular, layout, warnings, missing_required)

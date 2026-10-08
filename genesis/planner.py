@@ -770,11 +770,17 @@ def plan_swap_hifi_route(conn: sqlite3.Connection, analysis, cfg: Config,
             f"{cfg.max_pcr_length:,} bp limit; the restriction swap avoids "
             f"amplifying the backbone at all")
 
-    steps.append(Step(
-        0, "DPNI_DIGEST",
-        f"Digest both PCR reactions with DpnI to remove the parental "
-        f"{rec['name']} and {don['name']} templates",
-        output="template-free amplicons"))
+    dpni = dpni_decision(conn, [analysis.recipient.plasmid_id,
+                                analysis.donor.plasmid_id],
+                         analysis.recipient.plasmid_id, gel_purified=False)
+    if dpni["needed"]:
+        steps.append(Step(
+            0, "DPNI_DIGEST",
+            f"Digest both PCR reactions with DpnI to remove the parental "
+            f"{rec['name']} and {don['name']} templates",
+            output="template-free amplicons"))
+    else:
+        route.warnings.append("DpnI is not needed here: " + dpni["reason"])
     steps.append(Step(0, "DNA_CLEANUP",
                       "Column purify both PCR products",
                       output="clean amplicons"))
@@ -1106,10 +1112,15 @@ def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
         output=f"{analysis.insert.label} amplicon",
         details={"length": len(insert_seq), "template": don["name"],
                  "gc": round(gc_fraction(insert_seq), 3)}))
-    steps.append(Step(
-        0, "DPNI_DIGEST",
-        f"Digest the PCR with DpnI to remove the parental {don['name']}",
-        output="template-free amplicon"))
+    dpni = dpni_decision(conn, [analysis.donor.plasmid_id],
+                         analysis.recipient.plasmid_id, gel_purified=False)
+    if dpni["needed"]:
+        steps.append(Step(
+            0, "DPNI_DIGEST",
+            f"Digest the PCR with DpnI to remove the parental {don['name']}",
+            output="template-free amplicon"))
+    else:
+        route.warnings.append("DpnI is not needed here: " + dpni["reason"])
     steps.append(Step(0, "DNA_CLEANUP", "Column purify the PCR product",
                       output="clean amplicon"))
     steps.append(Step(
@@ -1128,3 +1139,80 @@ def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
     route.warnings += analysis.notes
     route.cost_breakdown["enzymes"] = [e1, e2]
     return route
+
+
+# --------------------------------------------------------------------------
+# When DpnI is actually needed
+# --------------------------------------------------------------------------
+
+#: Resistance markers, normalised. Two templates that select differently can
+#: be told apart by the plate, which is what makes DpnI skippable.
+_MARKERS = (("amp", "AmpR"), ("bla", "AmpR"), ("carb", "AmpR"),
+            ("kan", "KanR"), ("neo", "KanR"), ("chlor", "CmR"),
+            ("cam", "CmR"), ("spec", "SpecR"), ("strep", "SmR"),
+            ("tet", "TetR"), ("zeo", "ZeoR"), ("blast", "BsdR"),
+            ("puro", "PuroR"), ("hygro", "HygR"), ("gent", "GentR"),
+            ("aacc1", "GentR"))
+
+
+def resistance_marker(conn: sqlite3.Connection, plasmid_id: int) -> str | None:
+    """Which antibiotic a plasmid is selected with, as far as it is annotated."""
+    rows = conn.execute(
+        """SELECT name FROM annotation
+           WHERE plasmid_id = ? AND feature_type = 'resistance'""",
+        (plasmid_id,)).fetchall()
+    for row in rows:
+        label = (row["name"] or "").lower()
+        for needle, marker in _MARKERS:
+            if needle in label:
+                return marker
+    return None
+
+
+def dpni_decision(conn: sqlite3.Connection, template_ids: list,
+                  product_id: int | None, gel_purified: bool) -> dict:
+    """Whether a DpnI step earns its place.
+
+    DpnI cuts dam-methylated DNA, so its only job is destroying the circular
+    parental plasmid that came in with the template and would otherwise
+    transform directly and grow on the plate. That is a question about the
+    template, not about which assembly chemistry follows: Gibson and HiFi
+    are no more tolerant of a surviving parental plasmid than ligation is.
+
+    It can be dropped when the parent cannot produce a colony anyway:
+
+    * the amplicon was gel purified, which physically separates it from the
+      template;
+    * the template selects on a different antibiotic from the product, so
+      the plate removes it;
+    * the template was not a plasmid grown in a dam+ strain, in which case
+      DpnI has nothing to cut.
+    """
+    reasons: list[str] = []
+    if gel_purified:
+        return {"needed": False,
+                "reason": "the amplicon is gel purified, which separates it "
+                          "from the parental plasmid; DpnI would be "
+                          "belt-and-braces"}
+
+    product_marker = (resistance_marker(conn, product_id)
+                      if product_id is not None else None)
+    same_selection = []
+    for tid in template_ids:
+        marker = resistance_marker(conn, tid)
+        if marker is None or product_marker is None or marker == product_marker:
+            same_selection.append(tid)
+        else:
+            reasons.append(f"one template selects on {marker} and the product "
+                           f"on {product_marker}")
+
+    if not same_selection:
+        return {"needed": False,
+                "reason": "every template selects on a different antibiotic "
+                          "from the product, so the plate removes them: "
+                          + "; ".join(dict.fromkeys(reasons))}
+
+    return {"needed": True,
+            "reason": "a template carries the same selection marker as the "
+                      "product, so parental plasmid surviving the reaction "
+                      "would grow on the plate and look like a clone"}

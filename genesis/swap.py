@@ -393,7 +393,8 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
                  require_family: str = "",
                  prefer_plasmid_id: int | None = None,
                  pin_recipient_id: int | None = None,
-                 pin_donor_id: int | None = None) -> SwapAnalysis | None:
+                 pin_donor_id: int | None = None,
+                 tier_modules: list[dict] | None = None) -> SwapAnalysis | None:
     """Plan the shortest edit: one region out of a recipient, one piece in.
 
     ``resolved_modules`` is the plan's module list, in target order, each
@@ -451,6 +452,21 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
         if pinned is not None:
             candidates = [pinned] + [c for c in candidates
                                      if c.plasmid_id != pin_recipient_id]
+
+    # Rank by how far down the architecture each candidate already matches,
+    # rather than by how many parts it happens to share.
+    # Tier against the architecture as it was written, not as it ends up on
+    # the DNA. A Cre-lox payload is stored inverted, so the assembled order
+    # runs backwards, and scoring "promoter, then first coding sequence"
+    # against that would rank a plasmid by how well it matches the reverse
+    # of what was asked for.
+    ranked = rank_recipients(conn, candidates, tier_modules or wanted,
+                             prefer_id=pin_recipient_id
+                             if pin_recipient_id is not None
+                             else prefer_plasmid_id)
+    if ranked:
+        candidates = ranked + [c for c in candidates
+                               if c not in ranked]
     recipient = candidates[0]
     recipient_options = [c.to_dict() for c in candidates[:6]]
 
@@ -729,3 +745,86 @@ def same_protein_parts(conn: sqlite3.Connection, seq: str,
         if protein_identity(target, protein_of(row["seq"])) >= PROTEIN_IDENTITY:
             ids.append(row["id"])
     return ids
+
+
+# --------------------------------------------------------------------------
+# Tiered recipient scoring
+# --------------------------------------------------------------------------
+
+def architecture_tiers(conn: sqlite3.Connection, plasmid_id: int,
+                       modules: list[dict]) -> dict:
+    """How far down the target's architecture a plasmid already matches.
+
+    Counting shared parts treats a plasmid holding the promoter and the last
+    reporter the same as one holding the promoter and the first coding
+    sequence. They are not the same: the second needs only its tail changed,
+    which is one swap, while the first needs the middle rebuilt.
+
+    So the leading run matters more than the total. A recipient that already
+    has the right vector, the right promoter and the right first coding
+    sequence is the one to start from, and what is left to do is whatever
+    comes after the run ends.
+
+    Presence is tested on both strands, because a Cre-lox payload sits
+    inverted and is no less present for it.
+    """
+    row = conn.execute("SELECT seq, name FROM plasmid WHERE id = ?",
+                       (plasmid_id,)).fetchone()
+    if row is None:
+        return {"prefix": 0, "total": 0, "matched": [], "first_missing": None}
+
+    host = row["seq"].upper()
+    matched: list[str] = []
+    prefix = 0
+    counting = True
+    first_missing = None
+
+    for module in modules:
+        seq = (module.get("seq") or "").upper()
+        if not seq:
+            continue
+        present = sequence_coverage(seq, host) >= VARIANT_COVERAGE
+        if present:
+            matched.append(module.get("part_name") or module.get("type", "?"))
+            if counting:
+                prefix += 1
+        else:
+            if counting:
+                counting = False
+                first_missing = module.get("part_name") or module.get("type")
+    return {"prefix": prefix, "total": len(matched), "matched": matched,
+            "first_missing": first_missing}
+
+
+def rank_recipients(conn: sqlite3.Connection, candidates: list,
+                    modules: list[dict], prefer_id: int | None = None,
+                    limit: int = 6) -> list:
+    """Order recipients by how much of the architecture they already carry.
+
+    Tier by tier: the right vector and promoter first, then the first coding
+    sequence, and so on down the construct. Ties go to the smaller plasmid.
+    """
+    scored = []
+    for candidate in candidates[:40]:
+        tiers = architecture_tiers(conn, candidate.plasmid_id, modules)
+        candidate.reasons = []
+        if tiers["prefix"]:
+            candidate.reasons.append(
+                "already has " + " + ".join(tiers["matched"][:tiers["prefix"]]))
+        elif tiers["total"]:
+            candidate.reasons.append(
+                f"has {tiers['total']} of the parts, but not in order from "
+                f"the promoter")
+        if tiers["first_missing"]:
+            candidate.reasons.append(f"would need {tiers['first_missing']}")
+        if candidate.verified != "unverified":
+            candidate.reasons.append("sequence verified")
+        candidate.reasons.append(f"{candidate.length:,} bp")
+        scored.append((
+            (0 if candidate.plasmid_id == prefer_id else 1,
+             -tiers["prefix"], -tiers["total"],
+             0 if candidate.verified != "unverified" else 1,
+             candidate.length),
+            candidate))
+    scored.sort(key=lambda item: item[0])
+    return [c for _, c in scored[:limit]]
