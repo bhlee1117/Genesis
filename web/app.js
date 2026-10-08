@@ -6,12 +6,15 @@
 'use strict';
 
 /* ------------------------------------------------------------------ */
-/* Controlled vocabulary (mirrors genesis/vocab.py FEATURE_TYPES)       */
+/* Controlled vocabulary                                               */
 /* ------------------------------------------------------------------ */
 
+/* The server owns the vocabulary and it has changed under us before (DIO
+ * became Cre-lox), so the list below is only the offline fallback: init()
+ * replaces it with GET /api/vocab before the first row is drawn. */
 var FEATURE_TYPES = [
   'backbone', 'promoter', 'enhancer', 'CDS', 'trafficking_motif', 'linker',
-  'p2A', 'IRES', 'DIO', 'lox_site', 'AAV_ITR', 'resistance', 'origin',
+  'p2A', 'IRES', 'Cre-lox', 'lox_site', 'AAV_ITR', 'resistance', 'origin',
   'tag', 'polyA', 'WPRE', 'restriction_site', 'primer_binding_site',
   'terminator', 'intron', 'unknown'
 ];
@@ -20,15 +23,69 @@ var FEATURE_TYPES = [
 var TYPE_COLORS = {
   backbone: '#8a8f98', promoter: '#2f7f4f', enhancer: '#4f9e6a',
   CDS: '#2f6fb0', trafficking_motif: '#7a5fb0', linker: '#9aa0a8',
-  p2A: '#b07a2f', IRES: '#b0652f', DIO: '#a0398c', lox_site: '#c03a5b',
+  p2A: '#b07a2f', IRES: '#b0652f', 'Cre-lox': '#a0398c', lox_site: '#c03a5b',
   AAV_ITR: '#b02f2f', resistance: '#6b8f2f', origin: '#2f8f8f',
   tag: '#8f6f2f', polyA: '#4a5fa8', WPRE: '#5f7f9e', restriction_site: '#8f4f6f',
   primer_binding_site: '#7f8f4f', terminator: '#6f5f8f', intron: '#5f8f7f',
-  unknown: '#8a8f98'
+  unknown: '#8a8f98',
+  /* Parts indexed before the rename still carry the old type name. */
+  DIO: '#a0398c'
 };
 
 function colorFor(type) {
   return TYPE_COLORS[type] || TYPE_COLORS.unknown;
+}
+
+/* ---- Cre-lox ------------------------------------------------------- */
+
+/* The arrangements genesis/construct.py RECOMBINASE_MODES offers. `short` is
+ * what the group header says at a glance; `long` is the tooltip. */
+var CRE_LOX_TYPE = 'Cre-lox';
+
+var CRE_LOX_MODES = [
+  { key: 'DIO', title: 'double-floxed inverted orientation',
+    short: 'payload inverted, Cre switches ON',
+    long: 'DIO: the payload is stored inverted between lox2272 and loxP ' +
+          'pairs, so nothing is expressed until Cre flips it — Cre switches ' +
+          'expression ON.' },
+  { key: 'FLEX', title: 'flip-excision switch',
+    short: 'payload inverted, Cre switches ON',
+    long: 'FLEX: the flip-excision arrangement of the same lox2272 / loxP ' +
+          'pairs. The payload is stored inverted, so Cre switches ' +
+          'expression ON.' },
+  { key: 'FAS', title: 'loxP / loxFAS switch',
+    short: 'payload inverted, Cre switches ON (loxFAS)',
+    long: 'FAS: as DIO, but the second site pair is loxFAS instead of ' +
+          'lox2272. The payload is stored inverted, so Cre switches ' +
+          'expression ON.' },
+  { key: 'DO', title: 'double-floxed, Cre-OFF',
+    short: 'payload forward, Cre switches OFF',
+    long: 'DO: the payload is stored forward and is expressed from the ' +
+          'start; Cre inverts it away — Cre switches expression OFF.' }
+];
+
+var DEFAULT_CRE_LOX_MODE = 'DIO';
+
+/* Module types a Cre-lox cassette encloses; it ends at the first module that
+ * is not one of these (a polyA or a WPRE stays outside).
+ * Mirrors CASSETTE_PAYLOAD_TYPES in genesis/construct.py. */
+var CASSETTE_PAYLOAD_TYPES = ['CDS', 'trafficking_motif', 'linker', 'p2A',
+                              'tag', 'IRES'];
+
+function isCreLox(type) { return type === CRE_LOX_TYPE || type === 'DIO'; }
+
+function creLoxMode(key) {
+  var want = String(key || DEFAULT_CRE_LOX_MODE).toUpperCase();
+  for (var i = 0; i < CRE_LOX_MODES.length; i++) {
+    if (CRE_LOX_MODES[i].key === want) return CRE_LOX_MODES[i];
+  }
+  return CRE_LOX_MODES[0];
+}
+
+/** "DIO — payload inverted, Cre switches ON" */
+function creLoxLabel(key) {
+  var m = creLoxMode(key);
+  return m.key + ' — ' + m.short;
 }
 
 /* ------------------------------------------------------------------ */
@@ -699,7 +756,35 @@ var state = {
 
 /** A builder row. `part_id` pins an exact inventory part when one was picked. */
 function newModule(type) {
-  return { type: type, name: '', part_id: null, form: 'all' };
+  return {
+    type: type, name: '', part_id: null, form: 'all',
+    // Only meaningful on a Cre-lox row; kept on the row either way so that
+    // switching the type away and back does not forget the arrangement.
+    mode: isCreLox(type) ? DEFAULT_CRE_LOX_MODE : ''
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Controlled vocabulary, from the server                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Replace the built-in feature-type list with the server's own.
+ *
+ * The vocabulary is the server's to define — it renamed DIO to Cre-lox — so
+ * the type selects are filled from it rather than from a list in here that
+ * can silently drift. A failed request leaves the fallback in place: the
+ * builder still works, it just offers the types this file knows about.
+ */
+async function loadVocab() {
+  try {
+    var v = await api('/api/vocab');
+    if (Array.isArray(v.feature_types) && v.feature_types.length) {
+      FEATURE_TYPES = v.feature_types.slice();
+    }
+  } catch (err) {
+    /* Offline or an older server: keep the fallback list. */
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -829,7 +914,13 @@ function populatePartTypes(byType) {
   sel.dataset.filled = '1';
   var counts = {};
   byType.forEach(function (r) { counts[r.feature_type] = r.n; });
-  FEATURE_TYPES.forEach(function (t) {
+  // Parts indexed under a type the vocabulary has since renamed (DIO before
+  // it became Cre-lox) are still in the inventory, so list those too rather
+  // than leaving them unreachable from this filter.
+  var types = FEATURE_TYPES.concat(Object.keys(counts).filter(function (t) {
+    return t && FEATURE_TYPES.indexOf(t) < 0;
+  }));
+  types.forEach(function (t) {
     var n = counts[t];
     sel.appendChild(h('option', { value: t },
       t + (n ? ' (' + n + ')' : '')));
@@ -1288,42 +1379,184 @@ function partPicker(mod) {
   };
 }
 
-function renderModules() {
+/**
+ * Which rows each Cre-lox cassette encloses.
+ *
+ * A Cre-lox module is an architecture, not a part: the server wraps the
+ * coding modules that follow it and stops at the first module that is not
+ * one of them. This recomputes that span from the flat list, so the bracket
+ * drawn in the builder is derived from the same rule and never has to be
+ * kept in step by hand.
+ *
+ * Returns [{ head, members: [index…] }] in row order.
+ */
+function cassetteGroups(mods) {
+  var groups = [];
+  for (var i = 0; i < mods.length; i++) {
+    if (!isCreLox(mods[i].type)) continue;
+    var members = [];
+    var j = i + 1;
+    while (j < mods.length &&
+           CASSETTE_PAYLOAD_TYPES.indexOf(mods[j].type) >= 0) {
+      members.push(j);
+      j++;
+    }
+    groups.push({ head: i, members: members });
+    // A cassette cannot open inside another one's payload: carry on from
+    // the first row this cassette did not take.
+    i = j - 1;
+  }
+  return groups;
+}
+
+/** The mode selector shown on a Cre-lox row. */
+function modeSelect(mod, i, onPicked) {
+  var sel = h('select', {
+    class: 'mode-select',
+    'aria-label': 'Module ' + (i + 1) + ' Cre-lox arrangement',
+    onchange: function (e) {
+      mod.mode = e.target.value;
+      sel.title = creLoxMode(mod.mode).long;
+      onPicked();
+    }
+  }, CRE_LOX_MODES.map(function (m) {
+    return h('option', { value: m.key, title: m.long },
+      m.key + ' — ' + m.title);
+  }));
+  sel.value = creLoxMode(mod.mode).key;
+  sel.title = creLoxMode(mod.mode).long;
+  return sel;
+}
+
+/**
+ * One builder row, without any of the cassette decoration around it.
+ *
+ * `focus` is 'type' or 'mode' when this row is being redrawn because that
+ * control was just used: changing either one re-groups the whole builder, so
+ * the control has to be given its focus back on the new row.
+ */
+function moduleRow(mod, i, focus) {
+  var picker = partPicker(mod);
+  var typeSel = h('select', {
+    'aria-label': 'Module ' + (i + 1) + ' feature type',
+    onchange: function (e) {
+      mod.type = e.target.value;
+      if (isCreLox(mod.type) && !mod.mode) mod.mode = DEFAULT_CRE_LOX_MODE;
+      // The type decides whether this row opens a cassette and whether the
+      // rows under it are enclosed, so the whole builder is redrawn; focus
+      // is put back on the select that was just used.
+      renderModules(i, 'type');
+    }
+  }, FEATURE_TYPES.map(function (t) {
+    return h('option', { value: t, selected: t === mod.type }, t);
+  }));
+  // A spec loaded with a type this vocabulary no longer lists would
+  // otherwise silently become the first option.
+  if (FEATURE_TYPES.indexOf(mod.type) < 0 && mod.type) {
+    typeSel.appendChild(h('option', { value: mod.type }, mod.type + ' (legacy)'));
+  }
+  typeSel.value = mod.type;
+  if (focus === 'type') requestAnimationFrame(function () { typeSel.focus(); });
+
+  var modeSel = isCreLox(mod.type)
+    ? modeSelect(mod, i, function () { renderModules(i, 'mode'); })
+    : null;
+  if (modeSel && focus === 'mode') {
+    requestAnimationFrame(function () { modeSel.focus(); });
+  }
+
+  return h('div', { class: 'module-row' + (isCreLox(mod.type) ? ' is-crelox' : '') },
+    h('span', { class: 'module-index' }, String(i + 1)),
+    typeSel,
+    modeSel,
+    picker.node,
+    picker.formFilter,
+    picker.chip,
+    h('div', { class: 'row-buttons' },
+      h('button', {
+        type: 'button', title: 'Move up', disabled: i === 0,
+        onclick: function () { swapModules(i, i - 1); }
+      }, '↑'),
+      h('button', {
+        type: 'button', title: 'Move down', disabled: i === state.modules.length - 1,
+        onclick: function () { swapModules(i, i + 1); }
+      }, '↓'),
+      h('button', {
+        type: 'button', class: 'danger', title: 'Remove',
+        onclick: function () { state.modules.splice(i, 1); renderModules(); }
+      }, '×')));
+}
+
+/**
+ * Draw the builder, bracketing each Cre-lox cassette around what it encloses.
+ *
+ * The bracket is presentation only: `state.modules` stays the flat, ordered
+ * list the server is sent, and the row numbers keep counting straight
+ * through the group.
+ */
+function renderModules(focusIndex, focusWhat) {
   var host = $('modules');
   clear(host);
   if (!state.modules.length) {
     host.appendChild(h('p', { class: 'muted' }, 'No modules yet. Add one below.'));
+    return;
   }
-  state.modules.forEach(function (mod, i) {
-    var picker = partPicker(mod);
-    var typeSel = h('select', {
-      'aria-label': 'Module ' + (i + 1) + ' feature type',
-      onchange: function (e) { mod.type = e.target.value; picker.refresh(); }
-    }, FEATURE_TYPES.map(function (t) {
-      return h('option', { value: t, selected: t === mod.type }, t);
-    }));
-    typeSel.value = mod.type;
 
-    host.appendChild(h('div', { class: 'module-row' },
-      h('span', { class: 'module-index' }, String(i + 1)),
-      typeSel,
-      picker.node,
-      picker.formFilter,
-      picker.chip,
-      h('div', { class: 'row-buttons' },
-        h('button', {
-          type: 'button', title: 'Move up', disabled: i === 0,
-          onclick: function () { swapModules(i, i - 1); }
-        }, '↑'),
-        h('button', {
-          type: 'button', title: 'Move down', disabled: i === state.modules.length - 1,
-          onclick: function () { swapModules(i, i + 1); }
-        }, '↓'),
-        h('button', {
-          type: 'button', class: 'danger', title: 'Remove',
-          onclick: function () { state.modules.splice(i, 1); renderModules(); }
-        }, '×'))));
-  });
+  var groups = cassetteGroups(state.modules);
+  var headOf = {};
+  groups.forEach(function (g) { headOf[g.head] = g; });
+
+  var i = 0;
+  while (i < state.modules.length) {
+    var group = headOf[i];
+    if (!group) {
+      host.appendChild(moduleRow(state.modules[i], i,
+        i === focusIndex ? (focusWhat || 'type') : null));
+      i++;
+      continue;
+    }
+
+    var mod = state.modules[i];
+    var meta = creLoxMode(mod.mode);
+    var members = group.members;
+
+    var box = h('div', {
+      class: 'cassette' + (members.length ? '' : ' cassette-empty'),
+      role: 'group',
+      'aria-label': 'Cre-lox cassette, ' + meta.key + ' arrangement, enclosing ' +
+        plural(members.length, 'module')
+    }, moduleRow(mod, i, i === focusIndex ? (focusWhat || 'type') : null));
+
+    box.appendChild(h('div', { class: 'cassette-label', title: meta.long },
+      h('span', { class: 'cassette-mode' }, meta.key),
+      h('span', { class: 'cassette-meaning' }, '— ' + meta.short),
+      h('span', { class: 'cassette-count muted small' },
+        members.length
+          ? 'encloses ' + plural(members.length, 'module')
+          : 'encloses nothing yet')));
+
+    if (members.length) {
+      box.appendChild(h('div', { class: 'cassette-body' },
+        members.map(function (idx) {
+          return moduleRow(state.modules[idx], idx,
+            idx === focusIndex ? (focusWhat || 'type') : null);
+        })));
+      box.appendChild(h('div', { class: 'cassette-foot muted small' },
+        'end of cassette · ' +
+        (state.modules[members[members.length - 1] + 1]
+          ? 'the rows below stay outside it'
+          : 'nothing follows it')));
+      i = members[members.length - 1] + 1;
+    } else {
+      box.appendChild(h('p', { class: 'cassette-warn inline-warn small' },
+        'A Cre-lox module has to enclose something. Put a CDS (or a tag, ' +
+        'linker, p2A, trafficking motif or IRES) directly after it, or the ' +
+        'server drops the cassette.'));
+      i++;
+    }
+
+    host.appendChild(box);
+  }
 }
 
 function swapModules(a, b) {
@@ -1354,6 +1587,10 @@ function collectSpec() {
       // Only send a pin when the row actually carries one; an absent part_id
       // leaves the server free to pick a candidate as it always did.
       if (m.part_id) out.part_id = m.part_id;
+      // `mode` means nothing on any other type, and the server falls back to
+      // reading the module's *name* as a mode when it is absent, so a
+      // Cre-lox row always states it.
+      if (isCreLox(m.type)) out.mode = creLoxMode(m.mode).key;
       return out;
     })
   };
@@ -1379,12 +1616,16 @@ function applySpecToBuilder(spec) {
     return o.value === wanted;
   }) ? wanted : '';
   state.modules = (spec.modules || []).map(function (m) {
+    var type = m.type || 'unknown';
     return {
-      type: m.type || 'unknown',
+      type: type,
       name: m.name || '',
       part_id: m.part_id || null,
       pin_note: '',
-      form: 'all'
+      form: 'all',
+      // A Cre-lox row saved without a mode is the DIO arrangement, which is
+      // what the server assumes for it too.
+      mode: isCreLox(type) ? creLoxMode(m.mode).key : (m.mode || '')
     };
   });
   if (!state.modules.length) state.modules = [newModule('promoter')];
@@ -1444,6 +1685,100 @@ function refreshSaveButtons() {
       'Linked to design #' + saved.design_id + ' — version ' + saved.version +
       ' of “' + saved.name + '”. Overwrite replaces that version; Save adds a new one.'));
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Tab 3: Design - clearing the specification                          */
+/* ------------------------------------------------------------------ */
+
+/** The construct fields, as they are on a freshly loaded page. */
+function fieldsArePristine() {
+  var name = $('spec-name').value.trim().toLowerCase();
+  return (name === '' || name === 'untitled') &&
+         !$('spec-backbone').value.trim() &&
+         !$('spec-owner').value.trim() &&
+         !$('spec-vector').value &&
+         $('spec-circular').checked;
+}
+
+function modulesArePristine() {
+  if (state.modules.length !== 1) return false;
+  var m = state.modules[0];
+  return m.type === 'promoter' && !(m.name || '').trim() && !m.part_id;
+}
+
+/**
+ * What a Clear would throw away, in words, or [] when there is nothing.
+ *
+ * Clearing is one click and cannot be undone, so the confirmation names the
+ * work by what it is — a plan, pinned parts, typed YAML — rather than asking
+ * "are you sure?" about an unspecified something.
+ */
+function unsavedWork() {
+  var bits = [];
+
+  if (state.plan) {
+    bits.push(state.saved && state.saved.design_id
+      ? 'the plan on screen (saved as version ' + state.saved.version +
+        ' of “' + state.saved.name + '”, so it can be re-opened from the ' +
+        'Designs tab)'
+      : 'the generated plan on screen, which has not been saved');
+  }
+
+  if (!modulesArePristine()) {
+    var pinned = state.modules.filter(function (m) { return !!m.part_id; }).length;
+    bits.push(plural(state.modules.length, 'module row') +
+      (pinned ? ' (' + pinned + ' pinned to an exact inventory part)' : ''));
+  }
+
+  if (!fieldsArePristine()) bits.push('the construct details that were typed in');
+  if ($('spec-yaml').value.trim()) bits.push('the YAML specification');
+
+  return bits;
+}
+
+/** Reset the whole Design tab to the state the page opens in. */
+function clearSpec() {
+  $('spec-name').value = 'untitled';
+  $('spec-backbone').value = '';
+  $('spec-owner').value = '';
+  $('spec-vector').value = '';
+  $('spec-circular').checked = true;
+  $('spec-yaml').value = '';
+
+  // A fresh row: no name, and no `part_id`, so nothing stays pinned.
+  state.modules = [newModule('promoter')];
+  state.plan = null;
+  state.spec = null;
+  state.routeId = null;
+  state.saved = null;
+  state.appliedSuggestion = null;
+
+  clear($('plan-out'));
+  renderModules();
+  refreshSaveButtons();   // also clears the saved-design link
+  setStatus($('design-status'), 'specification cleared');
+}
+
+function clearSpecWithConfirm() {
+  var losing = unsavedWork();
+  if (!losing.length) { clearSpec(); return; }
+
+  modal({
+    title: 'Clear the construct specification?',
+    confirmLabel: 'Clear',
+    danger: true,
+    body: [
+      h('p', null, 'This resets the Design tab to an empty specification. ' +
+        'It discards:'),
+      h('ul', { class: 'modal-list' }, losing.map(function (b) {
+        return h('li', null, b);
+      })),
+      h('p', { class: 'muted small' },
+        'Saved designs are not touched — only what is on screen.')
+    ],
+    onConfirm: function (api_) { api_.close(); clearSpec(); }
+  });
 }
 
 async function generatePlan() {
@@ -1672,9 +2007,7 @@ function renderPlan() {
         (plan.backbone ? ' · backbone: ' + plan.backbone.name +
           ' (' + bp(plan.backbone.length) + ')' : ' · no backbone'))),
     suggestedName(c),
-    featureMap(c.length, c.layout || [], {
-      label: c.name, circular: !!c.circular, markers: c.codon_markers
-    }));
+    creLoxSummary(plan));
 
   if (plan.modules && plan.modules.length) {
     summary.appendChild(h('h4', null, 'Modules'));
@@ -1701,6 +2034,12 @@ function renderPlan() {
   }
   out.appendChild(summary);
 
+  /* --- the designed molecule itself -------------------------------- */
+  out.appendChild(renderConstruct(c));
+
+  /* --- read-back verification -------------------------------------- */
+  if (plan.verification) out.appendChild(renderVerification(plan.verification));
+
   /* --- vector family ----------------------------------------------- */
   if (plan.vector) out.appendChild(renderVector(plan.vector, plan));
 
@@ -1716,6 +2055,353 @@ function renderPlan() {
 
   /* --- export ------------------------------------------------------ */
   out.appendChild(renderExports());
+}
+
+/* ------------------------------------------------------------------ */
+/* Plan: the Cre-lox arrangement that was asked for                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One line naming each cassette in the specification and what it does.
+ *
+ * `spec_order` is the order as typed, before the cassette was expanded, so
+ * it is the only place in the plan that still carries the mode.
+ */
+function creLoxSummary(plan) {
+  var order = (plan.construct && plan.construct.spec_order) || [];
+  var cassettes = order.filter(function (m) { return isCreLox(m.type); });
+  if (!cassettes.length) return null;
+
+  return h('p', { class: 'crelox-summary' }, cassettes.map(function (m) {
+    var meta = creLoxMode(m.mode);
+    return h('span', { class: 'crelox-chip', title: meta.long },
+      h('span', { class: 'crelox-key' }, 'Cre-lox ' + meta.key),
+      h('span', { class: 'muted small' }, meta.short));
+  }));
+}
+
+/* ------------------------------------------------------------------ */
+/* Plan: the full designed construct                                   */
+/* ------------------------------------------------------------------ */
+
+var SEQ_LINE = 60;        // bases per rendered line
+var SEQ_GROUP = 10;       // bases per visual group within a line
+
+/** Fraction of G + C, counted without allocating a copy of the sequence. */
+function gcFraction(seq) {
+  var gc = 0;
+  for (var i = 0; i < seq.length; i++) {
+    var ch = seq.charCodeAt(i);
+    // G g C c
+    if (ch === 71 || ch === 103 || ch === 67 || ch === 99) gc++;
+  }
+  return seq.length ? gc / seq.length : 0;
+}
+
+/**
+ * The numbered sequence listing.
+ *
+ * Built as one string and handed to a single text node: a 15 kb construct is
+ * 250 lines, and one text node costs a fraction of what 250 elements and
+ * their layout would. Called lazily, the first time the block is opened.
+ */
+function sequenceText(seq) {
+  var width = String(seq.length).length;
+  var lines = [];
+  for (var i = 0; i < seq.length; i += SEQ_LINE) {
+    var chunk = seq.slice(i, i + SEQ_LINE);
+    var groups = [];
+    for (var j = 0; j < chunk.length; j += SEQ_GROUP) {
+      groups.push(chunk.slice(j, j + SEQ_GROUP));
+    }
+    lines.push(String(i + 1).padStart(width, ' ') + '  ' + groups.join(' '));
+  }
+  return lines.join('\n');
+}
+
+/** Put `text` on the clipboard, with a fallback for browsers without the API. */
+async function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (err) { /* fall through to the textarea below */ }
+  }
+  var ta = h('textarea', {
+    style: 'position:fixed;top:-1000px;left:-1000px;opacity:0', 'aria-hidden': 'true'
+  });
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+  ta.remove();
+  if (!ok) throw new Error('this browser would not let the page copy');
+}
+
+/** A button that copies whatever `get()` returns, and says that it did. */
+function copyButton(label, get, status, what) {
+  return h('button', {
+    type: 'button', class: 'secondary',
+    onclick: async function (e) {
+      var btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        var text = get();
+        await copyToClipboard(text);
+        setStatus(status, what + ' copied (' +
+          Number(text.length).toLocaleString() + ' characters)', 'ok');
+      } catch (err) {
+        setStatus(status, 'copy failed: ' + err.message, 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  }, label);
+}
+
+/** FASTA, so the copied sequence can be pasted straight into another tool. */
+function fastaText(name, seq) {
+  return '>' + (String(name || 'construct').replace(/\s+/g, '_')) + ' ' +
+    seq.length + ' bp\n' + sequenceWrapped(seq) + '\n';
+}
+
+function sequenceWrapped(seq) {
+  var lines = [];
+  for (var i = 0; i < seq.length; i += SEQ_LINE) lines.push(seq.slice(i, i + SEQ_LINE));
+  return lines.join('\n');
+}
+
+/**
+ * Everything that was designed: the feature map, every element in it, and the
+ * sequence itself.
+ *
+ * The element table and the sequence listing are both collapsed, and the
+ * sequence is only built when it is first opened, so a 15 kb construct costs
+ * nothing until somebody asks to read it.
+ */
+function renderConstruct(c) {
+  var seq = typeof c.sequence === 'string' ? c.sequence : '';
+  var layout = (c.layout || []).filter(function (f) {
+    return f && typeof f.start === 'number';
+  });
+  var status = h('span', { class: 'status' });
+
+  var card = h('div', { class: 'card construct-full' },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'Full construct'),
+      h('span', { class: 'muted small' },
+        seq ? 'every base and every element of the designed molecule'
+            : 'this plan carries no sequence')));
+
+  card.appendChild(featureMap(c.length, layout, {
+    label: c.name, circular: !!c.circular, markers: c.codon_markers
+  }));
+
+  if (!seq) {
+    card.appendChild(h('p', { class: 'muted' },
+      'The sequence is not part of this plan, so only the map can be shown.'));
+    return card;
+  }
+
+  card.appendChild(h('dl', { class: 'vector-facts construct-facts' },
+    statPair('length', bp(seq.length)),
+    statPair('topology', c.circular ? 'circular' : 'linear'),
+    statPair('GC', pct(gcFraction(seq))),
+    statPair('elements', String(layout.length))));
+
+  card.appendChild(h('div', { class: 'button-row' },
+    copyButton('Copy sequence', function () { return seq; }, status, 'sequence'),
+    copyButton('Copy FASTA', function () { return fastaText(c.name, seq); },
+      status, 'FASTA'),
+    status));
+
+  /* --- every element ------------------------------------------------ */
+  card.appendChild(h('details', { class: 'construct-elements' },
+    h('summary', null, 'Every element (' + layout.length + ')'),
+    table([
+      { label: 'Element', key: 'name' },
+      { label: 'Type', cell: function (f) { return typeTag(typeOf(f)); } },
+      { label: 'Start', numeric: true, cell: function (f) { return f.start + 1; } },
+      { label: 'End', numeric: true, key: 'end' },
+      { label: 'Length', numeric: true, cell: function (f) {
+          return bp(Number(f.end) - Number(f.start)); } },
+      { label: 'Strand', numeric: true, cell: function (f) {
+          return strandSign(f.strand); } }
+    ], layout)));
+
+  /* --- the sequence itself ------------------------------------------ */
+  var pre = h('pre', { class: 'seq-block mono' });
+  var built = false;
+  var details = h('details', {
+    class: 'construct-sequence',
+    ontoggle: function () {
+      if (built || !details.open) return;
+      built = true;
+      clear(pre);
+      pre.appendChild(document.createTextNode(sequenceText(seq)));
+    }
+  },
+    h('summary', null, 'Sequence — ' + bp(seq.length) + ', ' + SEQ_LINE +
+      ' bases per line'),
+    h('p', { class: 'muted small' },
+      'Positions are 1-based and count from the start of the molecule' +
+      (c.circular ? ', which for a circular plasmid is where the backbone ' +
+        'file began' : '') + '.'),
+    pre);
+  card.appendChild(details);
+
+  return card;
+}
+
+/* ------------------------------------------------------------------ */
+/* Plan: read-back verification                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The server's independent read-back of the finished sequence.
+ *
+ * `passed` is the headline and is shown either way, because a design that
+ * quietly failed its own check is the one thing nobody should have to scroll
+ * for. Note that `problems` can be non-empty on a pass: a part that occurs
+ * more than once is reported but is not by itself a failure.
+ */
+function renderVerification(v) {
+  var passed = !!v.passed;
+  var problems = v.problems || [];
+  var checks = v.checks || [];
+  var observed = v.observed || [];
+  var rec = v.recombined;
+
+  var card = h('div', {
+    class: 'card verification ' + (passed ? 'verify-pass' : 'verify-fail')
+  },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'Verification'),
+      h('span', { class: 'muted small' },
+        'the assembled sequence read back on its own, without the layout ' +
+        'that built it')));
+
+  card.appendChild(h('div', { class: 'verdict' },
+    h('span', { class: 'verdict-pill ' + (passed ? 'pill-ok' : 'pill-bad') },
+      passed ? 'PASSED' : 'FAILED'),
+    h('span', { class: 'verdict-text' },
+      v.summary || (passed ? 'the construct reads back as specified'
+                           : 'the construct does not read back as specified'))));
+
+  card.appendChild(h('dl', { class: 'vector-facts' },
+    statPair('parts found',
+      checks.filter(function (c) { return c.found; }).length + ' of ' + checks.length),
+    statPair('order', v.order_ok
+      ? 'as specified'
+      : 'NOT as specified — the forward-strand parts occur in a different order'),
+    statPair('re-annotated', plural(observed.length, 'feature') +
+      ' found by scanning the finished molecule')));
+
+  if (problems.length) {
+    card.appendChild(h('h4', { class: 'lvl lvl-' + (passed ? 'warning' : 'error') },
+      plural(problems.length, 'problem') +
+      (passed ? ' reported (none of them fails the check)' : '')));
+    card.appendChild(h('ul', {
+      class: 'issues issues-' + (passed ? 'warning' : 'error')
+    }, problems.map(function (p) {
+      return h('li', null, h('span', { class: 'msg' }, p));
+    })));
+  }
+
+  /* --- after recombination ------------------------------------------ */
+  if (rec) {
+    var payload = rec.payload_modules || [];
+    var forward = rec.now_forward || [];
+    var switched = !!rec.all_switched;
+    var still = payload.filter(function (p) { return forward.indexOf(p) < 0; });
+
+    // The server only counts a module as payload when it was stored
+    // *inverted*, so a Cre-OFF (DO) cassette legitimately has none: there is
+    // nothing to turn on, and calling that a failure would be wrong.
+    var kind = payload.length ? (switched ? 'is-ok' : 'is-bad') : 'is-neutral';
+    var verdict = payload.length
+      ? (switched ? 'payload switched' : 'payload did not switch')
+      : 'nothing stored inverted';
+    var sentence;
+    if (!payload.length) {
+      sentence = 'Simulating Cre gives a ' + bp(rec.length) + ' molecule. ' +
+        'No module was stored inverted, so there is nothing for Cre to turn ' +
+        'on — which is what a Cre-OFF (DO) arrangement looks like.';
+    } else if (switched) {
+      sentence = 'Simulating Cre gives a ' + bp(rec.length) + ' molecule in ' +
+        'which every inverted payload module now reads on the forward ' +
+        'strand, so the cassette switches as designed.';
+    } else {
+      sentence = 'Simulating Cre gives a ' + bp(rec.length) + ' molecule in ' +
+        'which ' + still.join(', ') + ' still cannot be read on the forward ' +
+        'strand.';
+    }
+
+    card.appendChild(h('div', { class: 'recombined ' + kind },
+      h('h4', null, 'After Cre recombination'),
+      h('p', { class: 'recombined-verdict' },
+        h('span', {
+          class: payload.length
+            ? 'pill pill-' + (switched ? 'ok' : 'bad') : 'pill'
+        }, verdict),
+        sentence),
+      h('dl', { class: 'vector-facts' },
+        statPair('stored inverted', payload.join(' + ') || 'nothing'),
+        statPair('forward after Cre', forward.join(' + ') || 'none'),
+        statPair('recombined length', bp(rec.length)))));
+  }
+
+  /* --- per-part read-back ------------------------------------------- */
+  card.appendChild(h('h4', null, 'Parts read back (' + checks.length + ')'));
+  card.appendChild(table([
+    { label: 'Part', key: 'name' },
+    { label: 'Type', cell: function (r) { return typeTag(r.feature_type); } },
+    { label: 'Expected', numeric: true, cell: function (r) { return bp(r.expected_bp); } },
+    { label: 'Found', cell: function (r) {
+        return h('span', { class: 'pill pill-' + (r.found ? 'ok' : 'bad') },
+          r.found ? 'found' : 'missing'); } },
+    // Two lox sites of each type, or two ITRs, are what makes the construct
+    // work: the server only calls a repeat a problem when it is one, and
+    // says so in `detail`, so only those are flagged here.
+    { label: 'Copies', numeric: true, cell: function (r) {
+        return h('span', {
+          class: (r.occurrences > 1 && r.detail) ? 'inline-warn' : null,
+          title: r.occurrences > 1 && !r.detail
+            ? 'more than one copy is expected for this element' : null
+        }, String(r.occurrences)); } },
+    { label: 'Strand', numeric: true, cell: function (r) {
+        return r.found ? strandSign(r.strand) : ''; } },
+    { label: 'Position', numeric: true, cell: function (r) {
+        return (r.start === null || r.start === undefined)
+          ? '' : Number(r.start + 1).toLocaleString(); } },
+    { label: 'Protein', cell: function (r) {
+        if (r.protein_ok === null || r.protein_ok === undefined) return '';
+        return h('span', { class: 'pill pill-' + (r.protein_ok ? 'ok' : 'bad') },
+          r.protein_ok ? 'no internal stop' : 'internal stop'); } },
+    { label: 'Detail', cell: function (r) {
+        return r.detail ? h('span', { class: 'inline-warn' }, r.detail) : ''; } }
+  ], checks, {
+    rowClass: function (r) { return r.found ? null : 'row-bad'; }
+  }));
+
+  /* --- independent re-annotation ------------------------------------ */
+  card.appendChild(h('details', { class: 'observed' },
+    h('summary', null, 'What a fresh scan of the finished molecule finds (' +
+      observed.length + ')'),
+    h('p', { class: 'muted small' },
+      'The same motif scanner that annotates imported files, run over the ' +
+      'assembled sequence with no knowledge of how it was built.'),
+    table([
+      { label: 'Feature', key: 'name' },
+      { label: 'Type', cell: function (r) { return typeTag(r.feature_type); } },
+      { label: 'Start', numeric: true, cell: function (r) { return r.start + 1; } },
+      { label: 'End', numeric: true, key: 'end' },
+      { label: 'Strand', numeric: true, cell: function (r) { return strandSign(r.strand); } },
+      { label: 'Level', key: 'level' }
+    ], observed)));
+
+  return card;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2285,7 +2971,7 @@ function selectTab(name) {
   if (name === 'designs') { LOADED.designs = true; renderDesigns(); }
 }
 
-function init() {
+async function init() {
   document.querySelectorAll('#tabs .tab').forEach(function (btn) {
     btn.addEventListener('click', function () { selectTab(btn.dataset.tab); });
   });
@@ -2307,6 +2993,7 @@ function init() {
     renderModules();
   });
   $('generate').addEventListener('click', generatePlan);
+  $('clear-spec').addEventListener('click', clearSpecWithConfirm);
   $('save-version').addEventListener('click', function () { saveDesign('version'); });
   $('save-overwrite').addEventListener('click', function () { saveDesign('overwrite'); });
   $('save-as').addEventListener('click', saveAsDesign);
@@ -2320,6 +3007,11 @@ function init() {
       if (yaml && !$('spec-yaml').value.trim()) $('spec-yaml').value = specToYaml();
     });
   });
+
+  // The type selects and the cassette rule are both driven by the server's
+  // vocabulary, so it is fetched before the first row is drawn. Everything
+  // after this point is independent and loads in parallel.
+  await loadVocab();
 
   renderModules();
   refreshSaveButtons();
@@ -2343,6 +3035,7 @@ function specToYaml() {
   lines.push('modules:');
   state.modules.forEach(function (m) {
     lines.push('  - type: ' + m.type);
+    if (isCreLox(m.type)) lines.push('    mode: ' + creLoxMode(m.mode).key);
     if ((m.name || '').trim()) lines.push('    name: ' + m.name.trim());
     if (m.part_id) lines.push('    part_id: ' + m.part_id);
   });

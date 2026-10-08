@@ -695,3 +695,190 @@ def codon_markers(construct: AssembledConstruct) -> list[dict]:
             })
 
     return sorted(markers, key=lambda m: m["start"])
+
+
+# --------------------------------------------------------------------------
+# Building the payload into a real backbone
+# --------------------------------------------------------------------------
+
+#: Element types that make up an expression cassette, and are therefore the
+#: part of a recipient plasmid a new payload replaces.
+CASSETTE_TYPES = {"promoter", "enhancer", "CDS", "Cre-lox", "DIO", "lox_site",
+                  "p2A", "trafficking_motif", "tag", "linker", "IRES"}
+
+#: Element types that belong to the vector itself and are never replaced:
+#: the ITRs that make an AAV packageable, and the origin and resistance that
+#: let the plasmid be grown at all.
+VECTOR_TYPES = {"AAV_ITR", "origin", "resistance"}
+
+
+def vector_arc(annotations: list[dict], length: int) -> tuple | None:
+    """The arc of a circular backbone that must be kept, as ``(start, end)``.
+
+    A transfer plasmid has two halves: the vector half, carrying the origin
+    and the resistance marker that let it be grown, and the payload half,
+    carrying the expression cassette. In an AAV the ITRs sit at the boundary
+    between them and belong to the vector half, because the payload has to
+    end up *between* the ITRs once the molecule is circular.
+
+    The cassette frequently wraps the origin of the coordinate system - in
+    one of this lab's pAAV backbones the promoter is at 9441 and its own CDS
+    at 0 - so the payload cannot be described as a single ``start..end``
+    slice. Describing the *kept* arc instead works in both cases: whatever
+    is not kept is what the new payload replaces.
+    """
+    anchors = [a for a in annotations if a["feature_type"] in VECTOR_TYPES]
+    if not anchors:
+        return None
+    start = min(a["start"] for a in anchors)
+    end = max(a["end"] for a in anchors)
+    if end <= start or (end - start) >= length:
+        return None
+    return start, end
+
+
+def cassette_span(annotations: list[dict], replace_types: set) -> tuple | None:
+    """Fallback for a backbone with no vector anchors: the cassette's extent."""
+    candidates = [a for a in annotations
+                  if a["feature_type"] in replace_types
+                  and a["feature_type"] not in VECTOR_TYPES]
+    if not candidates:
+        return None
+    start = min(a["start"] for a in candidates)
+    end = max(a["end"] for a in candidates)
+    return (start, end) if end > start else None
+
+
+def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
+                           backbone_annotations: list[dict],
+                           spec_types: set, circular: bool = True
+                           ) -> AssembledConstruct:
+    """Put the payload where it belongs inside the recipient plasmid.
+
+    Concatenating the payload onto the end of a backbone gives a sequence of
+    the right length that is completely wrong: in an AAV it leaves the whole
+    cassette outside the ITRs, where it cannot be packaged.
+
+    What a transfer plasmid actually needs kept is everything except the
+    expression cassette itself - the ITRs, the WPRE and polyA that follow
+    the coding sequence, the origin and the resistance marker. Only the
+    promoter-to-CDS stretch is replaced, and only up to the first WPRE or
+    polyA after it, unless the specification supplies its own.
+
+    The backbone is rotated so the payload region is contiguous before any
+    of this is worked out, because in a real pAAV the cassette frequently
+    wraps the origin of the coordinate system - in one of this lab's
+    backbones the promoter sits at 9441 and its own CDS at 0.
+    """
+    warnings: list[str] = []
+    missing_required: list[dict] = []
+
+    payload_parts: list[str] = []
+    payload_layout: list[dict] = []
+    cursor = 0
+    for rm in resolved:
+        if not rm.seq:
+            if rm.module.required:
+                missing_required.append({"type": rm.module.type,
+                                         "name": rm.module.name})
+            continue
+        payload_parts.append(rm.seq)
+        payload_layout.append({
+            "name": rm.part_name, "type": rm.feature_type,
+            "start": cursor, "end": cursor + len(rm.seq),
+            "strand": -1 if rm.module.orientation == "reverse" else 1,
+            "part_id": rm.part_id,
+        })
+        cursor += len(rm.seq)
+        warnings.extend(f"{rm.part_name}: {w}" for w in rm.warnings)
+    payload = "".join(payload_parts)
+
+    total = len(backbone_seq)
+    arc = vector_arc(backbone_annotations, total)
+
+    if arc is None:
+        rotation = 0
+        arc_end = total
+        warnings.append(
+            "the backbone has no ITR, origin or resistance annotated, so the "
+            "insertion point was taken from its annotated cassette alone; "
+            "check it before building this")
+    else:
+        keep_start, keep_end = arc
+        # Rotate so the payload region starts at 0 and the vector arc
+        # (ITRs, origin, resistance) sits at the end.
+        rotation = keep_end
+        arc_end = total - (keep_end - keep_start)
+
+    def rot(pos: int) -> int:
+        return (pos - rotation) % total
+
+    rotated_seq = backbone_seq[rotation:] + backbone_seq[:rotation]
+    rotated = []
+    for a in backbone_annotations:
+        start, end = rot(a["start"]), rot(a["end"])
+        # A feature ending exactly at the rotation point maps to 0, which
+        # would look like a wrap. It is the last thing in the molecule, not
+        # the first - and in a pAAV it is usually an ITR, which must not be
+        # lost.
+        if end == 0 and start > 0:
+            end = total
+        if end <= start:
+            # straddles the rotation point; it cannot be carried over cleanly
+            warnings.append(
+                f"the backbone feature {a['name']!r} spans the insertion "
+                f"boundary and was not carried over")
+            continue
+        rotated.append({**a, "start": start, "end": end})
+
+    # The stretch to replace: from the first cassette feature in the payload
+    # region, up to the first terminator element after it.
+    keeps_own_terminators = not (spec_types & {"polyA", "WPRE"})
+    cassette = [a for a in rotated
+                if a["feature_type"] in CASSETTE_TYPES
+                and a["feature_type"] not in VECTOR_TYPES
+                and a["start"] < arc_end]
+
+    if cassette:
+        replace_start = min(a["start"] for a in cassette)
+        replace_end = arc_end
+        if keeps_own_terminators:
+            after = [a["start"] for a in rotated
+                     if a["feature_type"] in ("polyA", "WPRE")
+                     and a["start"] >= replace_start and a["start"] < arc_end]
+            if after:
+                replace_end = min(after)
+    else:
+        replace_start = replace_end = 0
+        warnings.append(
+            "the backbone has no annotated expression cassette, so the "
+            "payload was inserted at the start of the payload region rather "
+            "than replacing anything")
+
+    seq = rotated_seq[:replace_start] + payload + rotated_seq[replace_end:]
+    shift = len(payload) - (replace_end - replace_start)
+
+    layout: list[dict] = []
+    for a in rotated:
+        if a["start"] >= replace_start and a["end"] <= replace_end:
+            continue                        # replaced along with the cassette
+        if a["start"] >= replace_end:
+            layout.append({"name": a["name"], "type": a["feature_type"],
+                           "start": a["start"] + shift, "end": a["end"] + shift,
+                           "strand": a.get("strand", 1), "from_backbone": True})
+        elif a["end"] <= replace_start:
+            layout.append({"name": a["name"], "type": a["feature_type"],
+                           "start": a["start"], "end": a["end"],
+                           "strand": a.get("strand", 1), "from_backbone": True})
+        else:
+            warnings.append(
+                f"the backbone feature {a['name']!r} straddles the insertion "
+                f"point and was disrupted")
+
+    for item in payload_layout:
+        layout.append({**item, "start": item["start"] + replace_start,
+                       "end": item["end"] + replace_start,
+                       "from_backbone": False})
+
+    layout.sort(key=lambda i: (i["start"], i["end"]))
+    return AssembledConstruct(seq, circular, layout, warnings, missing_required)

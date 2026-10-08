@@ -216,6 +216,26 @@ and does not split. Of the CDS parts on this share, 100 split this way, and
 96 of the resulting pieces turned out to be parts the lab already had names
 for.
 
+### Building into the vector
+
+A payload is not bolted onto the end of a backbone. Concatenating gives a
+sequence of the right length that is completely wrong: in an AAV it leaves
+the whole cassette outside the ITRs, where it cannot be packaged.
+
+Genesis replaces the backbone's own expression cassette instead, keeping
+everything that belongs to the vector - both ITRs, the WPRE and polyA that
+follow the coding sequence, the origin, the resistance marker - so the
+designed molecule is a real plasmid and the map shows all of it rather than
+one opaque "backbone" block. Only the promoter-to-CDS stretch is replaced,
+and only up to the first WPRE or polyA after it, unless the specification
+supplies its own.
+
+The backbone is rotated so the payload region is contiguous before any of
+this is worked out, because in a real pAAV the cassette usually wraps the
+origin of the coordinate system: in one of this lab's backbones the promoter
+sits at 9441 and its own first CDS at 0, so the payload cannot be described
+as a single `start..end` slice at all.
+
 ### Reading the design back
 
 Everything else works forward: modules are resolved, concatenated, and a
@@ -363,7 +383,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           163 tests, no lab share required
+tests/           172 tests, no lab share required
 ```
 
 ## Giving it to a labmate

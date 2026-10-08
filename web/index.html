@@ -112,6 +112,12 @@
           multi-protein CDS: open it with <kbd>&rarr;</kbd> (or the
           <span class="seg-open-demo">split</span> button) to pin one of its
           proteins instead.
+          A <code>Cre-lox</code> row picks an arrangement (DIO, FLEX, FAS or DO)
+          and brackets the coding modules below it &mdash; the ones it encloses
+          &mdash; until the first module that is not one of CDS,
+          trafficking_motif, linker, p2A, tag or IRES. The bracket is only a
+          picture of what the server does; the modules stay one flat, ordered
+          list.
         </p>
         <div id="modules"></div>
         <button type="button" id="add-module" class="secondary">Add module</button>
@@ -124,6 +130,8 @@
 
       <div class="card-foot">
         <button type="button" id="generate" class="primary">Generate plan</button>
+        <button type="button" id="clear-spec" class="secondary"
+                title="Reset the specification to an empty one and remove the plan on screen">Clear</button>
         <span class="save-group">
           <button type="button" id="save-version" class="secondary" disabled>Save</button>
           <button type="button" id="save-overwrite" class="secondary" disabled>Overwrite</button>

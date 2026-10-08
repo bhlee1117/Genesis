@@ -180,27 +180,55 @@ def verify_design(construct, resolved_modules, circular: bool = True,
 
     # --- the expressed molecule, for recombinase cassettes ----------------
     if recombined_seq is not None and recombined_seq != seq:
-        payload = [rm for rm in placed
+        # Which way the cassette is meant to switch depends on how the
+        # payload was stored. An inverted payload (DIO, FLEX, FAS) should
+        # become readable forward; a forward one (DO) should stop being
+        # readable, because Cre turns that arrangement off.
+        inverted = [rm for rm in placed
+                    if rm.feature_type in TRANSLATED
+                    and rm.module.orientation == "reverse"]
+        forward = [rm for rm in placed
                    if rm.feature_type in TRANSLATED
-                   and rm.module.orientation == "reverse"]
-        found_forward = []
-        for rm in payload:
-            fwd, _ = _locate(recombined_seq, revcomp(rm.seq), False)
-            if fwd:
-                found_forward.append(rm.part_name)
-        result.recombined = {
-            "length": len(recombined_seq),
-            "payload_modules": [rm.part_name for rm in payload],
-            "now_forward": found_forward,
-            "all_switched": len(found_forward) == len(payload) and bool(payload),
-        }
-        if payload and len(found_forward) != len(payload):
-            missing = [rm.part_name for rm in payload
-                       if rm.part_name not in found_forward]
-            result.problems.append(
-                f"after recombination these are still not readable on the "
-                f"forward strand: {', '.join(missing)}")
-            result.passed = False
+                   and rm.module.orientation != "reverse"]
+
+        if inverted:
+            switched = [rm.part_name for rm in inverted
+                        if _locate(recombined_seq, revcomp(rm.seq), False)[0]]
+            result.recombined = {
+                "direction": "on",
+                "length": len(recombined_seq),
+                "payload_modules": [rm.part_name for rm in inverted],
+                "now_forward": switched,
+                "all_switched": len(switched) == len(inverted),
+                "detail": "the payload was stored inverted, so recombination "
+                          "should make it readable on the forward strand",
+            }
+            if len(switched) != len(inverted):
+                still = [rm.part_name for rm in inverted
+                         if rm.part_name not in switched]
+                result.problems.append(
+                    f"after recombination these are still not readable on the "
+                    f"forward strand: {', '.join(still)}")
+                result.passed = False
+        else:
+            # A Cre-OFF cassette: the payload should no longer be intact.
+            remaining = [rm.part_name for rm in forward
+                         if _locate(recombined_seq, rm.seq, False)[0]]
+            result.recombined = {
+                "direction": "off",
+                "length": len(recombined_seq),
+                "payload_modules": [rm.part_name for rm in forward],
+                "now_forward": remaining,
+                "all_switched": not remaining,
+                "detail": "the payload was stored forward, so recombination "
+                          "should remove or invert it",
+            }
+            if forward and remaining:
+                result.problems.append(
+                    f"this looks like a Cre-OFF cassette, but after "
+                    f"recombination {', '.join(remaining)} is still intact "
+                    f"on the forward strand")
+                result.passed = False
 
     # --- summary ----------------------------------------------------------
     found = sum(1 for c in result.checks if c.found)

@@ -2007,3 +2007,136 @@ class TestCreLoxModes(unittest.TestCase):
         from genesis.construct import resolve_mode
         with self.assertRaises(ValueError):
             resolve_mode("nonsense")
+
+
+# --------------------------------------------------------------------------
+class TestBackboneInsertion(unittest.TestCase):
+    """The payload must land inside the vector, not be bolted onto the end.
+
+    An AAV built by concatenation has the right length and is useless: the
+    cassette sits outside the ITRs and cannot be packaged.
+    """
+
+    ITR = "TTGGCCACTCCCTCTCTGCGCGCTCGCTCGCTCACTGAGGC" + rand_seq(100, 1000)
+
+    def _backbone(self, wraps_origin: bool = False):
+        """A pAAV-like backbone: ITR - cassette - WPRE - polyA - ITR - ori/AmpR."""
+        parts, annotations, pos = [], [], 0
+
+        def add(seq, ftype, name):
+            nonlocal pos
+            parts.append(seq)
+            annotations.append({"feature_type": ftype, "name": name,
+                                "start": pos, "end": pos + len(seq),
+                                "strand": 1})
+            pos += len(seq)
+
+        if wraps_origin:
+            # cassette first, so the vector arc is at the far end and the
+            # payload region straddles the coordinate origin
+            add(orf(100, 1001), "CDS", "old gene")
+            add(rand_seq(589, 1002), "WPRE", "WPRE")
+            add(rand_seq(120, 1003), "polyA", "bGH polyA")
+            add(self.ITR, "AAV_ITR", "AAV2 ITR")
+            add(rand_seq(600, 1004), "origin", "ori")
+            add(rand_seq(860, 1005), "resistance", "AmpR")
+            add(self.ITR, "AAV_ITR", "AAV2 ITR")
+            add(rand_seq(400, 1006), "promoter", "old promoter")
+        else:
+            add(self.ITR, "AAV_ITR", "AAV2 ITR")
+            add(rand_seq(400, 1006), "promoter", "old promoter")
+            add(orf(100, 1001), "CDS", "old gene")
+            add(rand_seq(589, 1002), "WPRE", "WPRE")
+            add(rand_seq(120, 1003), "polyA", "bGH polyA")
+            add(self.ITR, "AAV_ITR", "AAV2 ITR")
+            add(rand_seq(600, 1004), "origin", "ori")
+            add(rand_seq(860, 1005), "resistance", "AmpR")
+        return "".join(parts), annotations
+
+    def _build(self, wraps_origin=False, spec_types=frozenset({"promoter", "CDS"})):
+        from genesis.construct import ResolvedModule, assemble_into_backbone
+        seq, annotations = self._backbone(wraps_origin)
+        modules = [
+            ResolvedModule(Module(type="promoter", name="hSyn"), None, "hSyn",
+                           rand_seq(300, 1010), "promoter", [], []),
+            ResolvedModule(Module(type="CDS", name="EGFP"), None, "EGFP",
+                           orf(150, 1011), "CDS", [], []),
+        ]
+        return assemble_into_backbone(modules, seq, annotations,
+                                      set(spec_types), True), modules
+
+    def _types(self, construct):
+        return [i["type"] for i in construct.layout]
+
+    def test_vector_elements_are_carried_into_the_product(self):
+        construct, _ = self._build()
+        types = self._types(construct)
+        for required in ("AAV_ITR", "WPRE", "polyA", "origin", "resistance"):
+            self.assertIn(required, types,
+                          f"{required} must survive into the product")
+
+    def test_both_itrs_survive(self):
+        construct, _ = self._build()
+        itrs = [i for i in construct.layout if i["type"] == "AAV_ITR"]
+        self.assertEqual(len(itrs), 2, "an AAV needs both ITRs")
+
+    def test_the_payload_lands_between_the_itrs(self):
+        """Circularly, the new modules must sit between the two ITRs."""
+        construct, _ = self._build()
+        itrs = sorted(i["start"] for i in construct.layout
+                      if i["type"] == "AAV_ITR")
+        new = [i for i in construct.layout if not i.get("from_backbone")]
+        self.assertTrue(new)
+        for item in new:
+            inside = itrs[0] <= item["start"] <= itrs[1]
+            outside_wrapping = item["start"] < itrs[0] or item["start"] > itrs[1]
+            self.assertTrue(inside or outside_wrapping)
+        # and specifically: no origin or resistance between payload and an ITR
+        between = [i["type"] for i in construct.layout
+                   if new[0]["start"] < i["start"] < new[-1]["end"]]
+        self.assertNotIn("origin", between)
+        self.assertNotIn("resistance", between)
+
+    def test_the_old_cassette_is_replaced_not_appended(self):
+        construct, _ = self._build()
+        names = [i["name"] for i in construct.layout]
+        self.assertNotIn("old gene", names)
+        self.assertNotIn("old promoter", names)
+        self.assertIn("EGFP", names)
+
+    def test_the_backbones_wpre_and_polya_are_kept(self):
+        """They belong to the vector, not to the payload being swapped."""
+        construct, _ = self._build()
+        names = [i["name"] for i in construct.layout]
+        self.assertIn("WPRE", names)
+        self.assertIn("bGH polyA", names)
+
+    def test_a_specified_polya_replaces_the_backbones_own(self):
+        construct, _ = self._build(spec_types={"promoter", "CDS", "polyA"})
+        polyas = [i for i in construct.layout if i["type"] == "polyA"]
+        self.assertEqual(len(polyas), 0,
+                         "asking for a polyA should clear the backbone's")
+
+    def test_a_cassette_that_wraps_the_origin_is_handled(self):
+        """Real pAAVs put the promoter near the end and its CDS at zero."""
+        construct, _ = self._build(wraps_origin=True)
+        types = self._types(construct)
+        for required in ("AAV_ITR", "WPRE", "polyA", "origin", "resistance"):
+            self.assertIn(required, types, required)
+        self.assertEqual(len([i for i in construct.layout
+                              if i["type"] == "AAV_ITR"]), 2)
+        self.assertNotIn("old gene", [i["name"] for i in construct.layout])
+
+    def test_the_product_verifies(self):
+        from genesis.verify import verify_design
+        construct, modules = self._build()
+        result = verify_design(construct, modules, True)
+        self.assertTrue(result.passed, result.problems)
+
+    def test_the_product_is_a_complete_aav(self):
+        from genesis.vectors import missing_elements
+        construct, _ = self._build()
+        annotations = [{"feature_type": i["type"], "name": i["name"]}
+                       for i in construct.layout]
+        result = missing_elements(annotations, "AAV")
+        self.assertTrue(result["complete"], result)

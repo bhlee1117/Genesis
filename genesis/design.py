@@ -10,13 +10,15 @@ import json
 import sqlite3
 
 from .config import Config
-from .construct import (ConstructSpec, assemble, codon_markers,
+from .construct import (ConstructSpec, assemble,
+                        assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
 from .planner import (group_contiguous, plan_hifi_route, plan_restriction_route,
                       plan_swap_hifi_route, plan_swap_restriction_route,
                       rank_routes, failure_history)
 from .swap import analyse_swap, build_scheme, rank_parents
 from .vectors import classify_vector, describe, missing_elements
+from .vocab import canonical_feature_type
 from .verify import verify_plan
 from .validate import Issue, summarize, validate_construct
 
@@ -95,23 +97,36 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # molecule that gets validated is the one that would actually be built.
     resolved, dio_notes = expand_dio(resolved)
 
-    # Stage 4: build the intended final molecule
-    construct = assemble(resolved, backbone["seq"] if backbone else "",
-                         circular=spec.circular)
+    # Stage 4: build the intended final molecule. With a backbone the
+    # payload replaces that plasmid's existing cassette, so the result is a
+    # real plasmid carrying its ITRs, WPRE, polyA, origin and resistance -
+    # not the payload bolted onto the end of one.
+    backbone_annotations = []
+    if backbone:
+        backbone_annotations = [
+            {"feature_type": r["feature_type"], "name": r["name"],
+             "start": r["start"], "end": r["end"], "strand": r["strand"]}
+            for r in conn.execute(
+                """SELECT feature_type, name, start, end, strand
+                   FROM annotation WHERE plasmid_id = ? ORDER BY start""",
+                (backbone["id"],))]
+        spec_types = {canonical_feature_type(
+            m["type"] if isinstance(m, dict) else m.type) for m in spec.modules}
+        construct = assemble_into_backbone(
+            resolved, backbone["seq"], backbone_annotations, spec_types,
+            circular=spec.circular)
+    else:
+        construct = assemble(resolved, "", circular=spec.circular)
     construct.warnings.extend(dio_notes)
 
     # --- vector family ---------------------------------------------------
     # Either the family was asked for, or it is inferred. Either way the
     # finished molecule is checked against what that family actually needs,
     # because a payload on its own is not a vector.
+    # The layout now holds everything in the molecule, backbone included,
+    # so it is the whole evidence for what family this construct belongs to.
     construct_annotations = [{"feature_type": i["type"], "name": i["name"]}
                              for i in construct.layout]
-    if backbone:
-        construct_annotations += [
-            {"feature_type": r["feature_type"], "name": r["name"]}
-            for r in conn.execute(
-                "SELECT feature_type, name FROM annotation WHERE plasmid_id = ?",
-                (backbone["id"],))]
 
     # Only a real plasmid's name is evidence. The name someone typed for the
     # construct they intend to build is a wish, not an observation, and
