@@ -2380,6 +2380,62 @@ class TestRecipientArchitecture(unittest.TestCase):
         self.assertTrue(any("architecture it needs" in n for n in result.notes),
                         result.notes)
 
+    def test_a_swap_that_cannot_supply_every_part_is_not_offered(self):
+        """A route that builds the wrong construct is not a cheap route.
+
+        Asked for a promoter and two sensors that the recipient has none of,
+        this used to amplify the promoter, note the rest in passing, and win
+        the route comparison on cost - because doing one third of the job is
+        cheaper than doing all of it.  The plan's own architecture claimed
+        sensors its protocol never touched.
+        """
+        from genesis.swap import analyse_swap
+        host = self._plasmid("host", [("promoter", "hSyn"),
+                                      ("CDS", "shared")])
+        absent = []
+        for name in ("CAG", "ASAP7y", "iGluSnFR4f"):
+            seq = rand_seq(600, hash(name) % 1000)
+            absent.append(self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (name, seq, name, len(seq))).lastrowid)
+        self.conn.commit()
+
+        modules = [{"type": "CDS", "part_id": self.part, "part_name": "shared",
+                    "seq": self.shared}]
+        modules += [{"type": "CDS", "part_id": pid, "part_name": n, "seq": ""}
+                    for pid, n in zip(absent, ("CAG", "ASAP7y", "iGluSnFR4f"))]
+
+        result = analyse_swap(self.conn, modules, self.cfg,
+                              prefer_plasmid_id=host)
+        self.assertIsNotNone(result)
+        self.assertFalse(result.feasible,
+                         "a swap missing three of four parts is not usable")
+        self.assertTrue(
+            any("single region" in n for n in result.notes), result.notes)
+
+    def test_one_missing_part_is_still_a_normal_swap(self):
+        from genesis.swap import analyse_swap
+        host = self._plasmid("host", [("promoter", "hSyn"),
+                                      ("CDS", "shared")])
+        seq = rand_seq(600, 77)
+        new = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','GFP',?,'gfp',?)""",
+            (seq, len(seq))).lastrowid
+        self.conn.commit()
+        result = analyse_swap(
+            self.conn,
+            [{"type": "CDS", "part_id": self.part, "part_name": "shared",
+              "seq": self.shared},
+             {"type": "CDS", "part_id": new, "part_name": "GFP", "seq": seq}],
+            self.cfg, prefer_plasmid_id=host)
+        self.assertIsNotNone(result)
+        self.assertTrue(
+            result.feasible
+            or not any("single region" in n for n in result.notes),
+            result.notes)
+
 
 # --------------------------------------------------------------------------
 class TestAddgenePrimerRules(unittest.TestCase):

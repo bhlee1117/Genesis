@@ -484,14 +484,27 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
                             [m["part_name"] for m in kept], [], notes,
                             feasible=False)
 
-    new_module = missing[0]
-
     if len(missing) > 1:
+        # A single swap puts one piece into one place.  Asked for more than
+        # that it used to supply the first and say so in a note, which left
+        # the plan claiming a construct its own steps could not build: the
+        # architecture promised ASAP7y and iGluSnFR4f while the protocol
+        # only ever amplified a promoter.  Worse, the route then won on
+        # cost, because doing less of the job is cheaper.  A route that
+        # cannot build the construct is not a cheaper way to build it.
+        absent = ", ".join(m["part_name"] for m in missing)
         notes.append(
-            f"{len(missing)} parts are absent from {recipient.name} "
-            f"({', '.join(m['part_name'] for m in missing)}); a single swap "
-            f"only replaces one region, so the extra pieces still need their "
-            f"own fragments")
+            f"{len(missing)} of the parts this design needs are absent from "
+            f"{recipient.name} ({absent}), and a single swap replaces a "
+            f"single region, so no edit of this plasmid produces the "
+            f"construct asked for; build it from parts, or start from a "
+            f"recipient that already carries the rest")
+        return SwapAnalysis(recipient, None, SwapRegion(0, 0), None, None, None,
+                            [m["part_name"] for m in kept],
+                            [m["part_name"] for m in missing], notes,
+                            feasible=False)
+
+    new_module = missing[0]
 
     # --- locate the region to remove ------------------------------------
     # The new piece goes where the target order says it goes: between the
