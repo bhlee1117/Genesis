@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Genesis</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>Genesis</h1>
+    <p class="subtitle">Molecular cloning strategy design over the lab plasmid inventory</p>
+  </div>
+  <div class="stats" id="stats">
+    <span class="stat-loading">loading stats&hellip;</span>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button type="button" class="tab" data-tab="inventory">Inventory</button>
+  <button type="button" class="tab" data-tab="parts">Parts</button>
+  <button type="button" class="tab active" data-tab="design">Design</button>
+  <button type="button" class="tab" data-tab="designs">Designs</button>
+</nav>
+
+<main>
+
+  <!-- ================= INVENTORY ================= -->
+  <section class="panel" id="panel-inventory" hidden>
+    <div class="toolbar">
+      <label>Search
+        <input type="search" id="inv-q" placeholder="name, description or feature">
+      </label>
+      <label>Owner
+        <select id="inv-owner"><option value="">all owners</option></select>
+      </label>
+      <button type="button" id="inv-go">Search</button>
+      <span class="status" id="inv-status"></span>
+    </div>
+    <div class="split">
+      <div class="split-main">
+        <div id="inv-table" class="scroll-y"></div>
+      </div>
+      <aside class="split-side" id="inv-detail">
+        <p class="muted">Select a plasmid to see its annotations and feature map.</p>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ================= PARTS ================= -->
+  <section class="panel" id="panel-parts" hidden>
+    <div class="toolbar">
+      <label>Type
+        <select id="part-type"><option value="">all types</option></select>
+      </label>
+      <label>Search
+        <input type="search" id="part-q" placeholder="part name">
+      </label>
+      <button type="button" id="part-go">Search</button>
+      <span class="status" id="part-status"></span>
+    </div>
+    <div class="split">
+      <div class="split-main">
+        <div id="part-table" class="scroll-y"></div>
+      </div>
+      <aside class="split-side" id="part-detail">
+        <p class="muted">Select a part to list its source plasmids.</p>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ================= DESIGN ================= -->
+  <section class="panel" id="panel-design">
+    <div class="card builder">
+      <div class="card-head">
+        <h2>Construct specification</h2>
+        <div class="mode-switch">
+          <label><input type="radio" name="spec-mode" value="builder" checked> Module builder</label>
+          <label><input type="radio" name="spec-mode" value="yaml"> YAML</label>
+        </div>
+      </div>
+
+      <div id="builder-pane">
+        <div class="field-row">
+          <label>Construct name
+            <input type="text" id="spec-name" value="untitled" placeholder="pAAV-hSyn-DIO-...">
+          </label>
+          <label>Backbone <span class="hint">plasmid id or name</span>
+            <input type="text" id="spec-backbone" placeholder="e.g. 42 or pAAV-hSyn">
+          </label>
+          <label>Owner
+            <input type="text" id="spec-owner" placeholder="optional">
+          </label>
+          <label class="checkbox"><input type="checkbox" id="spec-circular" checked> Circular</label>
+        </div>
+        <p class="hint builder-hint">
+          Type in a part box to search the inventory for that feature type.
+          Picking a suggestion pins that exact part by id (shown as a
+          <span class="pin-chip pin-chip-demo">pinned&nbsp;#</span> chip);
+          clear the box or the chip&rsquo;s &times; to let the planner choose.
+        </p>
+        <div id="modules"></div>
+        <button type="button" id="add-module" class="secondary">Add module</button>
+      </div>
+
+      <div id="yaml-pane" hidden>
+        <p class="hint">Flat YAML: top-level scalars plus a <code>modules:</code> list.</p>
+        <textarea id="spec-yaml" spellcheck="false" rows="14"></textarea>
+      </div>
+
+      <div class="card-foot">
+        <button type="button" id="generate" class="primary">Generate plan</button>
+        <button type="button" id="save-design" class="secondary" disabled>Save design</button>
+        <span class="status" id="design-status"></span>
+      </div>
+    </div>
+
+    <div id="plan-out"></div>
+  </section>
+
+  <!-- ================= DESIGNS ================= -->
+  <section class="panel" id="panel-designs" hidden>
+    <div class="toolbar">
+      <button type="button" id="designs-go">Reload</button>
+      <span class="status" id="designs-status"></span>
+    </div>
+    <div id="designs-table" class="scroll-y"></div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

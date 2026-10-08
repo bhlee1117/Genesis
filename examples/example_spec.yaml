@@ -1,0 +1,41 @@
+# Example construct specification for Genesis.
+#
+#   python3 -m genesis design examples/example_spec.yaml
+#
+# "backbone" is matched by name against the inventory; use
+# "backbone_plasmid_id: <id>" instead to pin an exact plasmid
+# (find ids with: python3 -m genesis find <term>).
+
+name: hSyn-CheRiff-TS-P2A-Citrine-ER2
+backbone: FCK
+modules:
+  - type: promoter
+    name: hsyn
+    required: true
+
+  - type: CDS
+    name: CheRiff
+    translated: true
+    preserve_frame: true
+
+  - type: trafficking_motif
+    name: KGC
+    translated: true
+
+  - type: p2A
+    name: P2A
+    translated: true
+
+  - type: CDS
+    name: Citrine
+    translated: true
+
+  - type: trafficking_motif
+    name: ER2
+    translated: true
+
+  - type: WPRE
+    name: WPRE
+
+  - type: polyA
+    name: bGH polyA

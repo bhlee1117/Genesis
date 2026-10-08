@@ -1,0 +1,1260 @@
+"""Test suite for Genesis.
+
+Run with:  python3 -m unittest discover -s tests -v
+
+These tests use only synthetic sequences, so they pass with the lab share
+unmounted. The checks are chosen to pin down the biology that is easy to get
+subtly wrong - overhang polarity, reading frame, Cre logic - rather than to
+restate the implementation.
+"""
+
+from __future__ import annotations
+
+import random
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from genesis import seqtools as st
+from genesis.config import Config
+from genesis.construct import ConstructSpec, Module, assemble, ResolvedModule
+from genesis.db import connect
+from genesis.design import design
+from genesis.enzymes import CATALOG, digest, ends_compatible, find_sites
+from genesis.export import protocol_markdown, to_genbank
+from genesis.importer import least_rotation, seq_checksum
+from genesis.primers import Primer, validate_primer, pick_anneal
+from genesis.seqio import parse_fasta, parse_genbank, parse_location, classify_role
+from genesis.validate import LoxSite, simulate_cre, validate_construct
+from genesis.vocab import classify_label, find_motifs, _fuzzy_find
+
+LOXP = "ATAACTTCGTATAATGTATGCTATACGAAGTTAT"
+LOX2272 = "ATAACTTCGTATAAAGTATCCTATACGAAGTTAT"
+
+
+def rand_seq(n, seed=None):
+    r = random.Random(seed)
+    return "".join(r.choice("ACGT") for _ in range(n))
+
+
+def orf(n_codons, seed=0):
+    r = random.Random(seed)
+    cods = ["GCT", "TGC", "GAT", "GAA", "TTT", "GGT", "CAT", "ATT", "AAA", "CTG"]
+    return "ATG" + "".join(r.choice(cods) for _ in range(n_codons)) + "TAA"
+
+
+# --------------------------------------------------------------------------
+class TestSeqTools(unittest.TestCase):
+
+    def test_revcomp_roundtrip(self):
+        s = rand_seq(500, 1)
+        self.assertEqual(st.revcomp(st.revcomp(s)), s)
+
+    def test_revcomp_known(self):
+        self.assertEqual(st.revcomp("GAATTC"), "GAATTC")       # palindrome
+        self.assertEqual(st.revcomp("ATCGAT"), "ATCGAT")
+        self.assertEqual(st.revcomp("AAAACCC"), "GGGTTTT")
+
+    def test_translate_known_peptides(self):
+        self.assertEqual(st.translate("ATGGCTTGCTAA"), "MAC*")
+        self.assertEqual(st.translate("ATCGAAGGTCGT"), "IEGR")  # Factor Xa site
+        self.assertEqual(st.translate("TAATAGTGA"), "***")
+
+    def test_translate_frame_and_partial_codon(self):
+        self.assertEqual(st.translate("GATGGCTTGC", frame=1), "MAC")
+        # trailing partial codons are dropped, not padded
+        self.assertEqual(st.translate("GATGGCTTG", frame=1), "MA")
+        self.assertEqual(st.translate("ATGGC"), "M")
+
+    def test_find_all_overlapping(self):
+        self.assertEqual(st.find_all("AAAA", "AA"), [0, 1, 2])
+
+    def test_find_all_circular_wrap(self):
+        # site split across the origin of a circular molecule
+        self.assertIn(8, st.find_all("TTTTTTTTGA" + "ATTC"[:0] + "AT", "GAAT",
+                                     circular=True))
+
+    def test_find_all_iupac(self):
+        self.assertEqual(st.find_all("ACCTGGA", "CCWGG"), [1])
+
+    def test_slice_region_circular(self):
+        s = "ABCDEFGH"
+        self.assertEqual(st.slice_region(s, 6, 2, circular=True), "GHAB")
+
+    def test_tm_monotonic_and_plausible(self):
+        short = st.tm("ACGTACGTACGTACGTAC")
+        longer = st.tm("ACGTACGTACGTACGTACGTACGTACGT")
+        self.assertLess(short, longer)
+        # A typical 20mer primer should land in the usual design window.
+        self.assertTrue(45 < st.tm("GCTAGCTAGCATCGATCGAT") < 75)
+
+    def test_tm_gc_effect(self):
+        at_rich = st.tm("ATATATATATATATATATAT")
+        gc_rich = st.tm("GCGCGCGCGCGCGCGCGCGC")
+        self.assertGreater(gc_rich, at_rich + 15)
+
+    def test_tm_rejects_ambiguous(self):
+        self.assertNotEqual(st.tm("ACGTNACGTACGTACGTAC"), st.tm("ACGTNACGTACGTACGTAC"))
+
+    def test_max_homopolymer(self):
+        self.assertEqual(st.max_homopolymer("ACGTTTTTACG"), 5)
+
+    def test_longest_repeat_merges_sliding_hits(self):
+        unit = rand_seq(200, 7)
+        seq = unit + rand_seq(300, 8) + unit
+        hits = st.longest_repeat(seq, min_len=40)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["length"], 200)
+        # One maximal repeat, not ~160 sliding duplicates.
+        self.assertLessEqual(len([h for h in hits if h["length"] > 100]), 2)
+
+    def test_find_orfs_both_strands(self):
+        payload = orf(120, 3)
+        fwd = st.find_orfs("TTTT" + payload + "TTTT", min_aa=100)
+        self.assertEqual(fwd[0]["strand"], 1)
+        rev = st.find_orfs("TTTT" + st.revcomp(payload) + "TTTT", min_aa=100)
+        self.assertEqual(rev[0]["strand"], -1)
+        self.assertEqual(rev[0]["protein"], fwd[0]["protein"])
+
+
+# --------------------------------------------------------------------------
+class TestParsers(unittest.TestCase):
+
+    GB = (
+        "LOCUS       TestPlasmid             60 bp ds-DNA     circular SYN 01-JAN-2020\n"
+        "DEFINITION  a test record.\n"
+        "FEATURES             Location/Qualifiers\n"
+        "     CDS             1..30\n"
+        '                     /label="testCDS"\n'
+        "     misc_feature    complement(31..60)\n"
+        '                     /label="reverse thing"\n'
+        "ORIGIN\n"
+        "        1 atggcttgct aaatggcttg ctaaatggct tgctaaatgg cttgctaaat ggcttgctaa\n"
+        "//\n"
+    )
+
+    def test_genbank_basic(self):
+        rec = parse_genbank(self.GB.encode())
+        self.assertEqual(rec.name, "TestPlasmid")
+        self.assertTrue(rec.circular)
+        self.assertEqual(len(rec.seq), 60)
+        self.assertEqual(len(rec.features), 2)
+        self.assertEqual(rec.features[0].label, "testCDS")
+        self.assertEqual((rec.features[0].start, rec.features[0].end), (0, 30))
+        self.assertEqual(rec.features[1].strand, -1)
+
+    def test_genbank_line_ending_variants(self):
+        """Old lab files use CR-only and CRLF endings; all must parse alike."""
+        base = parse_genbank(self.GB.encode())
+        for ending in ("\r\n", "\r"):
+            variant = self.GB.replace("\n", ending).encode()
+            rec = parse_genbank(variant)
+            self.assertEqual(rec.seq, base.seq, f"failed for {ending!r}")
+            self.assertEqual(len(rec.features), len(base.features))
+            self.assertEqual(rec.name, base.name)
+
+    def test_parse_location_forms(self):
+        self.assertEqual(parse_location("1..10"), ([(0, 10)], 1))
+        self.assertEqual(parse_location("complement(5..9)"), ([(4, 9)], -1))
+        self.assertEqual(parse_location("<1..>10"), ([(0, 10)], 1))
+        segs, strand = parse_location("join(1..3,7..9)")
+        self.assertEqual(segs, [(0, 3), (6, 9)])
+        segs, strand = parse_location("complement(join(1..3,7..9))")
+        self.assertEqual(strand, -1)
+
+    def test_fasta(self):
+        rec = parse_fasta(b">myseq a description\nACGT\nACGT\n")
+        self.assertEqual(rec.name, "myseq")
+        self.assertEqual(rec.seq, "ACGTACGT")
+
+    def test_fasta_strips_numbers_and_whitespace(self):
+        rec = parse_fasta(b">x\n  1 acgt acgt\n")
+        self.assertEqual(rec.seq, "ACGTACGT")
+
+    def test_sanger_read_is_not_a_plasmid(self):
+        """The share holds thousands of .seq reads; they must not become templates."""
+        read = b">PB106-JSP1_A08.ab1\n" + (b"NNNNNACGT" * 40) + b"\n"
+        rec = parse_fasta(read)
+        role, _ = classify_role(Path("x.seq"), rec)
+        self.assertEqual(role, "read")
+
+    def test_real_plasmid_is_classified_as_plasmid(self):
+        rec = parse_genbank(self.GB.encode())
+        rec.seq = rand_seq(5000, 2)
+        role, _ = classify_role(Path("p.gb"), rec)
+        self.assertEqual(role, "plasmid")
+
+
+# --------------------------------------------------------------------------
+class TestChecksum(unittest.TestCase):
+
+    def test_least_rotation_matches_brute_force(self):
+        r = random.Random(5)
+        for _ in range(100):
+            s = "".join(r.choice("ACGT") for _ in range(r.randint(1, 30)))
+            brute = min((s + s)[i:i + len(s)] for i in range(len(s)))
+            self.assertEqual(least_rotation(s), brute)
+
+    def test_circular_checksum_invariance(self):
+        s = rand_seq(2000, 9)
+        rotated = s[777:] + s[:777]
+        self.assertEqual(seq_checksum(s, True), seq_checksum(rotated, True))
+        self.assertEqual(seq_checksum(s, True), seq_checksum(st.revcomp(s), True))
+
+    def test_linear_checksum_distinguishes_rotation(self):
+        s = rand_seq(500, 10)
+        self.assertNotEqual(seq_checksum(s, False), seq_checksum(s[10:] + s[:10], False))
+
+
+# --------------------------------------------------------------------------
+class TestEnzymes(unittest.TestCase):
+
+    def test_overhangs_are_textbook(self):
+        cases = {"EcoRI": ("AATT", "5'"), "BamHI": ("GATC", "5'"),
+                 "KpnI": ("GTAC", "3'"), "SacI": ("AGCT", "3'"),
+                 "EcoRV": ("", "blunt"), "NotI": ("GGCC", "5'")}
+        for name, (oh, etype) in cases.items():
+            ctx = "TTTT" + CATALOG[name].site + "TTTT"
+            frag = digest(ctx, [name])[0]
+            self.assertEqual(frag.right_overhang, oh, name)
+            self.assertEqual(frag.right_end_type, etype, name)
+
+    def test_isocaudomers_are_compatible(self):
+        def ends(name):
+            f = digest("TTTT" + CATALOG[name].site + "TTTT", [name])[0]
+            return f.right_overhang, f.right_end_type
+        for a, b in [("BamHI", "BglII"), ("XbaI", "NheI"), ("SpeI", "AvrII"),
+                     ("SalI", "XhoI"), ("AgeI", "XmaI"), ("NotI", "EagI")]:
+            self.assertTrue(ends_compatible(*ends(a), *ends(b)), f"{a}/{b}")
+
+    def test_incompatible_ends_rejected(self):
+        def ends(name):
+            f = digest("TTTT" + CATALOG[name].site + "TTTT", [name])[0]
+            return f.right_overhang, f.right_end_type
+        for a, b in [("EcoRI", "BamHI"), ("KpnI", "SacI"), ("KpnI", "BamHI")]:
+            self.assertFalse(ends_compatible(*ends(a), *ends(b)), f"{a}/{b}")
+
+    def test_blunt_ends_always_join(self):
+        self.assertTrue(ends_compatible("", "blunt", "", "blunt"))
+
+    def test_linear_digest_partitions_the_molecule(self):
+        s = "TTTT" + "GAATTC" + "A" * 10 + "GGATCC" + "TTTT"
+        frags = digest(s, ["EcoRI", "BamHI"])
+        self.assertEqual([f.length for f in frags], [5, 16, 9])
+        self.assertEqual(sum(f.length for f in frags), len(s))
+
+    def test_circular_single_cut_linearises(self):
+        circ = "GAATTC" + rand_seq(400, 11)
+        frags = digest(circ, ["EcoRI"], circular=True)
+        self.assertEqual(len(frags), 1)
+        self.assertEqual(frags[0].length, len(circ))
+
+    def test_circular_digest_conserves_length(self):
+        circ = "GAATTC" + rand_seq(300, 12) + "GGATCC" + rand_seq(500, 13)
+        frags = digest(circ, ["EcoRI", "BamHI"], circular=True)
+        self.assertEqual(len(frags), 2)
+        self.assertEqual(sum(f.length for f in frags), len(circ))
+
+    def test_non_palindromic_site_found_on_both_strands(self):
+        enz = CATALOG["BsaI"]
+        fwd = find_sites("TTTT" + enz.site + "T" * 20, enz)
+        rev = find_sites("T" * 20 + st.revcomp(enz.site) + "TTTT", enz)
+        self.assertEqual(len(fwd), 1)
+        self.assertEqual(len(rev), 1)
+
+    def test_type_iis_cuts_outside_recognition(self):
+        self.assertTrue(CATALOG["BsaI"].is_type_iis)
+        self.assertFalse(CATALOG["EcoRI"].is_type_iis)
+
+
+# --------------------------------------------------------------------------
+class TestVocab(unittest.TestCase):
+
+    def test_label_rules(self):
+        cases = {"CMV promotor": "promoter", "Amp resistance": "resistance",
+                 "AAV2 ITR": "AAV_ITR", "loxP": "lox_site", "WPRE": "WPRE",
+                 "bGH poly(A) signal": "polyA", "pUC origin": "origin",
+                 "ER2": "trafficking_motif", "P2A": "p2A"}
+        for label, expected in cases.items():
+            self.assertEqual(classify_label(label), expected, label)
+
+    def test_genbank_key_fallback(self):
+        self.assertEqual(classify_label("", "CDS"), "CDS")
+        self.assertEqual(classify_label("some band", "rep_origin"), "origin")
+        self.assertEqual(classify_label("mystery", ""), "unknown")
+
+    def test_fuzzy_search_matches_brute_force(self):
+        r = random.Random(21)
+        for _ in range(60):
+            h = "".join(r.choice("ACGT") for _ in range(300))
+            n = "".join(r.choice("ACGT") for _ in range(r.randint(15, 40)))
+            for mm in (0, 1, 2, 3):
+                brute = [i for i in range(len(h) - len(n) + 1)
+                         if sum(a != b for a, b in zip(h[i:i + len(n)], n)) <= mm]
+                self.assertEqual(_fuzzy_find(h, n, mm), brute)
+
+    def test_motif_finder_locates_lox_both_strands(self):
+        seq = "G" * 100 + LOXP + "T" * 100 + st.revcomp(LOX2272) + "C" * 100
+        hits = {(m["name"], m["strand"]) for m in find_motifs(seq, include_protein=False)}
+        self.assertIn(("loxP", 1), hits)
+        self.assertIn(("lox2272", -1), hits)
+
+    def test_protein_motifs_are_codon_independent(self):
+        """P2A must be found regardless of codon usage, which DNA search misses."""
+        p2a_aa = "ATNFSLLKQAGDVEENPGP"
+        back = {"A": "GCG", "T": "ACA", "N": "AAC", "F": "TTC", "S": "AGC",
+                "L": "CTG", "K": "AAG", "Q": "CAG", "G": "GGC", "D": "GAC",
+                "V": "GTG", "E": "GAG", "P": "CCG"}
+        dna = "".join(back[a] for a in p2a_aa)
+        hits = [m for m in find_motifs("ACG" * 20 + dna + "TTA" * 20)
+                if m["name"] == "P2A"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["level"], "protein")
+
+
+# --------------------------------------------------------------------------
+class TestCre(unittest.TestCase):
+
+    def _sites(self, seq):
+        from genesis.validate import lox_sites_from_layout
+        return lox_sites_from_layout(seq)
+
+    def test_flex_inverts_then_excises(self):
+        payload = orf(198, 4)
+        dio = ("G" * 200 + LOXP + LOX2272 + st.revcomp(payload)
+               + st.revcomp(LOXP) + st.revcomp(LOX2272) + "C" * 200)
+        out, log = simulate_cre(dio, self._sites(dio))
+        self.assertEqual(len(log), 2)
+        self.assertIn("inverted", log[0])
+        self.assertIn("excised", log[1])
+        # The expressed ORF must exist, forward, at full length.
+        expected = st.translate(payload).rstrip("*")
+        found = [o for o in st.find_orfs(out, min_aa=150)
+                 if o["strand"] == 1 and o["protein"] == expected]
+        self.assertTrue(found, "FLEX did not restore a forward full-length ORF")
+        remaining = {s.name for s in self._sites(out)}
+        self.assertEqual(remaining, {"loxP", "lox2272"})
+
+    def test_parallel_pair_excises(self):
+        seq = "G" * 100 + LOXP + "T" * 300 + LOXP + "C" * 100
+        out, log = simulate_cre(seq, self._sites(seq))
+        self.assertLess(len(out), len(seq))
+        self.assertEqual(len(self._sites(out)), 1)
+        self.assertIn("excised", log[0])
+
+    def test_antiparallel_pair_inverts_once_without_looping(self):
+        seq = "G" * 100 + LOXP + "T" * 300 + st.revcomp(LOXP) + "C" * 100
+        out, log = simulate_cre(seq, self._sites(seq))
+        self.assertEqual(len(out), len(seq))
+        self.assertEqual(len(log), 1)
+
+    def test_heterotypic_sites_do_not_recombine(self):
+        seq = "G" * 100 + LOXP + "T" * 300 + LOX2272 + "C" * 100
+        out, log = simulate_cre(seq, self._sites(seq))
+        self.assertEqual(out, seq)
+        self.assertEqual(log, [])
+
+    def test_single_site_is_inert(self):
+        seq = "G" * 100 + LOXP + "C" * 100
+        out, log = simulate_cre(seq, self._sites(seq))
+        self.assertEqual(out, seq)
+
+
+# --------------------------------------------------------------------------
+class TestValidation(unittest.TestCase):
+
+    def _construct(self, modules, circular=True):
+        resolved = []
+        for ftype, name, seq in modules:
+            m = Module(type=ftype, name=name, seq=seq)
+            resolved.append(ResolvedModule(m, None, name, seq, ftype, [], []))
+        return assemble(resolved, "", circular)
+
+    def test_frame_break_detected(self):
+        c = self._construct([("CDS", "geneA", "ATG" + "GCT" * 20),
+                             ("CDS", "geneB", "GC" + "GCT" * 20 + "TAA")])
+        msgs = [i.message for i in validate_construct(c) if i.level == "error"]
+        self.assertTrue(any("not a multiple of 3" in m or "out of frame" in m
+                            for m in msgs), msgs)
+
+    def test_in_frame_fusion_passes(self):
+        c = self._construct([("CDS", "geneA", "ATG" + "GCT" * 20),
+                             ("CDS", "geneB", "GCT" * 20 + "TAA")])
+        errs = [i.message for i in validate_construct(c) if i.level == "error"]
+        self.assertEqual(errs, [])
+
+    def test_premature_stop_detected(self):
+        c = self._construct([("CDS", "geneA", "ATG" + "GCT" * 5 + "TAA" + "GCT" * 5),
+                             ("CDS", "geneB", "GCT" * 10 + "TAA")])
+        msgs = [i.message for i in validate_construct(c) if i.level == "error"]
+        self.assertTrue(any("premature stop" in m for m in msgs), msgs)
+
+    def test_2a_must_have_cds_on_both_sides(self):
+        p2a = "GGAAGCGGAGCTACTAACTTCAGCCTGCTGAAGCAGGCTGGAGACGTGGAGGAGAACCCTGGACCT"
+        c = self._construct([("p2A", "P2A", p2a),
+                             ("CDS", "geneB", "ATG" + "GCT" * 20 + "TAA")])
+        msgs = [i.message for i in validate_construct(c) if i.level == "error"]
+        self.assertTrue(any("both sides" in m for m in msgs), msgs)
+
+    def test_aav_payload_limit_enforced(self):
+        itr = rand_seq(145, 30)
+        c = self._construct([("AAV_ITR", "ITR-L", itr),
+                             ("CDS", "big", orf(1900, 31)),
+                             ("AAV_ITR", "ITR-R", itr)])
+        msgs = [i.message for i in validate_construct(c) if i.level == "error"]
+        self.assertTrue(any("AAV limit" in m for m in msgs), msgs)
+
+    def test_aav_payload_within_limit_passes(self):
+        itr = rand_seq(145, 32)
+        c = self._construct([("AAV_ITR", "ITR-L", itr),
+                             ("CDS", "ok", orf(500, 33)),
+                             ("AAV_ITR", "ITR-R", itr)])
+        msgs = [i.message for i in validate_construct(c)
+                if i.level == "error" and i.category == "packaging"]
+        self.assertEqual(msgs, [])
+
+
+# --------------------------------------------------------------------------
+class TestPrimers(unittest.TestCase):
+
+    def setUp(self):
+        self.cfg = Config()
+
+    def test_pick_anneal_hits_target_tm(self):
+        tmpl = rand_seq(1000, 40)
+        region = pick_anneal(tmpl, 100, "F", self.cfg)
+        self.assertTrue(self.cfg.primer_min_len <= len(region) <= self.cfg.primer_max_len)
+        self.assertLess(abs(st.tm(region) - self.cfg.primer_tm_target), 6)
+
+    def test_reverse_anneal_is_reverse_complemented(self):
+        tmpl = rand_seq(1000, 41)
+        region = pick_anneal(tmpl, 500, "R", self.cfg)
+        self.assertIn(st.revcomp(region), tmpl)
+
+    def test_mispriming_is_flagged(self):
+        unit = rand_seq(60, 42)
+        tmpl = unit + rand_seq(200, 43) + unit     # duplicated binding site
+        p = Primer("p", unit[:24], unit[:24])
+        warnings = validate_primer(p, tmpl, self.cfg)
+        self.assertTrue(any("occurs" in w for w in warnings), warnings)
+
+    def test_homopolymer_and_dimer_flagged(self):
+        p = Primer("p", "ACGTAAAAAAAGCTAGCTAGCT", "ACGTAAAAAAAGCTAGCTAGCT")
+        warnings = validate_primer(p, "", self.cfg)
+        self.assertTrue(any("homopolymer" in w for w in warnings), warnings)
+
+    def test_tm_reported_for_anneal_not_full_oligo(self):
+        anneal = "GCTAGCTAGCATCGATCGAT"
+        p = Primer("p", "A" * 25 + anneal, anneal, "A" * 25)
+        d = p.to_dict(self.cfg)
+        self.assertNotEqual(round(d["anneal_tm"], 1), round(d["full_tm"], 1))
+        self.assertEqual(round(d["anneal_tm"], 1), round(st.tm(anneal), 1))
+
+
+# --------------------------------------------------------------------------
+class TestSpecParsing(unittest.TestCase):
+
+    def test_yaml_dialect_from_the_specification(self):
+        spec = ConstructSpec.from_yaml("""
+name: test construct
+backbone: AAV_backbone_01
+modules:
+  - type: promoter
+    name: hSyn
+    required: true
+  - type: CDS
+    name: sensor_A
+    translated: true
+  - type: polyA
+    name: bGH_polyA
+""")
+        self.assertEqual(spec.name, "test construct")
+        self.assertEqual(spec.backbone, "AAV_backbone_01")
+        self.assertEqual(len(spec.modules), 3)
+        self.assertEqual(spec.modules[0].type, "promoter")
+        self.assertIs(spec.modules[0].required, True)
+        self.assertIs(spec.modules[1].translated, True)
+
+    def test_roundtrip_dict(self):
+        spec = ConstructSpec("x", modules=[Module("CDS", "a")])
+        again = ConstructSpec.from_dict(spec.to_dict())
+        self.assertEqual(again.modules[0].type, "CDS")
+
+
+# --------------------------------------------------------------------------
+class TestEndToEnd(unittest.TestCase):
+    """Build a small inventory in memory, then design against it."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.cfg = Config()
+        self.cfg.stocked_enzymes = ("EcoRI", "BamHI", "HindIII", "XhoI", "NotI",
+                                    "AgeI", "SalI", "KpnI")
+
+    def _add_part(self, ftype, name, seq, plasmid_name):
+        import hashlib
+        chk = hashlib.sha256(seq.encode()).hexdigest()
+        pl = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                                   circular, verified)
+               VALUES (?,?,?,?,?,1,'sequence_verified')""",
+            (plasmid_name, "tester", seq + rand_seq(3000, 50), len(seq) + 3000,
+             chk[:32] + plasmid_name)).lastrowid
+        part = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES (?,?,?,?,?)""", (ftype, name, seq, chk, len(seq))).lastrowid
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end, strand)
+               VALUES (?,?,0,?,1)""", (part, pl, len(seq)))
+        self.conn.commit()
+        return pl
+
+    def test_design_produces_two_labelled_routes(self):
+        backbone_seq = ("GAATTC" + rand_seq(2000, 60) + "GGATCC"
+                        + rand_seq(2000, 61))
+        bb = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                                   circular, verified)
+               VALUES ('pTestBackbone','tester',?,?,'bbsum',1,'sequence_verified')""",
+            (backbone_seq, len(backbone_seq))).lastrowid
+        self._add_part("CDS", "GFPlike", orf(240, 62), "pDonorGFP")
+        self.conn.commit()
+
+        spec = ConstructSpec("test build", backbone_plasmid_id=bb,
+                             modules=[Module("CDS", "GFPlike")])
+        plan = design(self.conn, spec, self.cfg)
+
+        strategies = {r["strategy"] for r in plan["routes"]}
+        # Both from-scratch strategies must always be offered; the two-parent
+        # swap strategies appear as well whenever a parent pair exists.
+        self.assertTrue({"hifi", "restriction"} <= strategies, strategies)
+        self.assertLessEqual(strategies - {"hifi", "restriction"},
+                             {"swap_hifi", "swap_restriction"})
+
+        # Every step must carry a real operation code (the Stage 6 requirement).
+        from genesis.operations import OPERATIONS
+        for route in plan["routes"]:
+            for step in route["steps"]:
+                self.assertIn(step["operation"], OPERATIONS, step)
+
+        # Routes are ranked cheapest-first among feasible ones.
+        feasible = [r for r in plan["routes"] if r["feasible"]]
+        self.assertEqual(feasible, sorted(feasible, key=lambda r: r["cost"]))
+
+    def test_multi_fragment_insert_rejects_restriction_route(self):
+        backbone_seq = "GAATTC" + rand_seq(3000, 70)
+        bb = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                                   circular, verified)
+               VALUES ('pBB2','tester',?,?,'bb2',1,'sequence_verified')""",
+            (backbone_seq, len(backbone_seq))).lastrowid
+        for i in range(4):
+            self._add_part("CDS", f"gene{i}", orf(100, 80 + i), f"pDonor{i}")
+        self.conn.commit()
+
+        spec = ConstructSpec("many pieces", backbone_plasmid_id=bb,
+                             modules=[Module("CDS", f"gene{i}") for i in range(4)])
+        plan = design(self.conn, spec, self.cfg)
+        re_route = next(r for r in plan["routes"] if r["strategy"] == "restriction")
+        self.assertFalse(re_route["feasible"])
+        self.assertTrue(any("not practical" in w for w in re_route["warnings"]))
+        # The HiFi route should still be offered.
+        hifi = next(r for r in plan["routes"] if r["strategy"] == "hifi")
+        self.assertTrue(hifi["feasible"])
+
+    def test_exports_are_wellformed(self):
+        backbone_seq = "GAATTC" + rand_seq(2500, 90)
+        bb = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                                   circular, verified)
+               VALUES ('pBB3','tester',?,?,'bb3',1,'sequence_verified')""",
+            (backbone_seq, len(backbone_seq))).lastrowid
+        self._add_part("CDS", "gene", orf(150, 91), "pDonorX")
+        spec = ConstructSpec("export test", backbone_plasmid_id=bb,
+                             modules=[Module("CDS", "gene")])
+        plan = design(self.conn, spec, self.cfg)
+
+        md = protocol_markdown(plan, self.cfg)
+        self.assertIn("# export test", md)
+        # Concise protocol first, with reagents and a reaction set-up...
+        self.assertIn("## Reagents and consumables", md)
+        self.assertIn("## Protocol", md)
+        self.assertIn("TRANSFORMATION", md)
+        self.assertIn("competent cells", md)
+        # ...and everything else after it.
+        self.assertIn("## Detail", md)
+        self.assertLess(md.index("## Protocol"), md.index("## Detail"))
+        self.assertLess(md.index("## Reagents"), md.index("## Protocol"))
+        for section in ("### Validation", "### Route comparison",
+                        "### Final sequence"):
+            self.assertIn(section, md)
+            self.assertGreater(md.index(section), md.index("## Detail"))
+
+        gb = to_genbank(plan)
+        self.assertTrue(gb.startswith("LOCUS"))
+        self.assertTrue(gb.rstrip().endswith("//"))
+        self.assertIn("FEATURES", gb)
+        # The GenBank sequence must round-trip through our own parser.
+        reparsed = parse_genbank(gb.encode())
+        self.assertEqual(reparsed.seq, plan["construct"]["sequence"].upper())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------------------------
+class TestMissingPartAlignment(unittest.TestCase):
+    """A module that resolves to nothing must not shift the others."""
+
+    def test_unresolvable_module_does_not_misalign_fragments(self):
+        conn = connect(":memory:")
+        cfg = Config()
+        import hashlib
+
+        def add(ftype, name, seq, plasmid):
+            pl = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,?,?,?,?,1,'sequence_verified')""",
+                (plasmid, "t", seq + rand_seq(2000, 99), len(seq) + 2000,
+                 name + "sum")).lastrowid
+            part = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ftype, name, seq, hashlib.sha256(seq.encode()).hexdigest(),
+                 len(seq))).lastrowid
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                        strand) VALUES (?,?,0,?,1)""", (part, pl, len(seq)))
+
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'bbx',1,'sequence_verified')""",
+            (rand_seq(3000, 98), 3000)).lastrowid
+        add("promoter", "promA", rand_seq(400, 97), "pProm")
+        add("CDS", "geneZ", orf(150, 96), "pGeneZ")
+        conn.commit()
+
+        # The middle module cannot be resolved and will be dropped.
+        spec = ConstructSpec("gap", backbone_plasmid_id=bb, modules=[
+            Module("promoter", "promA"),
+            Module("IRES", "no_such_ires", required=False),
+            Module("CDS", "geneZ"),
+        ])
+        plan = design(conn, spec, cfg)
+
+        names = {f["name"] for f in plan["fragments"]}
+        self.assertEqual(names, {"promA", "geneZ"})
+        # Each surviving fragment must still point at its own donor.
+        by_name = {f["name"]: f for f in plan["fragments"]}
+        self.assertEqual(by_name["promA"]["source"], "pProm")
+        self.assertEqual(by_name["geneZ"]["source"], "pGeneZ")
+
+
+# --------------------------------------------------------------------------
+class TestTimeEstimates(unittest.TestCase):
+    """Hands-on bench time must not be conflated with elapsed turnaround."""
+
+    def test_hands_on_is_less_than_elapsed(self):
+        from genesis.operations import OPERATIONS
+        for op in OPERATIONS.values():
+            self.assertLessEqual(op.hands_on_minutes, op.default_minutes, op.code)
+
+    def test_waiting_dominated_steps_are_cheap_in_hands_on_terms(self):
+        from genesis.operations import OPERATIONS
+        for code in ("SEQUENCE_VERIFY", "SYNTHESIS", "TRANSFORMATION"):
+            op = OPERATIONS[code]
+            self.assertLess(op.hands_on_minutes, op.default_minutes / 4, code)
+
+    def test_route_reports_both_figures(self):
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pB','t',?,?,'s1',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 120), 2506)).lastrowid
+        import hashlib
+        seq = orf(150, 121)
+        pl = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'s2',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 122), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','g',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(), len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,0,?,1)""", (part, pl, len(seq)))
+        conn.commit()
+
+        plan = design(conn, ConstructSpec("t", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "g")]), cfg)
+        for route in plan["routes"]:
+            self.assertIn("hands_on_minutes", route)
+            self.assertIn("turnaround_minutes", route)
+            if not route["feasible"]:
+                continue        # a rejected route has no steps to cost
+            self.assertLess(route["hands_on_minutes"], route["turnaround_minutes"])
+            # Sequencing alone is a day; a real plan must exceed that elapsed.
+            self.assertGreater(route["turnaround_minutes"], 1440)
+
+
+# --------------------------------------------------------------------------
+class TestBenchRealityChecks(unittest.TestCase):
+    """Plans must not propose things that fail at the bench."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.cfg = Config()
+
+    def _plasmid(self, name, seq, circular=1, verified="sequence_verified"):
+        return self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES (?,'t',?,?,?,?,?)""",
+            (name, seq, len(seq), name + "_sum", circular, verified)).lastrowid
+
+    def _part(self, ftype, name, seq, plasmid_id):
+        import hashlib
+        pid = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES (?,?,?,?,?)""",
+            (ftype, name, seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end, strand)
+               VALUES (?,?,0,?,1)""", (pid, plasmid_id, len(seq)))
+        return pid
+
+    def test_oversized_backbone_pcr_is_flagged(self):
+        bb = self._plasmid("pHuge", rand_seq(14000, 200))
+        donor = self._plasmid("pDonor", orf(150, 201) + rand_seq(2000, 202))
+        self._part("CDS", "gene", orf(150, 201), donor)
+        self.conn.commit()
+        plan = design(self.conn, ConstructSpec(
+            "big", backbone_plasmid_id=bb, modules=[Module("CDS", "gene")]), self.cfg)
+        hifi = next(r for r in plan["routes"] if r["strategy"] == "hifi")
+        self.assertTrue(any("backbone amplicon" in w and "above the" in w
+                            for w in hifi["warnings"]), hifi["warnings"])
+
+    def test_tiny_fragment_suggests_primer_tail_instead_of_pcr(self):
+        bb = self._plasmid("pBB", "GAATTC" + rand_seq(3000, 210))
+        donor = self._plasmid("pTiny", rand_seq(3000, 211))
+        self._part("linker", "shortlink", "GGCGGATCCGGCGGA", donor)
+        self.conn.commit()
+        plan = design(self.conn, ConstructSpec(
+            "tiny", backbone_plasmid_id=bb,
+            modules=[Module("linker", "shortlink")]), self.cfg)
+        hifi = next(r for r in plan["routes"] if r["strategy"] == "hifi")
+        self.assertTrue(any("annealed oligos" in w for w in hifi["warnings"]),
+                        hifi["warnings"])
+
+    def test_backbone_lookup_ignores_short_fragments(self):
+        self._plasmid("FCK_tiny_fragment", "ACGTACGTACGTACGTACGTACG", circular=0)
+        real = self._plasmid("FCK_real_vector", rand_seq(6000, 220))
+        donor = self._plasmid("pD", orf(150, 221) + rand_seq(1000, 222))
+        self._part("CDS", "g", orf(150, 221), donor)
+        self.conn.commit()
+        plan = design(self.conn, ConstructSpec(
+            "bb", backbone="FCK", modules=[Module("CDS", "g")]), self.cfg)
+        self.assertIsNotNone(plan["backbone"])
+        self.assertEqual(plan["backbone"]["id"], real)
+
+    def test_template_prefers_real_plasmid_over_pcr_product(self):
+        bb = self._plasmid("pBB", "GAATTC" + rand_seq(3000, 230))
+        seq = orf(150, 231)
+        product = self._plasmid("PCRprdt_gene", seq, circular=0,
+                                verified="unverified")
+        plasmid = self._plasmid("pMaintained_gene", seq + rand_seq(3000, 232))
+        part = self._part("CDS", "g", seq, product)
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end, strand)
+               VALUES (?,?,0,?,1)""", (part, plasmid, len(seq)))
+        self.conn.commit()
+        plan = design(self.conn, ConstructSpec(
+            "tmpl", backbone_plasmid_id=bb, modules=[Module("CDS", "g")]), self.cfg)
+        self.assertEqual(plan["fragments"][0]["source"], "pMaintained_gene")
+
+
+# --------------------------------------------------------------------------
+class TestNameSuggestion(unittest.TestCase):
+
+    def _plan(self, layout, backbone_name=""):
+        return {"construct": {"name": "untitled", "layout": layout},
+                "backbone": {"name": backbone_name} if backbone_name else None}
+
+    def test_names_from_architecture(self):
+        from genesis.protocol import suggest_name
+        layout = [
+            {"type": "backbone", "name": "backbone"},
+            {"type": "promoter", "name": "hSyn"},
+            {"type": "CDS", "name": "CheRiff"},
+            {"type": "p2A", "name": "P2A"},
+            {"type": "CDS", "name": "Citrine"},
+            {"type": "polyA", "name": "bGH polyA"},
+        ]
+        self.assertEqual(suggest_name(self._plan(layout)),
+                         "hSyn-CheRiff-P2A-Citrine")
+
+    def test_aav_prefix_from_itrs(self):
+        from genesis.protocol import suggest_name
+        layout = [{"type": "AAV_ITR", "name": "ITR"},
+                  {"type": "promoter", "name": "hSyn"},
+                  {"type": "CDS", "name": "GCaMP8f"},
+                  {"type": "AAV_ITR", "name": "ITR"}]
+        self.assertEqual(suggest_name(self._plan(layout)), "pAAV-hSyn-GCaMP8f")
+
+    def test_lenti_prefix_from_backbone_name(self):
+        from genesis.protocol import suggest_name
+        layout = [{"type": "promoter", "name": "EF1a"},
+                  {"type": "CDS", "name": "Voltron2"}]
+        self.assertEqual(suggest_name(self._plan(layout, "pLJM1_EF1a_LR")),
+                         "pLenti-EF1a-Voltron2")
+
+    def test_messy_part_labels_are_cleaned(self):
+        from genesis.protocol import suggest_name
+        layout = [{"type": "CDS", "name": "Archon1"},
+                  {"type": "trafficking_motif", "name": "KGC / Kir2.1 TS"},
+                  {"type": "trafficking_motif", "name": "ER2 export motif"}]
+        self.assertEqual(suggest_name(self._plan(layout)), "Archon1-KGC-ER2")
+
+    def test_structural_only_construct_falls_back(self):
+        from genesis.protocol import suggest_name
+        layout = [{"type": "origin", "name": "ColE1"},
+                  {"type": "resistance", "name": "AmpR"}]
+        self.assertEqual(suggest_name(self._plan(layout)), "untitled")
+
+
+# --------------------------------------------------------------------------
+class TestPDF(unittest.TestCase):
+
+    def test_pdf_writer_produces_a_valid_document(self):
+        from genesis.pdf import PDF
+        doc = PDF("unit test")
+        doc.heading("Title", 1)
+        for i in range(90):
+            doc.paragraph(f"line {i} " * 12)
+        doc.table(["a", "b"], [["1", "2"], ["3", "4"]])
+        data = doc.to_bytes()
+
+        self.assertTrue(data.startswith(b"%PDF-1.4"))
+        self.assertTrue(data.rstrip().endswith(b"%%EOF"))
+        self.assertGreater(data.count(b"/Type /Page "), 1)   # paginated
+
+        # Every xref offset must point at the object it claims.
+        import re
+        start = int(re.search(rb"startxref\s+(\d+)", data).group(1))
+        lines = data[start:].split(b"\n")
+        count = int(lines[1].split()[1])
+        for i, line in enumerate(lines[3:3 + count - 1], start=1):
+            offset = int(line.split()[0])
+            self.assertTrue(data[offset:].startswith(f"{i} 0 obj".encode()),
+                            f"xref entry {i} is wrong")
+
+    def test_text_measurement_uses_real_metrics(self):
+        from genesis.pdf import text_width, wrap
+        # 'i' is far narrower than 'W' in Helvetica; a fixed-width
+        # approximation would make these equal and wrap badly.
+        self.assertLess(text_width("iiii", "F1", 10),
+                        text_width("WWWW", "F1", 10) / 2)
+        lines = wrap("word " * 60, "F1", 10, 200)
+        self.assertGreater(len(lines), 1)
+        for line in lines:
+            self.assertLessEqual(text_width(line, "F1", 10), 200.5)
+
+    def test_protocol_pdf_round_trip(self):
+        conn = connect(":memory:")
+        cfg = Config()
+        import hashlib
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'pdfbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 300), 2506)).lastrowid
+        seq = orf(150, 301)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'pdfd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 302), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(), len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,0,?,1)""", (part, donor, len(seq)))
+        conn.commit()
+
+        plan = design(conn, ConstructSpec("pdf test", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]), cfg)
+        from genesis.export import protocol_pdf
+        data = protocol_pdf(plan, cfg)
+        self.assertTrue(data.startswith(b"%PDF"))
+        self.assertGreater(len(data), 3000)
+
+    def test_plan_carries_a_suggested_name(self):
+        conn = connect(":memory:")
+        cfg = Config()
+        import hashlib
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pAAV_backbone','t',?,?,'sn1',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 310), 2506)).lastrowid
+        for ftype, nm, s in (("promoter", "hSyn", rand_seq(400, 311)),
+                             ("CDS", "GCaMP8f", orf(150, 312))):
+            pl = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'sequence_verified')""",
+                ("p" + nm, s + rand_seq(2000, 313), len(s) + 2000, nm)).lastrowid
+            pid = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ftype, nm, s, hashlib.sha256(s.encode()).hexdigest(),
+                 len(s))).lastrowid
+            conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                            start, end, strand) VALUES (?,?,0,?,1)""",
+                         (pid, pl, len(s)))
+        conn.commit()
+        plan = design(conn, ConstructSpec(
+            "untitled", backbone_plasmid_id=bb,
+            modules=[Module("promoter", "hSyn"), Module("CDS", "GCaMP8f")]), cfg)
+        self.assertEqual(plan["construct"]["suggested_name"],
+                         "pAAV-hSyn-GCaMP8f")
+
+
+# --------------------------------------------------------------------------
+class TestCompositeParts(unittest.TestCase):
+    """A CDS that already carries a fused 2A must not produce a tandem pair."""
+
+    P2A_AA = "ATNFSLLKQAGDVEENPGP"
+    _BACK = {"A": "GCG", "T": "ACA", "N": "AAC", "F": "TTC", "S": "AGC",
+             "L": "CTG", "K": "AAG", "Q": "CAG", "G": "GGC", "D": "GAC",
+             "V": "GTG", "E": "GAG", "P": "CCG"}
+
+    @classmethod
+    def p2a_dna(cls):
+        return "".join(cls._BACK[a] for a in cls.P2A_AA)
+
+    def test_detects_fused_2a_in_a_cds(self):
+        from genesis.vocab import find_embedded_elements
+        cds = "ATG" + "GCT" * 150
+        found = find_embedded_elements(cds + self.p2a_dna(), "CDS")
+        self.assertTrue(found)
+        self.assertEqual(found[0]["feature_type"], "p2A")
+        self.assertTrue(found[0]["at_end"])
+
+    def test_plain_cds_has_nothing_embedded(self):
+        from genesis.vocab import find_embedded_elements
+        self.assertEqual(find_embedded_elements("ATG" + "GCT" * 150, "CDS"), [])
+
+    def test_trim_only_touches_terminal_elements(self):
+        from genesis.vocab import find_embedded_elements, trim_embedded
+        p2a = self.p2a_dna()
+        # an internal 2A must be left alone: cutting it changes the protein
+        internal = "ATG" + "GCT" * 60 + p2a + "GCT" * 60
+        els = find_embedded_elements(internal, "CDS")
+        trimmed, removed = trim_embedded(internal, els, "p2A")
+        self.assertEqual(trimmed, internal)
+        self.assertEqual(removed, [])
+
+    def test_resolver_trims_a_fused_2a_when_one_is_also_requested(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        p2a = self.p2a_dna()
+        fused = "ATG" + "GCT" * 150 + p2a          # CDS with a trailing P2A
+
+        def add(ftype, name, seq):
+            pl = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'sequence_verified')""",
+                ("p" + name, seq + rand_seq(2500, 400), len(seq) + 2500,
+                 name + "s")).lastrowid
+            pid = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ftype, name, seq, hashlib.sha256(seq.encode()).hexdigest(),
+                 len(seq))).lastrowid
+            conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                            start, end, strand) VALUES (?,?,0,?,1)""",
+                         (pid, pl, len(seq)))
+            return pid
+
+        add("CDS", "FusedGene", fused)
+        add("p2A", "P2A", p2a)
+        add("CDS", "Reporter", "GCT" * 150 + "TAA")
+        conn.commit()
+
+        spec = ConstructSpec("tandem check", modules=[
+            Module("CDS", "FusedGene"), Module("p2A", "P2A"),
+            Module("CDS", "Reporter")])
+        from genesis.construct import resolve
+        resolved = resolve(conn, spec)
+
+        gene = resolved[0]
+        self.assertNotIn(p2a, gene.seq, "the fused P2A should have been trimmed")
+        self.assertEqual(len(gene.seq), len(fused) - len(p2a))
+        self.assertTrue(any("two" in w for w in gene.warnings), gene.warnings)
+
+    def test_validator_flags_a_tandem_2a(self):
+        p2a = self.p2a_dna()
+        mods = [("CDS", "geneA", "ATG" + "GCT" * 50),
+                ("p2A", "P2A-1", p2a),
+                ("p2A", "P2A-2", p2a),
+                ("CDS", "geneB", "GCT" * 50 + "TAA")]
+        resolved = [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s,
+                                   t, [], []) for t, n, s in mods]
+        construct = assemble(resolved, "", True)
+        msgs = [i.message for i in validate_construct(construct)
+                if i.level == "error"]
+        self.assertTrue(any("two 2A peptides" in m for m in msgs), msgs)
+
+    def test_single_2a_is_not_flagged(self):
+        p2a = self.p2a_dna()
+        mods = [("CDS", "geneA", "ATG" + "GCT" * 50),
+                ("p2A", "P2A", p2a),
+                ("CDS", "geneB", "GCT" * 50 + "TAA")]
+        resolved = [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s,
+                                   t, [], []) for t, n, s in mods]
+        construct = assemble(resolved, "", True)
+        msgs = [i.message for i in validate_construct(construct)
+                if i.level == "error"]
+        self.assertFalse(any("two 2A peptides" in m for m in msgs), msgs)
+
+
+# --------------------------------------------------------------------------
+class TestDIO(unittest.TestCase):
+    """DIO is an architecture that wraps a payload, not a part to look up.
+
+        lox2272 - loxP - [payload inverted] - lox2272' - loxP'
+
+    Nothing is expressed until Cre inverts the payload and excises one pair.
+    """
+
+    def _resolved(self, items):
+        from genesis.construct import ResolvedModule
+        return [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s, t, [], [])
+                for t, n, s in items]
+
+    def test_expansion_builds_the_interleaved_lox_arrangement(self):
+        from genesis.construct import expand_dio
+        payload = orf(300, 500)
+        mods = self._resolved([("promoter", "hSyn", "G" * 400),
+                               ("DIO", "DIO", ""),
+                               ("CDS", "payload", payload)])
+        out, notes = expand_dio(mods)
+        kinds = [(m.feature_type, m.part_name, m.module.orientation) for m in out]
+        self.assertEqual(kinds, [
+            ("promoter", "hSyn", "forward"),
+            ("lox_site", "lox2272", "forward"),
+            ("lox_site", "loxP", "forward"),
+            ("CDS", "payload", "reverse"),
+            ("lox_site", "lox2272", "reverse"),
+            ("lox_site", "loxP", "reverse"),
+        ])
+        self.assertTrue(notes)
+
+    def test_payload_is_off_before_cre_and_on_after(self):
+        from genesis.construct import expand_dio
+        from genesis.validate import lox_sites_from_layout, simulate_cre
+        payload = orf(300, 501)
+        protein = st.translate(payload).rstrip("*")
+        out, _ = expand_dio(self._resolved([
+            ("promoter", "hSyn", "G" * 400), ("DIO", "DIO", ""),
+            ("CDS", "payload", payload)]))
+        construct = assemble(out, "", True)
+
+        before = [o for o in st.find_orfs(construct.seq, min_aa=250)
+                  if o["strand"] == 1 and o["protein"] == protein]
+        self.assertFalse(before, "payload must not be expressible before Cre")
+
+        recombined, log = simulate_cre(construct.seq,
+                                       lox_sites_from_layout(construct.seq))
+        after = [o for o in st.find_orfs(recombined, min_aa=250)
+                 if o["strand"] == 1 and o["protein"] == protein]
+        self.assertTrue(after, "Cre must switch the payload on")
+        self.assertEqual(len(log), 2)
+        self.assertIn("inverted", log[0])
+        self.assertIn("excised", log[1])
+
+    def test_one_site_of_each_type_survives(self):
+        from genesis.construct import expand_dio
+        from genesis.validate import lox_sites_from_layout, simulate_cre
+        out, _ = expand_dio(self._resolved([
+            ("DIO", "DIO", ""), ("CDS", "payload", orf(200, 502))]))
+        construct = assemble(out, "", True)
+        recombined, _ = simulate_cre(construct.seq,
+                                     lox_sites_from_layout(construct.seq))
+        remaining = lox_sites_from_layout(recombined)
+        self.assertEqual({s.name for s in remaining}, {"lox2272", "loxP"})
+        self.assertEqual(len(remaining), 2)
+
+    def test_multi_module_payload_is_inverted_as_one_block(self):
+        from genesis.construct import expand_dio
+        a, b = orf(100, 503), orf(120, 504)
+        out, _ = expand_dio(self._resolved([
+            ("DIO", "DIO", ""), ("CDS", "geneA", a),
+            ("p2A", "P2A", "GGC" * 22), ("CDS", "geneB", b),
+            ("polyA", "bGH", "AATAAA" * 5)]))
+        names = [m.part_name for m in out]
+        # payload reversed between the lox sites, polyA left outside
+        self.assertEqual(names, ["lox2272", "loxP", "geneB", "P2A", "geneA",
+                                 "lox2272", "loxP", "bGH"])
+
+    def test_dio_without_a_payload_is_reported_not_silently_kept(self):
+        from genesis.construct import expand_dio
+        out, notes = expand_dio(self._resolved([
+            ("promoter", "hSyn", "G" * 300), ("DIO", "DIO", "")]))
+        self.assertEqual([m.feature_type for m in out], ["promoter"])
+        self.assertTrue(any("no coding sequence" in n for n in notes), notes)
+
+    def test_inverted_payload_is_not_translated_as_a_forward_fusion(self):
+        """The reverse-strand payload must be read off its own strand."""
+        from genesis.construct import expand_dio, translated_span
+        out, _ = expand_dio(self._resolved([
+            ("DIO", "DIO", ""), ("CDS", "geneA", "ATG" + "GCT" * 40),
+            ("p2A", "P2A", "GGC" * 22),
+            ("CDS", "geneB", "GCT" * 40 + "TAA")]))
+        construct = assemble(out, "", True)
+        runs = translated_span(construct)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["strand"], -1)
+        # members come back in the order the ribosome reads them
+        self.assertEqual([m["name"] for m in runs[0]["members"]],
+                         ["geneA", "P2A", "geneB"])
+        errors = [i.message for i in validate_construct(construct)
+                  if i.level == "error"]
+        self.assertEqual(errors, [], errors)
+
+
+# --------------------------------------------------------------------------
+class TestCodonMarkers(unittest.TestCase):
+    """Start and stop codons, located for drawing on a map."""
+
+    def _c(self, items):
+        from genesis.construct import ResolvedModule
+        resolved = [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s,
+                                   t, [], []) for t, n, s in items]
+        return assemble(resolved, "", True)
+
+    def test_clean_fusion_has_one_start_and_one_stop(self):
+        from genesis.construct import codon_markers
+        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 20),
+                     ("CDS", "geneB", "GCT" * 20 + "TAA")])
+        marks = codon_markers(c)
+        self.assertEqual([m["kind"] for m in marks], ["start", "stop"])
+        self.assertEqual(marks[0]["start"], 0)
+        self.assertEqual(marks[0]["codon"], "ATG")
+        self.assertEqual(marks[1]["end"], c.length)
+        self.assertEqual(marks[1]["codon"], "TAA")
+
+    def test_premature_stop_is_marked_separately_from_the_real_one(self):
+        from genesis.construct import codon_markers
+        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 5 + "TGA" + "GCT" * 5),
+                     ("CDS", "geneB", "GCT" * 5 + "TAA")])
+        kinds = [m["kind"] for m in codon_markers(c)]
+        self.assertIn("premature_stop", kinds)
+        self.assertEqual(kinds.count("stop"), 1)
+        premature = next(m for m in codon_markers(c)
+                         if m["kind"] == "premature_stop")
+        self.assertEqual(premature["start"], 18)
+        self.assertEqual(premature["module"], "geneA")
+
+    def test_missing_start_and_missing_stop_are_reported(self):
+        from genesis.construct import codon_markers
+        c = self._c([("CDS", "geneA", "GCT" * 20),
+                     ("CDS", "geneB", "GCT" * 20)])
+        kinds = {m["kind"] for m in codon_markers(c)}
+        self.assertIn("missing_start", kinds)
+        self.assertIn("missing_stop", kinds)
+
+    def test_reverse_strand_payload_maps_back_to_construct_coordinates(self):
+        """An inverted DIO payload puts its ATG at the HIGHER coordinate."""
+        from genesis.construct import codon_markers, expand_dio, ResolvedModule
+        payload = "ATG" + "GCT" * 40 + "TAA"
+        mods = [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s, t, [], [])
+                for t, n, s in [("DIO", "DIO", ""), ("CDS", "payload", payload)]]
+        out, _ = expand_dio(mods)
+        c = assemble(out, "", True)
+        marks = codon_markers(c)
+
+        start = next(m for m in marks if m["kind"] == "start")
+        stop = next(m for m in marks if m["kind"] == "stop")
+        self.assertEqual(start["strand"], -1)
+        self.assertEqual(stop["strand"], -1)
+        self.assertGreater(start["start"], stop["start"])
+        # and they must point at the real codons on the reverse strand
+        self.assertEqual(st.revcomp(c.seq[start["start"]:start["end"]]), "ATG")
+        self.assertEqual(st.revcomp(c.seq[stop["start"]:stop["end"]]), "TAA")
+
+    def test_markers_are_sorted_and_carry_their_module(self):
+        from genesis.construct import codon_markers
+        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 10),
+                     ("p2A", "P2A", "GGC" * 22),
+                     ("CDS", "geneB", "GCT" * 10 + "TAG")])
+        marks = codon_markers(c)
+        self.assertEqual([m["start"] for m in marks],
+                         sorted(m["start"] for m in marks))
+        self.assertEqual(marks[0]["module"], "geneA")
+        self.assertEqual(marks[-1]["module"], "geneB")
+
+    def test_untranslated_construct_has_no_markers(self):
+        from genesis.construct import codon_markers
+        c = self._c([("promoter", "hSyn", "G" * 300),
+                     ("polyA", "bGH", "AATAAA" * 10)])
+        self.assertEqual(codon_markers(c), [])
+
+    def test_plan_exposes_markers(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        seq = orf(150, 600)
+        pl = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'cm1',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 601), len(seq) + 2000)).lastrowid
+        pid = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(), len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,0,?,1)""", (pid, pl, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("m", modules=[Module("CDS", "gene")]),
+                      cfg)
+        marks = plan["construct"]["codon_markers"]
+        self.assertTrue(marks)
+        self.assertEqual(marks[0]["kind"], "start")
+
+    def test_reverse_strand_missing_stop_sits_past_the_last_codon(self):
+        """Translation runs toward lower coordinates on the reverse strand,
+        so "just past the end" is the low edge of the run, not the high one."""
+        from genesis.construct import codon_markers, expand_dio, ResolvedModule
+        payload = "ATG" + "GCT" * 40            # deliberately no stop codon
+        mods = [ResolvedModule(Module(type=t, name=n, seq=s), None, n, s, t, [], [])
+                for t, n, s in [("DIO", "DIO", ""), ("CDS", "payload", payload)]]
+        out, _ = expand_dio(mods)
+        c = assemble(out, "", True)
+
+        cds = [i for i in c.layout if i["type"] == "CDS"]
+        run_start = min(i["start"] for i in cds)
+        marker = next(m for m in codon_markers(c) if m["kind"] == "missing_stop")
+        self.assertEqual(marker["strand"], -1)
+        self.assertEqual(marker["start"], run_start)
+        self.assertEqual(marker["start"], marker["end"])   # zero width
+
+    def test_forward_missing_stop_sits_past_the_last_codon(self):
+        from genesis.construct import codon_markers
+        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 20)])
+        marker = next(m for m in codon_markers(c) if m["kind"] == "missing_stop")
+        self.assertEqual(marker["start"], c.length)
