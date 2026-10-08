@@ -85,8 +85,9 @@ def cmd_reclassify(args, cfg: Config):
 def cmd_infer_orfs(args, cfg: Config):
     conn = _conn(cfg, args.db)
 
-    def progress(done, total, found):
-        print(f"  {done}/{total} plasmids | {found} CDS inferred",
+    def progress(done, total, found, skipped):
+        note = f" | {skipped} already done" if skipped else ""
+        print(f"  {done}/{total} plasmids | {found} CDS inferred{note}",
               file=sys.stderr)
 
     print("looking for payload CDSs nobody annotated", file=sys.stderr)

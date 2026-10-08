@@ -340,12 +340,12 @@ def infer_all(conn: sqlite3.Connection, limit: int | None = None,
     if limit is not None:
         ids = ids[:limit]
 
-    examined = annotated = parts_made = 0
+    examined = annotated = parts_made = skipped = 0
     named_by = {"catalogue": 0, "variant": 0, "plasmid_name": 0, "none": 0}
 
     for i, pid in enumerate(ids):
         if progress and i and i % 200 == 0:
-            progress(i, len(ids), annotated)
+            progress(i, len(ids), annotated, skipped)
         p = conn.execute(
             "SELECT id, name, seq, circular FROM plasmid WHERE id = ?",
             (pid,)).fetchone()
@@ -355,6 +355,8 @@ def infer_all(conn: sqlite3.Connection, limit: int | None = None,
             """SELECT feature_type, name, start, end, strand, evidence
                  FROM annotation WHERE plasmid_id = ?""", (pid,))]
         if not refresh and any(a["evidence"] == "orf" for a in anns):
+            # Already done on an earlier run; --refresh redoes them.
+            skipped += 1
             continue
         examined += 1
 
@@ -439,6 +441,7 @@ def infer_all(conn: sqlite3.Connection, limit: int | None = None,
     conn.commit()
     return {
         "plasmids_examined": examined,
+        "plasmids_already_done": skipped,
         "parts_renamed": upgraded,
         "cds_inferred": annotated,
         "parts_created": parts_made,
