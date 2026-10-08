@@ -2845,3 +2845,76 @@ class TestDefaultVector(unittest.TestCase):
         conn = connect(":memory:")
         plan = design(conn, spec, cfg)
         self.assertIsNone(plan["vector"]["requested"])
+
+
+class TestInferredORFs(unittest.TestCase):
+    """Payload CDSs the source files never annotated."""
+
+    def test_insert_name_is_pulled_out_of_the_plasmid_name(self):
+        from genesis.orfs import name_from_plasmid as n
+        self.assertEqual(n("YD043-pAAV-syn-iGluSnFR4f-NGR-WPRE"), "iGluSnFR4f")
+        self.assertEqual(n("paav-ef1a-dio-asap7y-wpre_"), "asap7y")
+        self.assertEqual(n("pcDNA3-CheRiff-eGFP"), "CheRiff")
+        self.assertEqual(n("UB030_HuC-zArchon"), "zArchon")
+
+    def test_vector_only_names_yield_nothing(self):
+        from genesis.orfs import name_from_plasmid as n
+        for name in ("pcDNA3a", "pUC19", "pAAV2", "PREDICTED_pPZ021",
+                     "addgene-plasmid-53191-sequence", "DL011_5-TBD"):
+            self.assertIsNone(n(name), name)
+
+    def test_identity_is_scored_against_the_longer_protein(self):
+        # The point of the whole exercise: a cpGFP buried inside a sensor
+        # makes the sensor 97% of a GFP under protein_identity, which asks
+        # "same part?".  Asking "what is this?" needs the other denominator,
+        # or every sensor in the inventory comes back as GFP.
+        from genesis.orfs import ProteinIndex
+        from genesis.seqtools import translate
+        big = "M" + "".join(random.Random(4).choice("ACDEFGHIKLMNPQRSTVWY")
+                            for _ in range(400))
+        small = big[100:200]
+
+        class Fake(ProteinIndex):
+            def __init__(self):
+                self.kmers, self.parts = {}, {}
+                for pid, aa in ((1, small), (2, big)):
+                    self.parts[pid] = (f"p{pid}", len(aa))
+                    for i in range(len(aa) - self.K + 1):
+                        self.kmers.setdefault(aa[i:i + self.K], set()).add(pid)
+
+        ident, pid, _name = Fake().best(big)
+        self.assertEqual(pid, 2, "a protein should match itself, not its part")
+        self.assertGreater(ident, 0.95)
+
+    def test_generic_catalogue_names_are_not_inherited(self):
+        from genesis.orfs import _useful
+        for bad in ("ORF frame 1", "CDS", "Translation 1970-3730", "target",
+                    "P (fragment)", "unnamed", "Template"):
+            self.assertFalse(_useful(bad), bad)
+        for good in ("QuasAr2", "iGluSnFr3", "beta-lactamase", "mCherry",
+                     "Voltron2 [2 of 3]"):
+            self.assertTrue(_useful(good), good)
+
+    def test_an_annotated_orf_is_left_alone(self):
+        from genesis.orfs import candidate_orfs
+        seq = "ATG" + "AAC" * 300 + "TAA" + "GGGG" * 50
+        covered = [{"feature_type": "CDS", "name": "known",
+                    "start": 0, "end": 906, "strand": 1}]
+        self.assertEqual(candidate_orfs(seq, False, covered), [])
+        self.assertTrue(candidate_orfs(seq, False, []))
+
+    def test_payload_span_ignores_the_resistance_promoter(self):
+        from genesis.orfs import payload_span
+        anns = [
+            {"feature_type": "promoter", "name": "hSyn promoter",
+             "start": 255, "end": 703},
+            {"feature_type": "WPRE", "name": "WPRE", "start": 2543, "end": 3132},
+            {"feature_type": "promoter", "name": "AmpR promoter",
+             "start": 5966, "end": 6071},
+        ]
+        self.assertEqual(payload_span(anns), (703, 2543))
+
+    def test_payload_span_needs_both_ends(self):
+        from genesis.orfs import payload_span
+        self.assertIsNone(payload_span(
+            [{"feature_type": "promoter", "name": "hSyn", "start": 0, "end": 400}]))

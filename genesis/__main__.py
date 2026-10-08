@@ -4,6 +4,7 @@
     python3 -m genesis scan [--limit N]      index the shared DNA folder
     python3 -m genesis scan --force          re-read every file, not just changed ones
     python3 -m genesis reclassify             re-label what is already indexed
+    python3 -m genesis infer-orfs             annotate unannotated payload CDSs
     python3 -m genesis stats                 what is in the inventory
     python3 -m genesis find <term>           search plasmids
     python3 -m genesis parts [--type CDS]    browse reusable parts
@@ -26,6 +27,7 @@ from .design import design as run_design, save_design
 from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
                      to_genbank)
 from .importer import import_tree, reclassify
+from .orfs import infer_all
 
 CONFIG_PATH = Path("~/.genesis/config.json").expanduser()
 
@@ -78,6 +80,18 @@ def cmd_reclassify(args, cfg: Config):
     print("re-deriving feature types from stored labels (the share is not read)",
           file=sys.stderr)
     print(json.dumps(reclassify(conn, progress=progress), indent=2))
+
+
+def cmd_infer_orfs(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+
+    def progress(done, total, found):
+        print(f"  {done}/{total} plasmids | {found} CDS inferred",
+              file=sys.stderr)
+
+    print("looking for payload CDSs nobody annotated", file=sys.stderr)
+    print(json.dumps(infer_all(conn, limit=args.limit, refresh=args.refresh,
+                               progress=progress), indent=2))
 
 
 def cmd_stats(args, cfg: Config):
@@ -321,6 +335,14 @@ def main(argv=None):
         "reclassify",
         help="re-apply the labelling rules to the inventory already indexed")
     s.set_defaults(fn=cmd_reclassify)
+
+    s = sub.add_parser(
+        "infer-orfs",
+        help="annotate payload CDSs that the source files never marked")
+    s.add_argument("--limit", type=int, help="stop after N plasmids")
+    s.add_argument("--refresh", action="store_true",
+                   help="discard previously inferred CDSs and redo them")
+    s.set_defaults(fn=cmd_infer_orfs)
 
     s = sub.add_parser("stats", help="summarise the inventory")
     s.set_defaults(fn=cmd_stats)

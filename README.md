@@ -493,7 +493,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           226 tests, no lab share required
+tests/           233 tests, no lab share required
 ```
 
 ## Giving it to a labmate
@@ -540,6 +540,30 @@ exactly this reason, so re-deriving needs nothing from the share: it runs in
 seconds, and over a slow mount that is the difference between a coffee break
 and a morning. It also repairs names: a CDS with no label of its own takes
 the name from a free-text feature drawn over the same span.
+
+```bash
+python3 -m genesis infer-orfs    # annotate payload CDSs nobody marked
+```
+
+About a third of the AAV and lentiviral plasmids on the share carry a
+payload whose CDS was never annotated: the promoter is marked, the WPRE is
+marked, and the 1.8 kb between them is blank. Genesis only catalogues what
+an annotation points at, so those inserts never became parts and never
+turned up in a search.
+
+`infer-orfs` finds the reading frames nothing accounts for and identifies
+them against the proteins the lab has already catalogued. The sensor in
+YD043-pAAV-syn-iGluSnFR4f is unannotated, but it is 85% identical to an
+iGluSnFr3 two shelves over, which is enough to say what it is. Where no
+protein is close enough, the plasmid name is the fallback — but only for
+the payload, since a plasmid name says nothing about the beta-lactamase in
+its backbone.
+
+Everything it adds is marked as inferred and carries lower confidence, so
+it stays visibly distinct from an annotation someone in the lab made, and
+`--refresh` recomputes the lot. An ORF only reaches the parts catalogue
+when a protein match corroborates its name; an unnamed one is still
+recorded against its plasmid.
 
 `scan --force` re-reads every file regardless of timestamp. It is the blunt
 version of `reclassify` and takes half an hour or more over the share; reach
