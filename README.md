@@ -239,7 +239,30 @@ origin of the coordinate system: in one of this lab's backbones the promoter
 sits at 9441 and its own first CDS at 0, so the payload cannot be described
 as a single `start..end` slice at all.
 
-### Choosing a recipient
+### Choosing a recipient and a donor
+
+The plasmid being built into is the first candidate recipient. Proposing a
+swap out of one plasmid while assembling into another describes two
+different experiments, which is how a plan to build a DIO Voltron construct
+came to start from a plasmid holding neither.
+
+What a recipient already has is judged by sequence, not by catalogue
+identity. The same protein is catalogued several times over at different
+boundaries, so PP072 holding "Voltron-2" does not make it hold the part id
+resolved for "LR-Voltron2" - and asking the sequence says it has 100% of it.
+A recipient must also be a plasmid that can be grown: without an origin and
+a resistance marker it is an extraction or a fragment, not something you can
+transform.
+
+Donors are ranked differently from recipients. A recipient is scored on how
+much of the target it already holds; a donor only has to hold one piece, so
+holding six catalogued variants of GFP does not make a plasmid a better
+place to get GFP from. What matters is how little trouble it is: the same
+vector family as the construct, sequence verified, and small. Because this
+is a lab preference as much as a computation, the alternatives travel with
+the plan.
+
+
 
 A recipient has to share the construct's *architecture*, not just a few of
 its genes. A plasmid carrying three of the right coding sequences but no lox

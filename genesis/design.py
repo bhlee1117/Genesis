@@ -303,13 +303,15 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     module_rows = [{
         "type": r.feature_type, "requested": r.module.name,
         "part_id": r.part_id, "part_name": r.part_name, "length": r.length,
+        "seq": r.seq,
     } for r in resolved]
 
     # The usual real-world route: start from the closest existing plasmid and
     # swap one region, rather than rebuilding the construct from parts.
     analysis = analyse_swap(conn, module_rows, cfg,
                             require_types=required_architecture(spec),
-                            require_family=spec.vector)
+                            require_family=spec.vector,
+                            prefer_plasmid_id=backbone["id"] if backbone else None)
     # Only draw a scheme for a swap that is actually on offer; a rejected
     # analysis still carries a recipient, and drawing it would illustrate
     # a plan nobody should follow.

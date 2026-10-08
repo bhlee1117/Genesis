@@ -465,18 +465,38 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                       "join them.", 8.8, gray=0.4)
 
         rec = scheme["recipient"]
-        plasmid_track(
-            doc, "RECIPIENT  " + rec["name"],
-            f"{rec['length']:,} bp, {rec['owner']} - "
-            f"{'cut here, keep the rest' if rec.get('highlight') else 'backbone'}",
-            rec["length"], rec["features"], rec.get("highlight"), "cut")
+        if rec.get("circular"):
+            circular_map(doc, "RECIPIENT  " + rec["name"],
+                         f"{rec['length']:,} bp, {rec['owner']}",
+                         rec["length"], rec["features"],
+                         highlight=rec.get("highlight"), highlight_kind="cut")
+        else:
+            plasmid_track(
+                doc, "RECIPIENT  " + rec["name"],
+                f"{rec['length']:,} bp, {rec['owner']} - cut here, keep the rest",
+                rec["length"], rec["features"], rec.get("highlight"), "cut")
 
         don = scheme.get("donor")
         if don:
-            plasmid_track(
-                doc, "DONOR  " + don["name"],
-                f"{don['length']:,} bp, {don['owner']} - take the marked region",
-                don["length"], don["features"], don.get("highlight"), "take")
+            if don.get("circular"):
+                circular_map(doc, "DONOR  " + don["name"],
+                             f"{don['length']:,} bp, {don['owner']}",
+                             don["length"], don["features"],
+                             highlight=don.get("highlight"),
+                             highlight_kind="take")
+            else:
+                plasmid_track(
+                    doc, "DONOR  " + don["name"],
+                    f"{don['length']:,} bp, {don['owner']} - take the marked region",
+                    don["length"], don["features"], don.get("highlight"), "take")
+
+        options = scheme.get("donor_options") or []
+        if len(options) > 1:
+            doc.paragraph(
+                "Other plasmids carrying this part: " + ", ".join(
+                    f"{o['name']} ({o['length']:,} bp)" for o in options[1:5]
+                ) + ". Which to use is a lab preference; pin one with "
+                    "backbone_plasmid_id or by naming it.", 8.2, gray=0.4)
 
         anchors = []
         if scheme.get("left_anchor"):

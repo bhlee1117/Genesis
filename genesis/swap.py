@@ -32,6 +32,36 @@ IDENTITY_TYPES = {"promoter", "enhancer", "CDS", "trafficking_motif", "p2A",
                   "IRES", "DIO", "tag", "linker", "polyA", "WPRE"}
 
 
+#: How much of a module's sequence must already be in a plasmid for that
+#: plasmid to count as having it. Well short of 1.0 on purpose: the same
+#: protein is catalogued at several boundaries, so PP072's "Voltron-2" and a
+#: spec's "LR-Voltron2" differ by a leader and are still the same thing to
+#: anyone deciding what to clone.
+VARIANT_COVERAGE = 0.6
+_COVERAGE_K = 40
+
+
+def sequence_coverage(query: str, host: str) -> float:
+    """What fraction of `query` already appears in `host`, either strand.
+
+    Measured over 40-mers rather than by exact containment, because the
+    question being asked is "does this plasmid already have this protein",
+    not "does it have this exact annotation's boundaries".
+    """
+    from .seqtools import revcomp
+
+    query = (query or "").upper()
+    if len(query) < _COVERAGE_K:
+        return 1.0 if query and query in host else 0.0
+    index = set()
+    both = host + "\x00" + revcomp(host)
+    for i in range(len(both) - _COVERAGE_K + 1):
+        index.add(both[i:i + _COVERAGE_K])
+    total = len(query) - _COVERAGE_K + 1
+    hits = sum(1 for i in range(total) if query[i:i + _COVERAGE_K] in index)
+    return hits / total if total else 0.0
+
+
 @dataclass
 class ParentMatch:
     plasmid_id: int
@@ -82,9 +112,11 @@ class SwapAnalysis:
     missing: list = field(default_factory=list)
     notes: list = field(default_factory=list)
     feasible: bool = True
+    donor_options: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
+            "donor_options": self.donor_options,
             "recipient": self.recipient.to_dict() if self.recipient else None,
             "donor": self.donor.to_dict() if self.donor else None,
             "remove": self.remove.to_dict() if self.remove else None,
@@ -123,6 +155,16 @@ def rank_parents(conn: sqlite3.Connection, part_ids: list[int],
             WHERE o.part_id IN ({placeholders})
               AND pl.seq_length >= ?
               AND pl.available_template = 1
+              AND pl.circular = 1
+              -- A recipient has to be a plasmid that can be grown and
+              -- selected. Without an origin and a resistance marker it is a
+              -- fragment or an extraction, not something you can transform.
+              AND EXISTS (SELECT 1 FROM annotation a
+                          WHERE a.plasmid_id = pl.id
+                            AND a.feature_type = 'origin')
+              AND EXISTS (SELECT 1 FROM annotation a
+                          WHERE a.plasmid_id = pl.id
+                            AND a.feature_type = 'resistance')
             GROUP BY pl.id
             ORDER BY COUNT(DISTINCT o.part_id) DESC, bp DESC
             LIMIT 400""",
@@ -167,22 +209,175 @@ def _annotations(conn: sqlite3.Connection, plasmid_id: int) -> list[dict]:
            WHERE plasmid_id = ? ORDER BY start""", (plasmid_id,)).fetchall()]
 
 
-def _occurrence(conn: sqlite3.Connection, plasmid_id: int,
-                part_id: int) -> dict | None:
+def find_donors(conn: sqlite3.Connection, part_ids: list[int],
+                require_family: str = "", exclude_id: int | None = None,
+                limit: int = 8) -> list[ParentMatch]:
+    """Plasmids worth amplifying a part out of.
+
+    Deliberately not ranked the way a recipient is. A recipient is scored on
+    how much of the target it already holds, but a donor only has to hold
+    one piece - so holding six catalogued variants of GFP does not make a
+    plasmid a better place to get GFP from. What matters is how little
+    trouble it is: the same vector family as the construct, sequence
+    verified, and small.
+    """
+    if not part_ids:
+        return []
+    placeholders = ",".join("?" * len(part_ids))
+    rows = conn.execute(
+        f"""SELECT DISTINCT pl.id, pl.name, pl.owner, pl.seq_length,
+                   pl.circular, pl.verified
+            FROM part_occurrence o JOIN plasmid pl ON pl.id = o.plasmid_id
+            WHERE o.part_id IN ({placeholders})
+              AND pl.circular = 1 AND pl.available_template = 1
+              AND EXISTS (SELECT 1 FROM annotation a
+                          WHERE a.plasmid_id = pl.id
+                            AND a.feature_type = 'origin')
+              AND EXISTS (SELECT 1 FROM annotation a
+                          WHERE a.plasmid_id = pl.id
+                            AND a.feature_type = 'resistance')
+            ORDER BY pl.seq_length ASC
+            LIMIT 80""", part_ids).fetchall()
+
+    from .vectors import classify_vector
+    scored = []
+    for r in rows:
+        if exclude_id is not None and r["id"] == exclude_id:
+            continue
+        family_miss = 0
+        if require_family:
+            ann = [dict(a) for a in conn.execute(
+                "SELECT feature_type, name FROM annotation WHERE plasmid_id = ?",
+                (r["id"],))]
+            family_miss = 0 if classify_vector(
+                ann, r["name"])["family"] == require_family else 1
+        scored.append((
+            (family_miss, 0 if r["verified"] != "unverified" else 1,
+             r["seq_length"]),
+            ParentMatch(r["id"], r["name"], r["owner"], r["seq_length"],
+                        bool(r["circular"]), r["verified"])))
+    scored.sort(key=lambda item: item[0])
+    return [match for _, match in scored[:limit]]
+
+
+def variant_part_ids(conn: sqlite3.Connection, seq: str,
+                     part_id: int | None = None) -> list[int]:
+    """Every catalogued part that is substantially the same sequence.
+
+    The same protein is catalogued several times over under different names
+    and boundaries. Treating those as one thing is what lets a donor search
+    find a plasmid carrying "EGFP" when the specification said "GFP".
+    """
+    ids = [part_id] if part_id else []
+    seq = (seq or "").upper()
+    if len(seq) < _COVERAGE_K:
+        return ids
+
+    # Index both strands. Inside a Cre-lox cassette the payload is stored
+    # reverse-complemented, so a module's sequence arrives here flipped and
+    # a one-strand index would match nothing at all.
+    from .seqtools import revcomp
+
+    index = set()
+    for strand_seq in (seq, revcomp(seq)):
+        for i in range(len(strand_seq) - _COVERAGE_K + 1):
+            index.add(strand_seq[i:i + _COVERAGE_K])
+
+    low, high = int(len(seq) * 0.7), int(len(seq) * 1.4)
+    rows = conn.execute(
+        """SELECT id, seq FROM part
+           WHERE seq_length BETWEEN ? AND ? AND id != COALESCE(?, -1)""",
+        (low, high, part_id)).fetchall()
+    for row in rows:
+        other = row["seq"].upper()
+        total = len(other) - _COVERAGE_K + 1
+        if total <= 0:
+            continue
+        hits = sum(1 for i in range(0, total, 7)
+                   if other[i:i + _COVERAGE_K] in index)
+        sampled = len(range(0, total, 7))
+        if sampled and hits / sampled >= VARIANT_COVERAGE:
+            ids.append(row["id"])
+    return ids
+
+
+def locate_by_coverage(query: str, host: str) -> dict | None:
+    """Find the region of `host` that a variant of `query` occupies.
+
+    Needed because a plasmid can hold a protein without holding the exact
+    part that was catalogued for it: PP072 carries Voltron-2, the spec asked
+    for LR-Voltron2, and they differ by a leader. The span is taken from the
+    first and last 40-mer of the query that appear in the host, which locates
+    the region without requiring the boundaries to agree.
+    """
+    from .seqtools import revcomp
+
+    query = (query or "").upper()
+    host = (host or "").upper()
+    if len(query) < _COVERAGE_K or not host:
+        return None
+
+    for strand, target in ((1, host), (-1, revcomp(host))):
+        positions = []
+        for i in range(0, len(query) - _COVERAGE_K + 1, 10):
+            at = target.find(query[i:i + _COVERAGE_K])
+            if at >= 0:
+                positions.append(at)
+        if len(positions) < 3:
+            continue
+        lo, hi = min(positions), max(positions) + _COVERAGE_K
+        if strand == -1:
+            lo, hi = len(host) - hi, len(host) - lo
+        return {"start": lo, "end": hi, "strand": strand}
+    return None
+
+
+def _occurrence(conn: sqlite3.Connection, plasmid_id: int, part_id: int,
+                seq: str = "") -> dict | None:
     row = conn.execute(
         """SELECT start, end, strand FROM part_occurrence
            WHERE plasmid_id = ? AND part_id = ? ORDER BY start LIMIT 1""",
         (plasmid_id, part_id)).fetchone()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+    # No catalogued occurrence: the plasmid may still hold a variant of this
+    # sequence, which is how it came to be counted as having the part.
+    if seq:
+        host = conn.execute("SELECT seq FROM plasmid WHERE id = ?",
+                            (plasmid_id,)).fetchone()
+        if host is not None:
+            return locate_by_coverage(seq, host["seq"])
+    return None
 
 
 # --------------------------------------------------------------------------
 # Working out what to cut and what to insert
 # --------------------------------------------------------------------------
 
+def _as_parent(conn: sqlite3.Connection, plasmid_id: int,
+               part_ids: list[int]) -> ParentMatch | None:
+    row = conn.execute(
+        """SELECT id, name, owner, seq_length, circular, verified
+           FROM plasmid WHERE id = ?""", (plasmid_id,)).fetchone()
+    if row is None:
+        return None
+    placeholders = ",".join("?" * len(part_ids)) if part_ids else "NULL"
+    held = {r["part_id"] for r in conn.execute(
+        f"""SELECT DISTINCT part_id FROM part_occurrence
+            WHERE plasmid_id = ? AND part_id IN ({placeholders})""",
+        (plasmid_id, *part_ids))} if part_ids else set()
+    bp = conn.execute(
+        f"""SELECT COALESCE(SUM(end - start), 0) AS bp FROM part_occurrence
+            WHERE plasmid_id = ? AND part_id IN ({placeholders})""",
+        (plasmid_id, *part_ids)).fetchone()["bp"] if part_ids else 0
+    return ParentMatch(row["id"], row["name"], row["owner"], row["seq_length"],
+                       bool(row["circular"]), row["verified"], held, bp)
+
+
 def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
                  cfg: Config, require_types: set | None = None,
-                 require_family: str = "") -> SwapAnalysis | None:
+                 require_family: str = "",
+                 prefer_plasmid_id: int | None = None) -> SwapAnalysis | None:
     """Plan the shortest edit: one region out of a recipient, one piece in.
 
     ``resolved_modules`` is the plan's module list, in target order, each
@@ -197,14 +392,41 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
     candidates = rank_parents(conn, part_ids, cfg,
                               require_types=require_types,
                               require_family=require_family)
+
+    # The plasmid being built into is the obvious thing to edit. Preferring
+    # it keeps the plan coherent: proposing a swap out of some other plasmid
+    # while assembling into this one describes two different experiments.
+    if prefer_plasmid_id is not None:
+        preferred = _as_parent(conn, prefer_plasmid_id, part_ids)
+        # Catalogue identity is too brittle to decide what a plasmid already
+        # has. The same protein exists as several parts with slightly
+        # different boundaries, so PP072 holding "Voltron-2" does not make it
+        # hold the part id resolved for "LR-Voltron2". Ask the sequence.
+        if preferred is not None:
+            row = conn.execute("SELECT seq, circular FROM plasmid WHERE id = ?",
+                               (prefer_plasmid_id,)).fetchone()
+            if row is not None:
+                host = row["seq"].upper()
+                for module in wanted:
+                    covered = sequence_coverage(module.get("seq") or "", host)
+                    if covered >= VARIANT_COVERAGE:
+                        preferred.matched_part_ids.add(module["part_id"])
+                        preferred.matched_bp += len(module.get("seq") or "")
+        if preferred is not None and (
+                not require_types
+                or require_types <= {a["feature_type"] for a in conn.execute(
+                    "SELECT DISTINCT feature_type FROM annotation "
+                    "WHERE plasmid_id = ?", (prefer_plasmid_id,))}):
+            candidates = [preferred] + [c for c in candidates
+                                        if c.plasmid_id != prefer_plasmid_id]
     if not candidates:
         if require_types or require_family:
-            wanted = ", ".join(sorted(require_types)) or require_family
+            needed = ", ".join(sorted(require_types)) or require_family
             return SwapAnalysis(
                 ParentMatch(0, "", "", 0, False, ""), None, SwapRegion(0, 0),
                 None, None, None, [], [],
                 [f"no plasmid in the inventory has both the parts this design "
-                 f"needs and the architecture it needs ({wanted}), so there "
+                 f"needs and the architecture it needs ({needed}), so there "
                  f"is nothing to edit; this one has to be built from parts"],
                 feasible=False)
         return None
@@ -244,8 +466,10 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
                   if m["part_id"] in recipient.matched_part_ids), None)
 
     annots = _annotations(conn, recipient.plasmid_id)
-    left_occ = _occurrence(conn, recipient.plasmid_id, before["part_id"]) if before else None
-    right_occ = _occurrence(conn, recipient.plasmid_id, after["part_id"]) if after else None
+    left_occ = (_occurrence(conn, recipient.plasmid_id, before["part_id"],
+                            before.get("seq", "")) if before else None)
+    right_occ = (_occurrence(conn, recipient.plasmid_id, after["part_id"],
+                             after.get("seq", "")) if after else None)
 
     if left_occ is None and right_occ is None:
         notes.append("could not locate the flanking parts in the recipient")
@@ -298,12 +522,20 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
         remove = SwapRegion(start, start, 1, label="insertion point")
 
     # --- locate the piece to take from a donor ---------------------------
-    donors = rank_parents(conn, [new_module["part_id"]], cfg, limit=5)
-    donors = [d for d in donors if d.plasmid_id != recipient.plasmid_id]
+    # Donors are searched by sequence, not by catalogue identity. "GFP" and
+    # "EGFP" are separate parts differing by three bases, so asking only for
+    # the exact part that was resolved would hide every plasmid that holds
+    # the same protein under the other name.
+    donor_parts = variant_part_ids(conn, new_module.get("seq") or "",
+                                   new_module["part_id"])
+    donors = find_donors(conn, donor_parts, require_family,
+                         exclude_id=recipient.plasmid_id)
     donor = donors[0] if donors else None
+    donor_options = [d.to_dict() for d in donors[:6]]
     insert = None
     if donor:
-        occ = _occurrence(conn, donor.plasmid_id, new_module["part_id"])
+        occ = _occurrence(conn, donor.plasmid_id, new_module["part_id"],
+                          new_module.get("seq", ""))
         if occ:
             insert = SwapRegion(occ["start"], occ["end"], occ["strand"],
                                 label=new_module["part_name"])
@@ -316,12 +548,17 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
     anchor_right = ({"name": after["part_name"], "part_id": after["part_id"],
                      **right_occ} if (after and right_occ) else None)
 
-    return SwapAnalysis(
+    analysis = SwapAnalysis(
         recipient=recipient, donor=donor, remove=remove, insert=insert,
         left_anchor=anchor_left, right_anchor=anchor_right,
         kept=[m["part_name"] for m in kept],
         missing=[m["part_name"] for m in missing],
         notes=notes, feasible=insert is not None)
+    # Which donor to use is a lab preference as much as a computation: a
+    # dozen plasmids may carry the same protein. The alternatives travel
+    # with the plan so the choice stays visible.
+    analysis.donor_options = donor_options
+    return analysis
 
 
 # --------------------------------------------------------------------------
@@ -367,6 +604,7 @@ def build_scheme(conn: sqlite3.Connection, analysis: SwapAnalysis) -> dict:
         scheme["recipient"]["action"] = "cut out and discard this region"
     if scheme["donor"]:
         scheme["donor"]["action"] = "take this region"
+    scheme["donor_options"] = list(getattr(analysis, "donor_options", []))
 
     # The product of a swap is the recipient with one region exchanged, which
     # is a different molecule from the part-by-part assembly the generic

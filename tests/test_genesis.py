@@ -2211,6 +2211,10 @@ class TestRecipientArchitecture(unittest.TestCase):
                     circular, verified, available_template)
                VALUES (?,'t',?,?,?,1,'sequence_verified',1)""",
             (name, body, len(body), name)).lastrowid
+        # Every recipient needs an origin and a resistance marker, or it is
+        # a fragment rather than something that can be grown.
+        annotations = list(annotations) + [("origin", "ori"),
+                                           ("resistance", "AmpR")]
         for ftype, label in annotations:
             self.conn.execute(
                 """INSERT INTO annotation(plasmid_id, feature_type, name,

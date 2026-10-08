@@ -805,6 +805,32 @@ function circularMap(length, items, opts) {
       }, item.f.name || item.f.type));
     });
 
+    /* The region being cut from a recipient, or taken from a donor. */
+    var hl = opts.highlight;
+    if (hl && hl.length) {
+      var kind = opts.highlightKind === 'take' ? 'take' : 'cut';
+      var hs = (hl.start % span) / span;
+      var he = (hl.end % span) / span;
+      if (he <= hs) he += 1;
+      node.appendChild(svg('path', {
+        d: arcPath(cx, cy, radius + 9, hs, he), fill: 'none',
+        class: 'circ-highlight hl-' + kind, 'stroke-width': 3
+      }));
+      [hs, he % 1].forEach(function (edge) {
+        var a = polar(cx, cy, radius + 3, edge), b = polar(cx, cy, radius + 15, edge);
+        node.appendChild(svg('line', {
+          x1: a[0].toFixed(1), y1: a[1].toFixed(1),
+          x2: b[0].toFixed(1), y2: b[1].toFixed(1),
+          class: 'circ-highlight hl-' + kind
+        }));
+      });
+      node.appendChild(svg('text', {
+        x: cx, y: cy + 44, 'text-anchor': 'middle',
+        class: 'circ-hl-label hl-' + kind
+      }, (kind === 'cut' ? 'cut out ' : 'take ') + bp(hl.length) +
+         (hl.label ? ' (' + hl.label + ')' : '')));
+    }
+
     (opts.markers || []).forEach(function (m) {
       if (typeof m.start !== 'number') return;
       var f = (m.start % span) / span;
@@ -2174,6 +2200,82 @@ function suggestedName(construct) {
     }, 'use'));
 }
 
+/* --------------------------------------------------------------------------
+ * Cloning scheme: the two parent plasmids, drawn as plasmids.
+ *
+ * A swap is an edit to a molecule that already exists, so the thing worth
+ * looking at is the recipient with the region to cut marked on it, and the
+ * donor with the region to take. Both are circles for the same reason the
+ * product is.
+ * ------------------------------------------------------------------------ */
+function parentCard(role, parent, kind) {
+  if (!parent) return null;
+  var head = h('div', { class: 'parent-head' },
+    h('span', { class: 'parent-role ' + role }, role.toUpperCase()),
+    h('strong', null, parent.name),
+    h('span', { class: 'muted small' },
+      bp(parent.length) + (parent.owner ? ' · ' + parent.owner : '')));
+  var card = h('div', { class: 'parent-card' }, head);
+  card.appendChild(circularMap(parent.length, (parent.features || []).map(
+    function (f) {
+      return { type: f.feature_type, name: f.name, start: f.start,
+               end: f.end, strand: f.strand };
+    }), {
+      label: parent.name, highlight: parent.highlight, highlightKind: kind
+    }));
+  return card;
+}
+
+function schemeCard(plan) {
+  var scheme = plan.scheme || {};
+  if (!scheme.recipient) return null;
+
+  var card = h('div', { class: 'card scheme-card' },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'Cloning scheme'),
+      h('span', { class: 'muted small' },
+        'two parents: cut a region out of the recipient, put a region from ' +
+        'the donor in its place')));
+
+  var grid = h('div', { class: 'parent-grid' });
+  var rec = parentCard('recipient', scheme.recipient, 'cut');
+  var don = parentCard('donor', scheme.donor, 'take');
+  if (rec) grid.appendChild(rec);
+  if (don) grid.appendChild(don);
+  card.appendChild(grid);
+
+  var anchors = [];
+  if (scheme.left_anchor) {
+    anchors.push(scheme.left_anchor.name + ' (ends ' +
+                 bp(scheme.left_anchor.end) + ')');
+  }
+  if (scheme.right_anchor) {
+    anchors.push(scheme.right_anchor.name + ' (starts ' +
+                 bp(scheme.right_anchor.start) + ')');
+  }
+  if (anchors.length) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'The cut is bounded by ' + anchors.join(' and ') +
+      (anchors.length === 1 ? ', which is kept' : ', which are kept') +
+      ' and is what the primers anneal to or the enzymes cut between.'));
+  }
+
+  var options = scheme.donor_options || [];
+  if (options.length > 1) {
+    var list = h('p', { class: 'muted small' },
+      'Other plasmids carrying this part: ');
+    options.slice(1, 6).forEach(function (o, i) {
+      if (i) list.appendChild(document.createTextNode(', '));
+      list.appendChild(h('span', { class: 'donor-alt' },
+        o.name + ' (' + bp(o.length) + ')'));
+    });
+    list.appendChild(document.createTextNode(
+      '. Which to use is a lab preference; name one as the backbone to pin it.'));
+    card.appendChild(list);
+  }
+  return card;
+}
+
 function renderPlan() {
   var out = $('plan-out');
   clear(out);
@@ -2217,6 +2319,9 @@ function renderPlan() {
     ], plan.fragments));
   }
   out.appendChild(summary);
+
+  var scheme = schemeCard(plan);
+  if (scheme) out.appendChild(scheme);
 
   /* --- the designed molecule itself -------------------------------- */
   out.appendChild(renderConstruct(c));

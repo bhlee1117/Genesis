@@ -608,7 +608,9 @@ def _arc_path(doc, cx, cy, radius, start_f, end_f, width, rgb):
 
 def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
                  features: list, radius: float = 108,
-                 codon_marks: list | None = None):
+                 codon_marks: list | None = None,
+                 highlight: dict | None = None,
+                 highlight_kind: str = "cut"):
     """Draw a plasmid the way a plasmid is drawn: as a circle.
 
     A linear track is fine for comparing two parents side by side, but it
@@ -672,6 +674,26 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
                  width=0.4)
         doc.text_at(name, lx + (3 if right else -3 - w), ly - 2, "F1", 6.6,
                     rgb=_feature_rgb(f["feature_type"]))
+
+    # The region being cut out of a recipient, or taken from a donor, drawn
+    # as a ring outside the features with its own boundary markers.
+    if highlight and highlight.get("length"):
+        rgb = CUT_RED if highlight_kind == "cut" else TAKE_GREEN
+        hs = (highlight["start"] % length) / length
+        he = (highlight["end"] % length) / length
+        if he <= hs:
+            he += 1.0
+        _arc_path(doc, cx, cy, radius + 7, hs, he, 2.4, rgb)
+        for edge in (hs, he % 1.0):
+            a = _polar(cx, cy, radius + 2, edge)
+            b = _polar(cx, cy, radius + 12, edge)
+            doc.line(a[0], a[1], b[0], b[1], rgb=rgb, width=1.4)
+        caption = (f"cut out {highlight['length']:,} bp"
+                   if highlight_kind == "cut"
+                   else f"take {highlight['length']:,} bp")
+        if highlight.get("label"):
+            caption += f" ({highlight['label'][:28]})"
+        doc.text_at(caption, cx, cy - 24, "F2", 7.5, rgb=rgb, centre=True)
 
     for mark in codon_marks or []:
         mf = (mark["start"] % length) / length
