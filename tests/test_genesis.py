@@ -285,6 +285,117 @@ class TestVocab(unittest.TestCase):
         self.assertEqual(classify_label("some band", "rep_origin"), "origin")
         self.assertEqual(classify_label("mystery", ""), "unknown")
 
+    def test_primer_is_never_the_thing_it_anneals_to(self):
+        # SnapGene ships these stock primer annotations.  Each is named after
+        # its target, and each used to be catalogued as that target: a 20 bp
+        # "resistance gene", a 20 bp "polyA signal".
+        for label in ("Amp-R", "SV40pA-R", "wpre-rev", "M13 fwd",
+                      "F1 origin, reverse primer", "pAAV-DIO-Screen-R",
+                      "SV40 polyA terminator, reverse primer",
+                      "Chimeric intron in CAG promoter, forward primer"):
+            self.assertEqual(classify_label(label, "primer_bind"),
+                             "primer_binding_site", label)
+
+    def test_label_still_refines_a_cds(self):
+        # The override is narrow: a CDS labelled AmpR is still resistance.
+        self.assertEqual(classify_label("AmpR", "CDS"), "resistance")
+        self.assertEqual(classify_label("P2A", "CDS"), "p2A")
+        self.assertEqual(classify_label("ER2", "CDS"), "trafficking_motif")
+
+    def test_enhancer_key_outranks_a_promoter_label(self):
+        # "CMV enhancer" matched the promoter rule on the word CMV, which
+        # made 606 enhancers look like promoters to the recipient tiers.
+        self.assertEqual(classify_label("CMV enhancer", "enhancer"), "enhancer")
+        self.assertEqual(classify_label("CAG\\enhancer", "enhancer"), "enhancer")
+        # but SnapGene files the WPRE under enhancer, so the label still wins
+        self.assertEqual(classify_label("WPRE", "enhancer"), "WPRE")
+
+    def test_fas_site_is_a_lox_site_but_the_fas_gene_is_not(self):
+        for label in ("FAS SITE", "FAS SITE(1)", "loxFAS", "FAS-site"):
+            self.assertEqual(classify_label(label, "misc_feature"),
+                             "lox_site", label)
+        # Fas is also a gene; a bare FAS must not make one a lox site.
+        self.assertNotEqual(
+            classify_label("HT75 LZF70 Fsyn FAS C gene", "gene"), "lox_site")
+
+    def test_cre_lox_family_label_survives(self):
+        for label in ("DIO cassette", "FLEX switch", "double-floxed"):
+            self.assertEqual(classify_label(label, "misc_feature"),
+                             "Cre-lox", label)
+
+    def test_unlabelled_cds_borrows_the_name_drawn_over_it(self):
+        from genesis.importer import name_unlabelled
+        # The real shape of the ASAP7y file: the CDS has the type and no
+        # label, the misc_feature has the name and no type.
+        anns = [
+            {"feature_type": "unknown", "name": "ASAP7y",
+             "original_label": "ASAP7y", "original_key": "misc_feature",
+             "start": 2443, "end": 3724, "strand": 1},
+            {"feature_type": "CDS", "name": "CDS", "original_label": "",
+             "original_key": "CDS", "start": 2443, "end": 3724, "strand": -1},
+        ]
+        self.assertEqual(name_unlabelled(anns), 1)
+        self.assertEqual(anns[1]["name"], "ASAP7y")
+
+    def test_naming_tolerates_a_trailing_linker(self):
+        from genesis.importer import name_unlabelled
+        # The Kv2.1 CDS runs 27 bp past its label, into a GSS linker.
+        anns = [
+            {"feature_type": "unknown", "name": "kv2.1",
+             "original_label": "kv2.1", "original_key": "misc_feature",
+             "start": 2221, "end": 2416, "strand": -1},
+            {"feature_type": "CDS", "name": "CDS", "original_label": "",
+             "original_key": "CDS", "start": 2221, "end": 2443, "strand": -1},
+        ]
+        self.assertEqual(name_unlabelled(anns), 1)
+        self.assertEqual(anns[1]["name"], "kv2.1")
+
+    def test_naming_refuses_a_partial_overlap(self):
+        from genesis.importer import name_unlabelled
+        # A 10 bp chromophore marker must not rename the 700 bp CDS over it.
+        anns = [
+            {"feature_type": "unknown", "name": "chromophore",
+             "original_label": "chromophore", "original_key": "misc_feature",
+             "start": 2782, "end": 2791, "strand": -1},
+            {"feature_type": "CDS", "name": "CDS", "original_label": "",
+             "original_key": "CDS", "start": 2551, "end": 3280, "strand": -1},
+        ]
+        self.assertEqual(name_unlabelled(anns), 0)
+        self.assertEqual(anns[1]["name"], "CDS")
+
+    def test_self_describing_types_are_left_alone(self):
+        from genesis.importer import name_unlabelled
+        # A WPRE called "WPRE" is already named; the type is the name.
+        anns = [
+            {"feature_type": "unknown", "name": "SP43",
+             "original_label": "SP43", "original_key": "misc_feature",
+             "start": 100, "end": 400, "strand": 1},
+            {"feature_type": "WPRE", "name": "WPRE", "original_label": "",
+             "original_key": "misc_feature",
+             "start": 100, "end": 400, "strand": 1},
+        ]
+        self.assertEqual(name_unlabelled(anns), 0)
+        self.assertEqual(anns[1]["name"], "WPRE")
+
+    def test_a_named_feature_is_not_renamed(self):
+        from genesis.importer import name_unlabelled
+        anns = [
+            {"feature_type": "unknown", "name": "some note",
+             "original_label": "some note", "original_key": "misc_feature",
+             "start": 0, "end": 300, "strand": 1},
+            {"feature_type": "CDS", "name": "Citrine",
+             "original_label": "Citrine", "original_key": "CDS",
+             "start": 0, "end": 300, "strand": 1},
+        ]
+        self.assertEqual(name_unlabelled(anns), 0)
+        self.assertEqual(anns[1]["name"], "Citrine")
+
+    def test_part_types_use_the_current_vocabulary(self):
+        from genesis.importer import PART_TYPES
+        from genesis.vocab import FEATURE_TYPES
+        self.assertTrue(PART_TYPES <= set(FEATURE_TYPES),
+                        PART_TYPES - set(FEATURE_TYPES))
+
     def test_fuzzy_search_matches_brute_force(self):
         r = random.Random(21)
         for _ in range(60):

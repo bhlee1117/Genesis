@@ -188,13 +188,72 @@ def annotations_for(rec: Record, run_motif_scan: bool = True) -> list[dict]:
                 "confidence": 0.9 if m["level"] == "protein" else 0.85,
                 "qualifiers": {"note": m.get("note", "")},
             })
+    name_unlabelled(out)
     return out
+
+
+def _is_nameless(a: dict) -> bool:
+    """True when an annotation's name carries no information."""
+    name = (a.get("name") or "").strip()
+    return (not name
+            or name == a.get("feature_type")
+            or name.lower() == (a.get("original_key") or "").lower())
+
+
+#: Types that still need a name of their own.  A WPRE called "WPRE" or a
+#: loxP called "lox_site" is already as named as it needs to be - the type
+#: identifies the element.  A CDS called "CDS" identifies nothing.
+NAMEABLE_TYPES = {"CDS", "promoter", "enhancer", "trafficking_motif",
+                  "linker", "tag", "resistance"}
+
+
+def name_unlabelled(annotations: list[dict]) -> int:
+    """Give an unlabelled feature the name of a feature drawn over it.
+
+    Files routinely carry the type on one feature and the name on another:
+    a CDS with no ``/label`` sitting underneath a misc_feature called
+    "ASAP7y".  Catalogued as it stands, that part ends up named "CDS" and
+    nobody can ever find it by name again.
+
+    Only free-text features donate a name - a feature the rules already
+    recognised is describing itself, not its neighbour - and only a nearly
+    identical span counts, so a short motif inside a gene cannot rename it.
+    """
+    donors = [a for a in annotations
+              if a["feature_type"] == "unknown"
+              and (a.get("original_label") or "").strip()
+              and a["end"] > a["start"]]
+    if not donors:
+        return 0
+
+    renamed = 0
+    for a in annotations:
+        if a["feature_type"] not in NAMEABLE_TYPES or not _is_nameless(a):
+            continue
+        span = a["end"] - a["start"]
+        if span <= 0:
+            continue
+        best, best_score = None, 0.0
+        for d in donors:
+            overlap = min(a["end"], d["end"]) - max(a["start"], d["start"])
+            if overlap <= 0:
+                continue
+            # Reciprocal: neither feature may be much bigger than the other.
+            score = min(overlap / span, overlap / (d["end"] - d["start"]))
+            if score > best_score:
+                best, best_score = d, score
+        # A coding feature often runs a little past the label drawn over it
+        # - a trailing linker, a stop codon - so the match need not be exact.
+        if best is not None and best_score >= 0.85:
+            a["name"] = best["original_label"].strip()
+            renamed += 1
+    return renamed
 
 
 #: Feature types worth promoting into the reusable-part catalogue.
 PART_TYPES = {"promoter", "CDS", "trafficking_motif", "linker", "p2A", "IRES",
               "lox_site", "AAV_ITR", "polyA", "WPRE", "tag", "enhancer",
-              "resistance", "origin", "DIO"}
+              "resistance", "origin", "Cre-lox"}
 
 TRANSLATED_TYPES = {"CDS", "trafficking_motif", "linker", "p2A", "tag"}
 
@@ -332,7 +391,7 @@ def infer_topology(rec: Record, annotations: list[dict]) -> tuple[bool, bool]:
 
 def import_tree(conn: sqlite3.Connection, cfg: Config, root: str | Path | None = None,
                 limit: int | None = None, progress=None,
-                motif_scan: bool = True) -> ImportStats:
+                motif_scan: bool = True, force: bool = False) -> ImportStats:
     root = Path(root or cfg.dna_root)
     stats = ImportStats()
     if not root.exists():
@@ -367,7 +426,7 @@ def import_tree(conn: sqlite3.Connection, cfg: Config, root: str | Path | None =
         existing = conn.execute(
             "SELECT id, file_checksum, mtime FROM source_file WHERE rel_path = ?",
             (rel_str,)).fetchone()
-        if existing and existing["mtime"] == st.st_mtime:
+        if existing and existing["mtime"] == st.st_mtime and not force:
             continue  # unchanged since last scan
 
         owner = infer_owner(rel, cfg)
@@ -468,3 +527,141 @@ def import_tree(conn: sqlite3.Connection, cfg: Config, root: str | Path | None =
 
     conn.commit()
     return stats
+
+
+# --------------------------------------------------------------------------
+# Re-labelling without re-reading the share
+# --------------------------------------------------------------------------
+
+@dataclass
+class _StoredSeq:
+    """Stands in for a parsed Record when the sequence comes from the database."""
+    seq: str
+    circular: bool
+
+
+def reclassify(conn: sqlite3.Connection, progress=None) -> dict:
+    """Re-derive annotation types from the labels already in the database.
+
+    A scan is keyed on file timestamps, so when the *rules* change rather
+    than the files, nothing is re-read and the old verdicts stand.  Every
+    annotation keeps its original label and GenBank key for exactly this
+    case, which means a fresh classification needs nothing from the share:
+    this runs in seconds, and over a slow mount that is the difference
+    between a coffee break and a morning.
+    """
+    from .vocab import canonical_feature_type
+
+    def orphan_ids() -> set[int]:
+        return {r["id"] for r in conn.execute(
+            "SELECT id FROM part WHERE id NOT IN "
+            "(SELECT part_id FROM part_occurrence)")}
+
+    orphans_before = orphan_ids()
+
+    rows = conn.execute(
+        """SELECT id, plasmid_id, feature_type, original_label, original_key,
+                  name, start, end, strand, confidence, evidence
+           FROM annotation""").fetchall()
+
+    changes = []
+    for r in rows:
+        if r["evidence"] == "file":
+            new = classify_label(r["original_label"] or "",
+                                 r["original_key"] or "")
+        else:
+            # Motif hits are typed by the library, but a renamed feature type
+            # still has to follow.
+            new = canonical_feature_type(r["feature_type"])
+        if new != r["feature_type"]:
+            changes.append((r, new))
+
+    moved: dict[str, int] = {}
+    for r, new in changes:
+        moved[f"{r['feature_type']} -> {new}"] = \
+            moved.get(f"{r['feature_type']} -> {new}", 0) + 1
+        conn.execute("UPDATE annotation SET feature_type=? WHERE id=?",
+                     (new, r["id"]))
+
+    # Retire the parts the old verdicts produced.  Only occurrences sitting
+    # at this annotation's coordinates and carrying its old type are touched,
+    # so a part another annotation also vouches for keeps its occurrence.
+    dropped = 0
+    for r, _new in changes:
+        cur = conn.execute(
+            """DELETE FROM part_occurrence
+                WHERE plasmid_id=? AND start=? AND end=? AND strand=?
+                  AND part_id IN (SELECT id FROM part WHERE feature_type=?)""",
+            (r["plasmid_id"], r["start"], r["end"], r["strand"],
+             r["feature_type"]))
+        dropped += cur.rowcount
+
+    created = 0
+    seqs: dict[int, _StoredSeq] = {}
+    for i, (r, new) in enumerate(changes):
+        if progress and i and i % 500 == 0:
+            progress(i, len(changes))
+        if new not in PART_TYPES:
+            continue
+        rec = seqs.get(r["plasmid_id"])
+        if rec is None:
+            p = conn.execute("SELECT seq, circular FROM plasmid WHERE id=?",
+                             (r["plasmid_id"],)).fetchone()
+            if not p or not p["seq"]:
+                continue
+            rec = seqs[r["plasmid_id"]] = _StoredSeq(p["seq"], bool(p["circular"]))
+        created += extract_parts(conn, r["plasmid_id"], rec, [{
+            "feature_type": new, "name": r["name"] or new,
+            "start": r["start"], "end": r["end"], "strand": r["strand"],
+            "confidence": r["confidence"],
+        }])
+
+    # Second pass: repair names.  A part called "CDS" cannot be searched
+    # for, and the name it should carry is usually sitting on a free-text
+    # feature over the same span.
+    named = 0
+    renamed_parts = 0
+    plasmids = [r["id"] for r in conn.execute(
+        """SELECT DISTINCT plasmid_id AS id FROM annotation a
+            WHERE a.name = '' OR a.name = a.feature_type
+               OR lower(a.name) = lower(a.original_key)""")]
+    for pid in plasmids:
+        anns = [dict(r) for r in conn.execute(
+            """SELECT id, feature_type, name, original_label, original_key,
+                      start, end, strand FROM annotation WHERE plasmid_id=?""",
+            (pid,))]
+        before = {a["id"]: a["name"] for a in anns}
+        if not name_unlabelled(anns):
+            continue
+        for a in anns:
+            if a["name"] == before[a["id"]]:
+                continue
+            conn.execute("UPDATE annotation SET name=? WHERE id=?",
+                         (a["name"], a["id"]))
+            named += 1
+            # Carry the name onto the part, but only if the part has no
+            # real name of its own to lose.
+            renamed_parts += conn.execute(
+                """UPDATE part SET name=?
+                    WHERE name = feature_type
+                      AND id IN (SELECT part_id FROM part_occurrence
+                                  WHERE plasmid_id=? AND start=? AND end=?)""",
+                (a["name"], pid, a["start"], a["end"])).rowcount
+
+    # Parts that were already unreferenced before this ran are somebody
+    # else's business; only the ones this pass stranded are removed.
+    stranded = orphan_ids() - orphans_before
+    for pid in stranded:
+        conn.execute("DELETE FROM part WHERE id=?", (pid,))
+
+    conn.commit()
+    return {
+        "annotations": len(rows),
+        "relabelled": len(changes),
+        "moved": dict(sorted(moved.items(), key=lambda kv: -kv[1])),
+        "occurrences_dropped": dropped,
+        "parts_created": created,
+        "parts_removed": len(stranded),
+        "annotations_named": named,
+        "parts_named": renamed_parts,
+    }

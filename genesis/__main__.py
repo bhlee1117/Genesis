@@ -2,6 +2,8 @@
 
     python3 -m genesis init                  write a config file
     python3 -m genesis scan [--limit N]      index the shared DNA folder
+    python3 -m genesis scan --force          re-read every file, not just changed ones
+    python3 -m genesis reclassify             re-label what is already indexed
     python3 -m genesis stats                 what is in the inventory
     python3 -m genesis find <term>           search plasmids
     python3 -m genesis parts [--type CDS]    browse reusable parts
@@ -23,7 +25,7 @@ from .db import connect
 from .design import design as run_design, save_design
 from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
                      to_genbank)
-from .importer import import_tree
+from .importer import import_tree, reclassify
 
 CONFIG_PATH = Path("~/.genesis/config.json").expanduser()
 
@@ -53,8 +55,11 @@ def cmd_scan(args, cfg: Config):
               file=sys.stderr)
 
     print(f"scanning {cfg.dna_root}", file=sys.stderr)
+    if args.force:
+        print("  --force: re-reading every file, not just changed ones",
+              file=sys.stderr)
     stats = import_tree(conn, cfg, limit=args.limit, progress=progress,
-                        motif_scan=not args.no_motifs)
+                        motif_scan=not args.no_motifs, force=args.force)
     d = stats.as_dict()
     print(json.dumps(d, indent=2))
     if d["errors"]:
@@ -62,6 +67,17 @@ def cmd_scan(args, cfg: Config):
               file=sys.stderr)
         for e in d["errors"][:5]:
             print(f"  {e}", file=sys.stderr)
+
+
+def cmd_reclassify(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+
+    def progress(done, total):
+        print(f"  {done}/{total} relabelled annotations applied", file=sys.stderr)
+
+    print("re-deriving feature types from stored labels (the share is not read)",
+          file=sys.stderr)
+    print(json.dumps(reclassify(conn, progress=progress), indent=2))
 
 
 def cmd_stats(args, cfg: Config):
@@ -296,7 +312,15 @@ def main(argv=None):
     s.add_argument("--limit", type=int, help="stop after N files")
     s.add_argument("--no-motifs", action="store_true",
                    help="skip de-novo motif annotation (faster)")
+    s.add_argument("--force", action="store_true",
+                   help="re-read every file, including ones whose timestamp "
+                        "has not changed (use after a classifier change)")
     s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser(
+        "reclassify",
+        help="re-apply the labelling rules to the inventory already indexed")
+    s.set_defaults(fn=cmd_reclassify)
 
     s = sub.add_parser("stats", help="summarise the inventory")
     s.set_defaults(fn=cmd_stats)

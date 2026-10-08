@@ -72,9 +72,13 @@ def min_part_length(feature_type: str) -> int:
 
 _LABEL_RULES: list[tuple[str, str]] = [
     (r"\bITR\b|inverted terminal repeat", "AAV_ITR"),
-    (r"\blox(P|2272|N|511|66|71)?\b|\bFRT\b|\brox\b", "lox_site"),
-    (r"\bDIO\b|\bDO\b|double[- ]?floxed|\bFLEX\b|\bCreOn\b|\bCreOff\b"
-     r"|\bFAS\b", "Cre-lox"),
+    # loxFAS is a lox variant, and this lab writes it "FAS SITE".  It belongs
+    # with the other sites, because that is what the recombination logic
+    # looks for.  Bare "FAS" is not enough: Fas is also a gene name.
+    (r"\blox(P|2272|N|511|66|71|FAS)?\b|\bFRT\b|\brox\b"
+     r"|\bFAS[- _]?site\b", "lox_site"),
+    (r"\bDIO\b|\bDO\b|double[- ]?floxed|\bFLEX\b|\bCreOn\b|\bCreOff\b",
+     "Cre-lox"),
     (r"\bWPRE\b|woodchuck", "WPRE"),
     (r"poly[- ]?A|polyadenylation|\bbGH\b|\bSV40 ?pA\b", "polyA"),
     (r"\bIRES\b", "IRES"),
@@ -110,13 +114,46 @@ _KEY_RULES = {
 }
 
 
+#: Keys whose own meaning beats the label rules.
+#:
+#: Normally the label is the better evidence: a feature keyed ``CDS`` and
+#: labelled "AmpR" really is a resistance gene, and that refinement is the
+#: point of the label rules.  These two keys are the exceptions.
+#:
+#: ``None`` means the key wins outright; a set means it wins only against
+#: those verdicts.
+_KEY_OVERRIDES: dict[str, set[str] | None] = {
+    # A primer is named after what it anneals to, never after itself, so
+    # SnapGene's stock "Amp-R" and "SV40pA-R" are 20 bp primer sites and not
+    # a resistance gene or a polyA signal.  Nothing a primer is called can
+    # make it the element it sits next to.
+    "primer_bind": None,
+    # SnapGene files the WPRE under enhancer, so the label still decides
+    # there.  But a depositor who keyed a feature as an enhancer has already
+    # distinguished it from a promoter, and "CMV enhancer" should not be
+    # overruled into a promoter just because it says CMV.
+    "enhancer": {"promoter"},
+}
+
+
 def classify_label(label: str, key: str = "") -> str:
     """Map a free-text label plus GenBank key onto the controlled vocabulary."""
     text = f"{label} {key}".strip()
+    k = (key or "").lower()
+
+    verdict = ""
     for pattern, ftype in _LABEL_RULES:
         if re.search(pattern, text, re.IGNORECASE):
-            return ftype
-    k = (key or "").lower()
+            verdict = ftype
+            break
+
+    if k in _KEY_OVERRIDES and k in _KEY_RULES:
+        beaten = _KEY_OVERRIDES[k]
+        if not verdict or beaten is None or verdict in beaten:
+            return _KEY_RULES[k]
+
+    if verdict:
+        return verdict
     if k in _KEY_RULES:
         mapped = _KEY_RULES[k]
         # repeat_region is only an ITR if the label says so

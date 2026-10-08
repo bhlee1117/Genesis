@@ -493,7 +493,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           215 tests, no lab share required
+tests/           226 tests, no lab share required
 ```
 
 ## Giving it to a labmate
@@ -519,6 +519,31 @@ skips the scan entirely, and everyone sees the same inventory. They do not
 need the DNA share mounted unless they want to re-scan it themselves.
 
 To refresh later, re-copy the database, or run `python3 -m genesis scan`.
+
+### Keeping the inventory current
+
+```bash
+python3 -m genesis scan          # pick up new and changed files
+python3 -m genesis reclassify    # re-apply the labelling rules
+```
+
+`scan` is incremental: it skips any file whose timestamp has not moved, so a
+run after adding a few plasmids takes seconds rather than re-reading all
+22,000. `--limit N` stops early, and `--no-motifs` skips de-novo annotation,
+which is the slow half.
+
+`reclassify` is the one to use when the *rules* changed rather than the
+files. A scan is keyed on timestamps, so a plasmid indexed under an older
+vocabulary keeps its old verdict forever — nothing about the file has
+changed. Every annotation stores its original label and GenBank key for
+exactly this reason, so re-deriving needs nothing from the share: it runs in
+seconds, and over a slow mount that is the difference between a coffee break
+and a morning. It also repairs names: a CDS with no label of its own takes
+the name from a free-text feature drawn over the same span.
+
+`scan --force` re-reads every file regardless of timestamp. It is the blunt
+version of `reclassify` and takes half an hour or more over the share; reach
+for it only when you suspect the stored records themselves are wrong.
 
 ### If you would rather run one shared server
 
