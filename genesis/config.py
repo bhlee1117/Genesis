@@ -64,6 +64,9 @@ class Config:
     #: they need, which is the main thing it changes about primer design.
     preferred_assembly_kit: str = "NEBuilder HiFi"
     #: Backbone to reach for when an AAV is requested and none is named.
+    #: Vector family assumed when a specification does not mention one.
+    #: Set to "" to infer it from the backbone instead.
+    default_vector: str = "AAV"
     default_aav_backbone: str = "PP072"
     default_lenti_backbone: str = ""
     include_transformation_steps: bool = True

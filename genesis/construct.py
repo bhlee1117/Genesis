@@ -47,7 +47,9 @@ class ConstructSpec:
     circular: bool = True
     notes: str = ""
     #: "AAV", "lentiviral", "plasmid", or "" to infer from the backbone.
-    vector: str = ""
+    #: None means the specification did not mention one, which lets the
+    #: configured default apply - distinct from asking for "auto".
+    vector: str | None = None
     #: Pin the two parents of a swap. Left unset, Genesis recommends.
     recipient_plasmid_id: int | None = None
     donor_plasmid_id: int | None = None
@@ -79,7 +81,8 @@ class ConstructSpec:
             owner=data.get("owner", ""),
             circular=data.get("circular", True),
             notes=data.get("notes", ""),
-            vector=_normalise_vector(data.get("vector", "")),
+            vector=(_normalise_vector(data["vector"])
+                    if "vector" in data else None),
             recipient_plasmid_id=data.get("recipient_plasmid_id"),
             donor_plasmid_id=data.get("donor_plasmid_id"),
         )

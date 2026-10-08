@@ -20,6 +20,9 @@ var FEATURE_TYPES = [
 ];
 
 /* Mid-saturation hues, legible on both light and dark backgrounds. */
+/* The lab builds AAVs by default; Auto remains one click away. */
+var DEFAULT_VECTOR = 'AAV';
+
 var TYPE_COLORS = {
   backbone: '#8a8f98', promoter: '#2f7f4f', enhancer: '#4f9e6a',
   CDS: '#2f6fb0', trafficking_motif: '#7a5fb0', linker: '#9aa0a8',
@@ -1985,12 +1988,16 @@ function clearSpec() {
   $('spec-name').value = 'untitled';
   $('spec-backbone').value = '';
   $('spec-owner').value = '';
-  $('spec-vector').value = '';
+  $('spec-vector').value = DEFAULT_VECTOR;
   $('spec-circular').checked = true;
   $('spec-yaml').value = '';
 
   // A fresh row: no name, and no `part_id`, so nothing stays pinned.
   state.modules = [newModule('promoter')];
+  // Nor do the chosen parents survive: a cleared specification has no
+  // recipient or donor to be pinned to.
+  pinnedParents.recipient = null;
+  pinnedParents.donor = null;
   state.plan = null;
   state.spec = null;
   state.routeId = null;

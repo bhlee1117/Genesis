@@ -531,7 +531,7 @@ class TestEndToEnd(unittest.TestCase):
         # swap strategies appear as well whenever a parent pair exists.
         self.assertTrue({"hifi", "restriction"} <= strategies, strategies)
         self.assertLessEqual(strategies - {"hifi", "restriction"},
-                             {"swap_hifi", "swap_restriction"})
+                             {"swap_hifi", "swap_restriction", "swap_hybrid"})
 
         # Every step must carry a real operation code (the Stage 6 requirement).
         from genesis.operations import OPERATIONS
@@ -2685,3 +2685,52 @@ class TestDpnINecessity(unittest.TestCase):
                                 ("CmR", "CmR"), ("aacC1", "GentR")):
             pid = self._plasmid("p" + label, label)
             self.assertEqual(resistance_marker(self.conn, pid), expected, label)
+
+
+# --------------------------------------------------------------------------
+class TestDefaultVector(unittest.TestCase):
+    """A specification that never mentions a vector takes the lab default."""
+
+    def test_an_unmentioned_vector_is_none_not_empty(self):
+        spec = ConstructSpec.from_dict(
+            {"name": "x", "modules": [{"type": "CDS", "name": "g"}]})
+        self.assertIsNone(spec.vector,
+                          "not mentioning a vector is different from asking "
+                          "for auto")
+
+    def test_asking_for_auto_still_infers(self):
+        for value in ("auto", ""):
+            spec = ConstructSpec.from_dict({"name": "x", "vector": value})
+            self.assertEqual(spec.vector, "")
+
+    def test_the_configured_default_is_applied(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        self.assertEqual(cfg.default_vector, "AAV")
+        seq = orf(150, 1700)
+        pid = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','g',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        pl = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES ('pD','t',?,?,'dv',1,'unverified')""",
+            (seq + rand_seq(2000, 1701), len(seq) + 2000)).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,0,?,1)""", (pid, pl, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec.from_dict(
+            {"name": "x", "modules": [{"type": "CDS", "name": "g"}]}), cfg)
+        self.assertEqual(plan["vector"]["requested"], "AAV")
+
+    def test_the_default_can_be_turned_off(self):
+        cfg = Config()
+        cfg.default_vector = ""
+        spec = ConstructSpec.from_dict(
+            {"name": "x", "modules": [{"type": "CDS", "name": "g"}]})
+        self.assertIsNone(spec.vector)
+        conn = connect(":memory:")
+        plan = design(conn, spec, cfg)
+        self.assertIsNone(plan["vector"]["requested"])

@@ -214,6 +214,11 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         construct = assemble(resolved, "", circular=spec.circular)
     construct.warnings.extend(dio_notes)
 
+    # A specification that never mentioned a vector takes the configured
+    # default; one that explicitly asked for auto keeps inferring.
+    if spec.vector is None:
+        spec.vector = cfg.default_vector
+
     # --- vector family ---------------------------------------------------
     # Either the family was asked for, or it is inferred. Either way the
     # finished molecule is checked against what that family actually needs,

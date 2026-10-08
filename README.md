@@ -188,8 +188,11 @@ plasmids, assembles the intended molecule, and validates it.
 A payload is not a vector. An AAV transfer plasmid needs two ITRs around
 the payload, a polyA and normally a WPRE inside them, and the bacterial
 origin and resistance outside. A lentiviral one needs LTRs, the packaging
-signal, RRE and cPPT instead. Set `vector:` in the specification to `AAV`,
-`lentiviral` or `plasmid` and Genesis will only accept a backbone of that
+signal, RRE and cPPT instead. A specification that does not mention a vector takes `default_vector` from
+the configuration, which ships as `AAV` because that is what this lab builds
+most of; set it to `""` to infer from the backbone instead. Saying
+`vector: auto` explicitly always infers, whatever the default is. Set
+`vector:` to `AAV`, `lentiviral` or `plasmid` and Genesis will only accept a backbone of that
 family and will check the finished molecule against the full element list,
 reporting anything absent. Asking for a family that the backbone does not belong to reports the
 mismatch and names the evidence, rather than quietly leaving the construct
@@ -490,7 +493,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           212 tests, no lab share required
+tests/           215 tests, no lab share required
 ```
 
 ## Giving it to a labmate
