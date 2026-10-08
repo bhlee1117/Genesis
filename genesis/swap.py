@@ -74,11 +74,15 @@ class ParentMatch:
     matched_bp: int = 0
     score: float = 0.0
 
+    #: Short, plain reasons this plasmid was offered.
+    reasons: list = field(default_factory=list)
+
     def to_dict(self) -> dict:
         return {"id": self.plasmid_id, "name": self.name, "owner": self.owner,
                 "length": self.length, "circular": self.circular,
                 "verified": self.verified, "matched": len(self.matched_part_ids),
-                "matched_bp": self.matched_bp, "score": round(self.score, 2)}
+                "matched_bp": self.matched_bp, "score": round(self.score, 2),
+                "reasons": self.reasons}
 
 
 @dataclass
@@ -113,10 +117,12 @@ class SwapAnalysis:
     notes: list = field(default_factory=list)
     feasible: bool = True
     donor_options: list = field(default_factory=list)
+    recipient_options: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "donor_options": self.donor_options,
+            "recipient_options": self.recipient_options,
             "recipient": self.recipient.to_dict() if self.recipient else None,
             "donor": self.donor.to_dict() if self.donor else None,
             "remove": self.remove.to_dict() if self.remove else None,
@@ -251,11 +257,19 @@ def find_donors(conn: sqlite3.Connection, part_ids: list[int],
                 (r["id"],))]
             family_miss = 0 if classify_vector(
                 ann, r["name"])["family"] == require_family else 1
+        match = ParentMatch(r["id"], r["name"], r["owner"], r["seq_length"],
+                            bool(r["circular"]), r["verified"])
+        match.reasons = []
+        if require_family and not family_miss:
+            match.reasons.append(f"same vector family ({require_family})")
+        elif require_family:
+            match.reasons.append("different vector family")
+        if r["verified"] != "unverified":
+            match.reasons.append("sequence verified")
+        match.reasons.append(f"{r['seq_length']:,} bp")
         scored.append((
             (family_miss, 0 if r["verified"] != "unverified" else 1,
-             r["seq_length"]),
-            ParentMatch(r["id"], r["name"], r["owner"], r["seq_length"],
-                        bool(r["circular"]), r["verified"])))
+             r["seq_length"]), match))
     scored.sort(key=lambda item: item[0])
     return [match for _, match in scored[:limit]]
 
@@ -377,7 +391,9 @@ def _as_parent(conn: sqlite3.Connection, plasmid_id: int,
 def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
                  cfg: Config, require_types: set | None = None,
                  require_family: str = "",
-                 prefer_plasmid_id: int | None = None) -> SwapAnalysis | None:
+                 prefer_plasmid_id: int | None = None,
+                 pin_recipient_id: int | None = None,
+                 pin_donor_id: int | None = None) -> SwapAnalysis | None:
     """Plan the shortest edit: one region out of a recipient, one piece in.
 
     ``resolved_modules`` is the plan's module list, in target order, each
@@ -430,7 +446,13 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
                  f"is nothing to edit; this one has to be built from parts"],
                 feasible=False)
         return None
+    if pin_recipient_id is not None:
+        pinned = _as_parent(conn, pin_recipient_id, part_ids)
+        if pinned is not None:
+            candidates = [pinned] + [c for c in candidates
+                                     if c.plasmid_id != pin_recipient_id]
     recipient = candidates[0]
+    recipient_options = [c.to_dict() for c in candidates[:6]]
 
     kept = [m for m in wanted if m["part_id"] in recipient.matched_part_ids]
     missing = [m for m in wanted if m["part_id"] not in recipient.matched_part_ids]
@@ -526,10 +548,23 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
     # "EGFP" are separate parts differing by three bases, so asking only for
     # the exact part that was resolved would hide every plasmid that holds
     # the same protein under the other name.
-    donor_parts = variant_part_ids(conn, new_module.get("seq") or "",
-                                   new_module["part_id"])
+    # Both levels. DNA k-mers catch boundary variants of the same gene;
+    # protein comparison catches codon-optimised copies that share almost no
+    # DNA, and the badly-labelled ones ("ORF frame 2") that are the protein
+    # under no useful name at all.
+    donor_parts = sorted(set(
+        variant_part_ids(conn, new_module.get("seq") or "",
+                         new_module["part_id"])
+        + same_protein_parts(conn, new_module.get("seq") or "",
+                             new_module["part_id"],
+                             new_module.get("type", "CDS"))))
     donors = find_donors(conn, donor_parts, require_family,
                          exclude_id=recipient.plasmid_id)
+    if pin_donor_id is not None:
+        donors = ([d for d in donors if d.plasmid_id == pin_donor_id] or
+                  [_as_parent(conn, pin_donor_id, [new_module["part_id"]])]) + \
+                 [d for d in donors if d.plasmid_id != pin_donor_id]
+        donors = [d for d in donors if d is not None]
     donor = donors[0] if donors else None
     donor_options = [d.to_dict() for d in donors[:6]]
     insert = None
@@ -558,6 +593,7 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
     # dozen plasmids may carry the same protein. The alternatives travel
     # with the plan so the choice stays visible.
     analysis.donor_options = donor_options
+    analysis.recipient_options = recipient_options
     return analysis
 
 
@@ -605,6 +641,7 @@ def build_scheme(conn: sqlite3.Connection, analysis: SwapAnalysis) -> dict:
     if scheme["donor"]:
         scheme["donor"]["action"] = "take this region"
     scheme["donor_options"] = list(getattr(analysis, "donor_options", []))
+    scheme["recipient_options"] = list(getattr(analysis, "recipient_options", []))
 
     # The product of a swap is the recipient with one region exchanged, which
     # is a different molecule from the part-by-part assembly the generic
@@ -621,3 +658,74 @@ def build_scheme(conn: sqlite3.Connection, analysis: SwapAnalysis) -> dict:
             "insert_label": analysis.insert.label,
         }
     return scheme
+
+
+# --------------------------------------------------------------------------
+# Protein-level identity
+# --------------------------------------------------------------------------
+
+#: Two coding sequences are the same part if their proteins agree this far.
+PROTEIN_IDENTITY = 0.95
+
+
+def protein_of(seq: str) -> str:
+    """The protein a coding sequence encodes, read in its best frame.
+
+    Taken as the longest uninterrupted translation across the three forward
+    frames, which is what a CDS annotation means even when its boundaries
+    are a few bases out.
+    """
+    from .seqtools import translate
+
+    best = ""
+    for frame in range(3):
+        for stretch in translate(seq, frame=frame).split("*"):
+            if len(stretch) > len(best):
+                best = stretch
+    return best
+
+
+def protein_identity(a: str, b: str) -> float:
+    """Fraction of the shorter protein shared with the longer one.
+
+    Compared by residue windows rather than aligned properly: the question
+    is "are these the same protein under two names", not "what is the exact
+    alignment", and a window index answers that without an alignment matrix.
+    """
+    if not a or not b:
+        return 0.0
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    k = 8
+    if len(short) < k:
+        return 1.0 if short in long_ else 0.0
+    index = {long_[i:i + k] for i in range(len(long_) - k + 1)}
+    total = len(short) - k + 1
+    hits = sum(1 for i in range(total) if short[i:i + k] in index)
+    return hits / total if total else 0.0
+
+
+def same_protein_parts(conn: sqlite3.Connection, seq: str,
+                       part_id: int | None = None,
+                       feature_type: str = "CDS") -> list[int]:
+    """Catalogued parts encoding the same protein as `seq`.
+
+    DNA comparison misses codon-optimised versions of a protein entirely:
+    two genes can share almost no 40-mers and still make the same thing.
+    Asking at the protein level is what groups "GFP", "EGFP" and a
+    human-codon-optimised copy of either into one answer.
+    """
+    target = protein_of(seq or "")
+    if len(target) < 30:
+        return [part_id] if part_id else []
+
+    ids = [part_id] if part_id else []
+    low, high = int(len(seq) * 0.5), int(len(seq) * 2.0)
+    rows = conn.execute(
+        """SELECT id, seq FROM part
+           WHERE feature_type = ? AND seq_length BETWEEN ? AND ?
+             AND id != COALESCE(?, -1)""",
+        (feature_type, low, high, part_id)).fetchall()
+    for row in rows:
+        if protein_identity(target, protein_of(row["seq"])) >= PROTEIN_IDENTITY:
+            ids.append(row["id"])
+    return ids

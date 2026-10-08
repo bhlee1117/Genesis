@@ -60,6 +60,8 @@ class Config:
         "NheI", "KpnI", "SacI", "PstI", "SpeI", "BglII", "EcoRV", "AscI",
         "BsrGI", "MluI", "NcoI", "SmaI", "ApaI", "ClaI", "BsaI", "BsmBI",
     )
+    #: "NEBuilder HiFi" or "Gibson". The two differ in how much homology
+    #: they need, which is the main thing it changes about primer design.
     preferred_assembly_kit: str = "NEBuilder HiFi"
     #: Backbone to reach for when an AAV is requested and none is named.
     default_aav_backbone: str = "PP072"
@@ -81,7 +83,11 @@ class Config:
     primer_leader: str = "TTAATT"
     primer_max_gc: float = 0.65
     primer_min_gc: float = 0.35
-    overlap_length: int = 25              # Gibson/HiFi homology arm
+    #: Homology arm. Used as a ceiling: the shortest arm that still reaches
+    #: `overlap_tm_min` is taken, because every base of overlap is a base of
+    #: oligo somebody pays for and synthesises with some error rate.
+    overlap_length: int = 25
+    overlap_min_length: int = 15
     overlap_tm_min: float = 48.0
     primer_conc_nm: float = 500.0
     na_mm: float = 50.0

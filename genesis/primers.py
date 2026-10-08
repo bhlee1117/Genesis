@@ -186,12 +186,11 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     tail; the reverse primer carries the reverse complement of the 5' start
     of the *downstream* fragment.
     """
-    ov = cfg.overlap_length
     f_anneal = pick_anneal(template, start, "F", cfg, circular_template)
     r_anneal = pick_anneal(template, end, "R", cfg, circular_template)
 
-    f_tail = upstream_seq[-ov:] if upstream_seq else ""
-    r_tail = revcomp(downstream_seq[:ov]) if downstream_seq else ""
+    f_tail = pick_overlap(upstream_seq, cfg, from_end=True)
+    r_tail = revcomp(pick_overlap(downstream_seq, cfg, from_end=False))
 
     fwd = Primer(
         name=f"{fragment_name}-F", sequence=f_tail + f_anneal, anneal=f_anneal,
@@ -290,6 +289,51 @@ def design_re_pair(fragment_name: str, template: str, start: int, end: int,
 # --------------------------------------------------------------------------
 
 TRANSLATED = {"CDS", "trafficking_motif", "linker", "p2A", "tag"}
+
+#: Homology each kit needs, as (minimum, maximum) base pairs.
+#:
+#: NEBuilder HiFi's higher-fidelity enzyme mix works with 15-25 bp, where
+#: standard Gibson typically wants 20-40 bp. Shorter homology means shorter
+#: oligos, so HiFi is the easier of the two on primer design, not the
+#: harder. Both want the arm's Tm at or above 48 C, since the reaction runs
+#: at 50 C.
+#: https://www.neb.com/en-us/tools-and-resources/usage-guidelines/optimization-tips-for-nebuilder-hifi-dna-assembly-and-neb-gibson-assembly
+ASSEMBLY_HOMOLOGY = {
+    "hifi": (15, 25),
+    "gibson": (20, 40),
+}
+
+
+def homology_range(cfg: Config) -> tuple:
+    kit = (cfg.preferred_assembly_kit or "").lower()
+    key = "gibson" if "gibson" in kit and "hifi" not in kit else "hifi"
+    low, high = ASSEMBLY_HOMOLOGY[key]
+    # The kit decides the ceiling. `overlap_length` is only a floor-raiser
+    # for someone who wants longer arms than the kit strictly needs.
+    return max(low, cfg.overlap_min_length), max(high, cfg.overlap_length)
+
+
+def pick_overlap(neighbour: str, cfg: Config, from_end: bool = True) -> str:
+    """Take the shortest homology arm that still anneals at the assembly
+    temperature.
+
+    Using the maximum every time makes every oligo longer than it needs to
+    be. The arm is grown from the kit's minimum until its Tm reaches the
+    threshold, and only then does it stop.
+    """
+    low, high = homology_range(cfg)
+    if not neighbour:
+        return ""
+    best = ""
+    for length in range(low, high + 1):
+        arm = neighbour[-length:] if from_end else neighbour[:length]
+        if len(arm) < length:
+            break
+        best = arm
+        t = tm(arm, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+        if t == t and t >= cfg.overlap_tm_min:
+            return arm
+    return best
 
 
 def analyse_junctions(layout: list[dict], seq: str, method: str,

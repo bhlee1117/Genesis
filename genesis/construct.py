@@ -48,6 +48,9 @@ class ConstructSpec:
     notes: str = ""
     #: "AAV", "lentiviral", "plasmid", or "" to infer from the backbone.
     vector: str = ""
+    #: Pin the two parents of a swap. Left unset, Genesis recommends.
+    recipient_plasmid_id: int | None = None
+    donor_plasmid_id: int | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -77,6 +80,8 @@ class ConstructSpec:
             circular=data.get("circular", True),
             notes=data.get("notes", ""),
             vector=_normalise_vector(data.get("vector", "")),
+            recipient_plasmid_id=data.get("recipient_plasmid_id"),
+            donor_plasmid_id=data.get("donor_plasmid_id"),
         )
 
     @classmethod

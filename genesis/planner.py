@@ -908,7 +908,8 @@ def plan_swap_restriction_route(conn: sqlite3.Connection, analysis, cfg: Config,
 
 def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
                        left_bound: int, right_bound: int, remove,
-                       cfg: Config) -> dict | None:
+                       cfg: Config,
+                       insert_must_lack_sites: bool = True) -> dict | None:
     """Find two enzymes that cut only inside the region being replaced.
 
     Both cuts must lie between the conserved features either side, and
@@ -929,8 +930,11 @@ def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
         if len(sites) != 1:
             continue                     # must be unique in the recipient
         cut = sites[0].top_cut
-        if find_sites(insert_seq, enz, False):
-            continue                     # would cut the incoming piece
+        if insert_must_lack_sites and find_sites(insert_seq, enz, False):
+            # Only matters when the insert is itself digested. If it arrives
+            # as a PCR product joined by homology, the enzyme never touches
+            # it and a site inside it is irrelevant.
+            continue
         if left_bound <= cut <= remove.start:
             left_usable.append((n, cut))
         elif remove.end <= cut <= right_bound:
@@ -968,6 +972,7 @@ def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
                                 "size to separate cleanly on a gel")
             cand = {
                 "enzymes": (a, b), "warnings": warnings,
+                "cut_left": lo, "cut_right": hi,
                 "dropout": dropout or remove.length,
                 "backbone_band": backbone_band,
                 "left_end": enz_a.end_type, "right_end": enz_b.end_type,
@@ -998,3 +1003,128 @@ def _append_swap_finishing(steps: list[Step], cfg: Config, analysis,
             f"Sanger sequence both new junctions and the whole "
             f"{analysis.insert.label} insert",
             output="verified plasmid"))
+
+
+def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
+                           scheme: dict) -> Route:
+    """Cut the recipient open, amplify only the insert, assemble.
+
+    The all-PCR swap amplifies the backbone as well, which on a 7 kb plasmid
+    means a long inverse PCR whose every base carries polymerase error, and
+    a second pair of primers to pay for. If enzymes can open the recipient
+    at the right place there is no reason to copy it at all: digest it, gel
+    purify the vector, and run one PCR for the piece going in.
+
+    One PCR instead of two, one primer pair instead of two, and the vector
+    arrives as original plasmid DNA rather than an amplicon.
+    """
+    route = Route(id="swap_hybrid", strategy="swap_hybrid",
+                  title="Swap by digest + one PCR + HiFi assembly",
+                  scheme=scheme)
+    if analysis is None or not analysis.feasible:
+        route.feasible = False
+        route.warnings.append(
+            (analysis.notes[0] if analysis and analysis.notes
+             else "no suitable pair of parent plasmids was found"))
+        return route
+
+    rec = conn.execute(
+        "SELECT seq, circular, name, verified FROM plasmid WHERE id = ?",
+        (analysis.recipient.plasmid_id,)).fetchone()
+    don = conn.execute(
+        "SELECT seq, circular, name, verified FROM plasmid WHERE id = ?",
+        (analysis.donor.plasmid_id,)).fetchone()
+    if rec is None or don is None:
+        route.feasible = False
+        route.warnings.append("parent plasmid sequence missing")
+        return route
+
+    rec_seq, rec_circ = rec["seq"], bool(rec["circular"])
+    remove = analysis.remove
+    insert_seq = _insert_sequence(conn, analysis)
+    left_bound = analysis.left_anchor["end"] if analysis.left_anchor else 0
+    right_bound = (analysis.right_anchor["start"] if analysis.right_anchor
+                   else len(rec_seq))
+
+    pair = _find_swap_enzymes(rec_seq, rec_circ, insert_seq, left_bound,
+                              right_bound, remove, cfg,
+                              insert_must_lack_sites=False)
+    if not pair:
+        route.feasible = False
+        gap_left = remove.start - left_bound
+        gap_right = right_bound - remove.end
+        detail = ""
+        if gap_left <= 0 or gap_right <= 0:
+            side = "upstream" if gap_left <= 0 else "downstream"
+            detail = (f" - the part being kept {side} begins exactly where "
+                      f"the region to remove ends, leaving nowhere to cut "
+                      f"without cutting into it")
+        route.warnings.append(
+            f"no stocked enzyme opens {rec['name']} at both ends of the "
+            f"region to remove{detail}. Deleting a region by assembly needs "
+            f"it physically cut out at both boundaries, so this edit has to "
+            f"amplify around it instead: use the all-PCR swap")
+        return route
+
+    e1, e2 = pair["enzymes"]
+    steps: list[Step] = []
+
+    steps.append(Step(
+        0, "RE_DIGEST",
+        f"Digest {rec['name']} with {e1} + {e2} to open it and drop out "
+        f"{remove.label} ({pair['dropout']:,} bp)",
+        inputs=[rec["name"], f"{e1}, {e2}"], output="linearised vector",
+        details={"enzymes": [e1, e2]}))
+    if e1 == e2:
+        steps.append(Step(
+            0, "DEPHOSPHORYLATION",
+            "Dephosphorylate the cut vector; both ends came from the same "
+            "enzyme and would otherwise re-close on themselves",
+            output="dephosphorylated vector"))
+    steps.append(Step(
+        0, "GEL_EXTRACTION",
+        f"Gel purify the {pair['backbone_band']:,} bp vector band, away from "
+        f"the {pair['dropout']:,} bp dropout",
+        output="purified vector", details={"size": pair["backbone_band"]}))
+
+    # The single PCR: the insert, with homology to the cut vector ends.
+    cut_lo = min(pair.get("cut_left", remove.start), pair.get("cut_right", remove.end))
+    cut_hi = max(pair.get("cut_left", remove.start), pair.get("cut_right", remove.end))
+    upstream = slice_region(rec_seq, max(cut_lo - 60, 0), cut_lo, circular=rec_circ)
+    downstream = slice_region(rec_seq, cut_hi, cut_hi + 60, circular=rec_circ)
+
+    fwd, rev = design_gibson_pair(
+        0, analysis.insert.label or "insert", don["seq"],
+        analysis.insert.start, analysis.insert.end, upstream, downstream,
+        cfg, circular_template=bool(don["circular"]))
+    steps.append(Step(
+        0, "PCR",
+        f"Amplify {analysis.insert.label} ({len(insert_seq):,} bp) from "
+        f"{don['name']} with {fwd.name} / {rev.name}, adding homology to the "
+        f"cut vector ends",
+        inputs=[don["name"], f"{fwd.name}+{rev.name}"],
+        output=f"{analysis.insert.label} amplicon",
+        details={"length": len(insert_seq), "template": don["name"],
+                 "gc": round(gc_fraction(insert_seq), 3)}))
+    steps.append(Step(
+        0, "DPNI_DIGEST",
+        f"Digest the PCR with DpnI to remove the parental {don['name']}",
+        output="template-free amplicon"))
+    steps.append(Step(0, "DNA_CLEANUP", "Column purify the PCR product",
+                      output="clean amplicon"))
+    steps.append(Step(
+        0, "HI_FI_ASSEMBLY",
+        f"Assemble the cut vector with {analysis.insert.label} using "
+        f"{cfg.preferred_assembly_kit}",
+        inputs=["purified vector", f"{analysis.insert.label} amplicon"],
+        output="assembled plasmid", details={"fragments": 2}))
+
+    route.warnings += pair["warnings"]
+    _append_swap_finishing(steps, cfg, analysis, conn)
+    route.steps = renumber(steps)
+    route.primers = [fwd, rev]
+    for p in route.primers:
+        route.warnings += [f"primer {p.name}: {w}" for w in p.warnings]
+    route.warnings += analysis.notes
+    route.cost_breakdown["enzymes"] = [e1, e2]
+    return route

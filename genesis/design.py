@@ -14,7 +14,8 @@ from .construct import (ConstructSpec, assemble,
                         assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
 from .planner import (group_contiguous, plan_hifi_route, plan_restriction_route,
-                      plan_swap_hifi_route, plan_swap_restriction_route,
+                      plan_swap_hifi_route, plan_swap_hybrid_route,
+                      plan_swap_restriction_route,
                       rank_routes, failure_history)
 from .swap import analyse_swap, build_scheme, rank_parents
 from .vectors import classify_vector, describe, missing_elements
@@ -311,7 +312,9 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     analysis = analyse_swap(conn, module_rows, cfg,
                             require_types=required_architecture(spec),
                             require_family=spec.vector,
-                            prefer_plasmid_id=backbone["id"] if backbone else None)
+                            prefer_plasmid_id=backbone["id"] if backbone else None,
+                            pin_recipient_id=spec.recipient_plasmid_id,
+                            pin_donor_id=spec.donor_plasmid_id)
     # Only draw a scheme for a swap that is actually on offer; a rejected
     # analysis still carries a recipient, and drawing it would illustrate
     # a plan nobody should follow.
@@ -325,8 +328,9 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         plan_restriction_route(conn, construct, fragments, backbone, cfg),
     ]
     if analysis is not None:
-        routes.insert(0, plan_swap_hifi_route(conn, analysis, cfg, scheme))
-        routes.insert(1, plan_swap_restriction_route(conn, analysis, cfg, scheme))
+        routes.insert(0, plan_swap_hybrid_route(conn, analysis, cfg, scheme))
+        routes.insert(1, plan_swap_hifi_route(conn, analysis, cfg, scheme))
+        routes.insert(2, plan_swap_restriction_route(conn, analysis, cfg, scheme))
 
     # An unresolved required module invalidates every route: the plan would
     # build a different construct from the one that was asked for.

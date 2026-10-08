@@ -2357,3 +2357,131 @@ class TestAddgenePrimerRules(unittest.TestCase):
         region = pick_anneal(self.template, 500, "F", self.cfg)
         self.assertIn(region, self.template)
         self.assertEqual(len(region), len(set([region])) * len(region))
+
+
+# --------------------------------------------------------------------------
+class TestAssemblyHomology(unittest.TestCase):
+    """Homology arms follow the kit, and are no longer than they need to be."""
+
+    def test_the_two_kits_want_different_homology(self):
+        from genesis.primers import homology_range
+        hifi, gibson = Config(), Config()
+        gibson.preferred_assembly_kit = "Gibson"
+        self.assertEqual(homology_range(hifi)[0], 15)
+        self.assertEqual(homology_range(gibson)[0], 20)
+        self.assertGreater(homology_range(gibson)[1], homology_range(hifi)[1])
+
+    def test_hifi_gives_shorter_arms_so_shorter_primers(self):
+        from genesis.primers import pick_overlap
+        hifi, gibson = Config(), Config()
+        gibson.preferred_assembly_kit = "Gibson"
+        neighbour = rand_seq(80, 1300)
+        self.assertLessEqual(len(pick_overlap(neighbour, hifi)),
+                             len(pick_overlap(neighbour, gibson)))
+
+    def test_a_gc_rich_arm_is_cut_short(self):
+        """No reason to pay for 25 bases when 15 already anneal."""
+        from genesis.primers import pick_overlap
+        cfg = Config()
+        arm = pick_overlap("GC" * 40, cfg)
+        self.assertEqual(len(arm), 15)
+        self.assertGreaterEqual(st.tm(arm), cfg.overlap_tm_min)
+
+    def test_an_at_rich_arm_grows_to_the_ceiling(self):
+        from genesis.primers import pick_overlap, homology_range
+        cfg = Config()
+        arm = pick_overlap("AT" * 40, cfg)
+        self.assertEqual(len(arm), homology_range(cfg)[1])
+
+
+# --------------------------------------------------------------------------
+class TestProteinLevelIdentity(unittest.TestCase):
+    """The same protein under two names, and under two codon usages."""
+
+    @staticmethod
+    def _back_translate(peptide, table_shift=0):
+        """Encode a peptide, optionally choosing different synonymous codons."""
+        choices = {}
+        for codon, aa in st.CODON_TABLE.items():
+            choices.setdefault(aa, []).append(codon)
+        return "".join(
+            sorted(choices[a])[table_shift % len(choices[a])] for a in peptide)
+
+    def test_codon_optimised_copies_share_the_protein_not_the_dna(self):
+        from genesis.swap import protein_identity, protein_of
+        import genesis.seqtools as seq
+        peptide = "MGSHHHHHHSSGLVPRGSHMASMTGGQQMGRGSEFELRRQACGRTRKLME"
+        a = self._back_translate(peptide, 0)
+        b = self._back_translate(peptide, 1)
+        self.assertNotEqual(a, b)
+        # DNA 40-mers barely overlap, the proteins are identical
+        shared = sum(1 for i in range(len(a) - 40 + 1)
+                     if a[i:i + 40] in b)
+        self.assertEqual(shared, 0)
+        self.assertEqual(protein_of(a), protein_of(b))
+        self.assertEqual(protein_identity(protein_of(a), protein_of(b)), 1.0)
+
+    def test_different_proteins_do_not_match(self):
+        from genesis.swap import protein_identity, protein_of
+        a = self._back_translate("MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ")
+        b = self._back_translate("MWQRVNDLGEYTKPFACHIMLSEDGKRNVTWAY")
+        self.assertLess(protein_identity(protein_of(a), protein_of(b)), 0.5)
+
+    def test_a_longer_fusion_contains_the_shorter_protein(self):
+        from genesis.swap import protein_identity, protein_of
+        core = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSG"
+        fusion = "MGSSHHHHHHSQDP" + core + "GGSGGSAAAEFLYKVV"
+        self.assertGreaterEqual(
+            protein_identity(protein_of(self._back_translate(core)),
+                             protein_of(self._back_translate(fusion))), 0.9)
+
+
+# --------------------------------------------------------------------------
+class TestParentSelection(unittest.TestCase):
+    """Recommendations are offered, and a choice can be pinned."""
+
+    def test_a_pinned_donor_is_used(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        gene = orf(200, 1400)
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','g',?,?,?)""",
+            (gene, hashlib.sha256(gene.encode()).hexdigest(),
+             len(gene))).lastrowid
+
+        def plasmid(name, extra):
+            body = gene + rand_seq(3000, 1401)
+            pid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified, available_template)
+                   VALUES (?,'t',?,?,?,1,'sequence_verified',1)""",
+                (name, body, len(body), name)).lastrowid
+            for ftype, label in [("origin", "ori"), ("resistance", "AmpR")] + extra:
+                conn.execute(
+                    """INSERT INTO annotation(plasmid_id, feature_type, name,
+                            start, end, strand) VALUES (?,?,?,0,30,1)""",
+                    (pid, ftype, label))
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                        strand) VALUES (?,?,0,?,1)""", (part, pid, len(gene)))
+            return pid
+
+        small = plasmid("small-donor", [])
+        chosen = plasmid("the-one-i-want", [])
+        conn.commit()
+
+        from genesis.swap import find_donors
+        donors = find_donors(conn, [part], "")
+        self.assertTrue(donors)
+        self.assertTrue(all(d.reasons for d in donors),
+                        "every recommendation needs a stated reason")
+        self.assertIn(chosen, [d.plasmid_id for d in donors])
+
+    def test_a_spec_can_pin_both_parents(self):
+        spec = ConstructSpec.from_dict({
+            "name": "x", "recipient_plasmid_id": 11, "donor_plasmid_id": 22,
+            "modules": [{"type": "CDS", "name": "g"}]})
+        self.assertEqual(spec.recipient_plasmid_id, 11)
+        self.assertEqual(spec.donor_plasmid_id, 22)

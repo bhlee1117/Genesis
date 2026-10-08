@@ -254,6 +254,17 @@ A recipient must also be a plasmid that can be grown: without an origin and
 a resistance marker it is an extraction or a fragment, not something you can
 transform.
 
+Both parents can be pinned (`recipient_plasmid_id`, `donor_plasmid_id`) and
+both come with ranked alternatives and a stated reason for each, because
+which plasmid to start from is a lab judgement as much as a computation.
+
+Equivalence between parts is decided at two levels. DNA k-mers catch
+boundary variants of the same gene; **protein comparison** catches
+codon-optimised copies that share almost no DNA, and the badly-labelled ones
+- "ORF frame 2", "Translation 5108-5968" - that are a familiar protein under
+no useful name at all. For GFP the DNA search finds 60 parts and the protein
+search finds 11 more that it misses, `eGFP` among them.
+
 Donors are ranked differently from recipients. A recipient is scored on how
 much of the target it already holds; a donor only has to hold one piece, so
 holding six catalogued variants of GFP does not make a plasmid a better
@@ -365,6 +376,15 @@ bench time and **elapsed** turnaround including overnight growth and
 sequencing. A plan that is 5 h of work spread over 3 days reads as exactly
 that.
 
+### Assembly method and homology
+
+NEBuilder HiFi works with **15-25 bp** of homology where standard Gibson
+typically wants **20-40 bp**, so HiFi is the easier of the two on primer
+design, not the harder: shorter homology means shorter oligos. Genesis takes
+the shortest arm that still reaches 48 C, since the reaction runs at 50 C -
+a GC-rich junction gets 15 bases and an AT-rich one grows to the ceiling.
+Setting `preferred_assembly_kit` to Gibson widens the range accordingly.
+
 ### Primers
 
 Every primer is computed from the template sequence. Nothing is reused from
@@ -438,7 +458,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           189 tests, no lab share required
+tests/           198 tests, no lab share required
 ```
 
 ## Giving it to a labmate
