@@ -2264,3 +2264,92 @@ class TestRecipientArchitecture(unittest.TestCase):
         self.assertFalse(result.feasible)
         self.assertTrue(any("architecture it needs" in n for n in result.notes),
                         result.notes)
+
+
+# --------------------------------------------------------------------------
+class TestAddgenePrimerRules(unittest.TestCase):
+    """Primer design follows Addgene's PCR cloning protocol.
+
+    https://www.addgene.org/protocols/pcr-cloning/ - the hybridising region
+    is 18-21 bp, a restriction primer carries a 3-6 bp leader before a 6-8 bp
+    site, and the Tm that matters is the one for the hybridising region only.
+    """
+
+    def setUp(self):
+        self.cfg = Config()
+        self.template = rand_seq(3000, 1200)
+
+    def test_the_window_matches_the_protocol(self):
+        self.assertEqual((self.cfg.primer_min_len, self.cfg.primer_max_len),
+                         (18, 21))
+        self.assertTrue(3 <= len(self.cfg.primer_leader) <= 6)
+
+    def test_annealing_region_stays_inside_the_window(self):
+        from genesis.primers import pick_anneal
+        for start in range(100, 2000, 137):
+            for direction in ("F", "R"):
+                region = pick_anneal(self.template, start, direction, self.cfg)
+                self.assertTrue(18 <= len(region) <= 21,
+                                f"{direction} at {start}: {len(region)} nt")
+
+    def test_a_restriction_primer_is_leader_site_anneal(self):
+        from genesis.primers import design_re_pair
+        from genesis.enzymes import CATALOG
+        fwd, rev = design_re_pair("frag", self.template, 200, 900,
+                                  "EcoRI", "BamHI", self.cfg)
+        for primer, enzyme in ((fwd, "EcoRI"), (rev, "BamHI")):
+            site = CATALOG[enzyme].site
+            self.assertTrue(6 <= len(site) <= 8)
+            leader = primer.tail[:-len(site)]
+            self.assertTrue(3 <= len(leader) <= 6, leader)
+            self.assertTrue(18 <= len(primer.anneal) <= 21)
+            self.assertEqual(primer.tail, leader + primer.tail[len(leader):])
+            self.assertEqual(primer.sequence, primer.tail + primer.anneal)
+
+    def test_the_reverse_primer_is_the_reverse_complement(self):
+        from genesis.primers import pick_anneal
+        region = pick_anneal(self.template, 900, "R", self.cfg)
+        self.assertIn(st.revcomp(region), self.template)
+
+    def test_tm_is_reported_for_the_hybridising_region_only(self):
+        from genesis.primers import Primer
+        anneal = "GCTAGCTAGCATCGATCGAT"
+        primer = Primer("p", "A" * 25 + anneal, anneal, "A" * 25)
+        reported = primer.to_dict(self.cfg)
+        self.assertAlmostEqual(reported["anneal_tm"], st.tm(anneal), places=1)
+        self.assertNotAlmostEqual(reported["anneal_tm"], reported["full_tm"],
+                                  places=1)
+
+    def test_the_leader_does_not_create_another_site(self):
+        from genesis.primers import choose_leader
+        from genesis.enzymes import CATALOG
+        from genesis.seqtools import find_all
+        for name in ("EcoRI", "BamHI", "NotI", "XhoI", "AgeI", "KpnI",
+                     "NheI", "SpeI", "SalI", "HindIII"):
+            site = CATALOG[name].site
+            leader = choose_leader(site, self.cfg, self.cfg.stocked_enzymes)
+            self.assertTrue(3 <= len(leader) <= 6)
+            junction = leader + site
+            for other in self.cfg.stocked_enzymes:
+                enzyme = CATALOG.get(other)
+                if enzyme is None:
+                    continue
+                positions = set(find_all(junction, enzyme.site))
+                positions |= set(find_all(junction, st.revcomp(enzyme.site)))
+                expected = 1 if enzyme.site in (site, st.revcomp(site)) else 0
+                self.assertLessEqual(len(positions), expected,
+                                     f"{leader}+{site} creates a {other} site")
+
+    def test_an_out_of_window_region_is_flagged(self):
+        from genesis.primers import Primer, validate_primer
+        long_anneal = self.template[100:140]          # 40 nt
+        primer = Primer("p", long_anneal, long_anneal)
+        warnings = validate_primer(primer, self.template, self.cfg)
+        self.assertTrue(any("window" in w for w in warnings), warnings)
+
+    def test_designed_primers_are_not_taken_from_the_catalogue(self):
+        """Primers are computed from the template, never reused."""
+        from genesis.primers import pick_anneal
+        region = pick_anneal(self.template, 500, "F", self.cfg)
+        self.assertIn(region, self.template)
+        self.assertEqual(len(region), len(set([region])) * len(region))

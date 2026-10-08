@@ -1192,3 +1192,40 @@ tr.row-bad td {
   line-height: 1.5;
 }
 .modal-list li { margin-bottom: 3px; }
+
+/* --- circular plasmid map ------------------------------------------------
+   A plasmid is a circle; a linear track implies the ends are ends, and a
+   cassette that wraps the origin looks broken on one. */
+.map-circular { width: 100%; display: flex; justify-content: center; }
+.circ-svg { max-width: 560px; display: block; }
+.circ-backbone { stroke: var(--border-strong); fill: none; }
+.circ-origin { stroke: var(--text-muted); stroke-width: 1; }
+.circ-tick { fill: var(--text-muted); font-size: 9px; font-family: var(--sans); }
+.circ-leader { stroke: var(--border-strong); stroke-width: 0.8; }
+.circ-label { font-size: 10px; font-family: var(--sans); }
+.circ-name {
+  fill: var(--text); font-size: 12px; font-weight: 600;
+  font-family: var(--sans);
+}
+.circ-size { fill: var(--text); font-size: 13px; font-family: var(--sans); }
+.circ-topo { fill: var(--text-muted); font-size: 10px; font-family: var(--sans); }
+.circ-feature path { transition: stroke-width 0.1s; }
+.circ-feature:hover path { stroke-width: 11; }
+.circ-codon line { stroke-width: 1.6; }
+.circ-codon.mark-start line { stroke: var(--ok-border); }
+.circ-codon.mark-stop line { stroke: var(--accent); }
+.circ-codon.mark-premature_stop line,
+.circ-codon.mark-missing_start line,
+.circ-codon.mark-missing_stop line { stroke: var(--error-border); stroke-width: 2.2; }
+
+.map-toggle { display: flex; gap: 4px; margin: 0 0 8px; }
+.map-toggle button {
+  font: inherit; font-size: 11px; padding: 3px 10px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--text-muted); border-radius: var(--radius);
+}
+.map-toggle button.active {
+  background: var(--accent); color: var(--accent-text);
+  border-color: var(--accent);
+}
+.map-note { margin: 6px 0 0; }

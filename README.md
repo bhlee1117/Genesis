@@ -155,6 +155,9 @@ plasmids, assembles the intended molecule, and validates it.
   | `FAS` | loxFAS + loxP | inverted | switches **on** |
   | `DO` | lox2272 + loxP | forward | switches **off** |
 
+  The lab's standard AAV backbone (`PP072` by default, set in `config.py`)
+  is used when an AAV is asked for and no backbone is named.
+
   `type: DIO` still works and means Cre-lox in its DIO arrangement. The
   loxFAS sequence was taken from the lab's own plasmids, where it is
   annotated "FAS SITE"; it carries mutated inverted repeats so it pairs only
@@ -341,11 +344,25 @@ that.
 
 ### Primers
 
-Primers are built as `[overlap tail] + [annealing region]`, and **Tm is
-reported for the annealing region alone** — quoting the Tm of the whole oligo
+Every primer is computed from the template sequence. Nothing is reused from
+the annotated primer-binding sites in the lab's files.
+
+Design follows Addgene's PCR cloning protocol: the region that hybridises to
+the template is **18-21 bp**, and a restriction primer is **leader (3-6 bp) +
+recognition site (6-8 bp) + hybridising region**, the leader being there so
+the enzyme has something to grip. The leader is not arbitrary - each
+candidate is checked against the site it precedes and against every stocked
+enzyme, so it cannot accidentally complete a second recognition sequence
+where it abuts the site.
+
+Primers are built as `[overlap or leader+site tail] + [annealing region]`,
+and **Tm is reported for the annealing region alone** — quoting the Tm of the whole oligo
 including its Gibson tail is a common cause of failed first cycles. Melting
 temperatures use SantaLucia unified nearest-neighbour parameters with a
-divalent-cation correction. Each primer is checked for length, GC, Tm,
+divalent-cation correction. Within the 18-21 bp window the length whose Tm
+lands closest to the target is chosen; where an AT-rich template cannot
+reach the target inside that window, the achievable Tm is reported rather
+than the window being widened. Each primer is checked for length, GC, Tm,
 homopolymer runs, hairpins, 3' self-dimers, GC-rich 3' ends and mispriming
 elsewhere in the template.
 
@@ -398,7 +415,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           181 tests, no lab share required
+tests/           189 tests, no lab share required
 ```
 
 ## Giving it to a labmate

@@ -77,7 +77,7 @@ def _has_features(conn: sqlite3.Connection, plasmid_id: int,
 
 
 def find_backbone_for(conn: sqlite3.Connection, family: str, needs: set,
-                      limit: int = 60) -> dict | None:
+                      limit: int = 60, cfg: Config | None = None) -> dict | None:
     """Pick a backbone of the right family when none was named.
 
     Preferred: a plasmid of the requested vector family that already has the
@@ -85,6 +85,22 @@ def find_backbone_for(conn: sqlite3.Connection, family: str, needs: set,
     than it has to be - a smaller backbone is easier to amplify and leaves
     more room under the AAV packaging limit.
     """
+    # A named default first: the lab's standard backbone for this family is
+    # a better starting point than whatever scores highest, because it is the
+    # one people already have, have sequenced, and know works.
+    preferred = ""
+    if cfg is not None:
+        preferred = (cfg.default_aav_backbone if family == "AAV"
+                     else cfg.default_lenti_backbone if family == "lentiviral"
+                     else "")
+    if preferred:
+        row = conn.execute(
+            """SELECT * FROM plasmid WHERE name LIKE ? COLLATE NOCASE
+               AND circular = 1 ORDER BY seq_length ASC LIMIT 1""",
+            (f"{preferred}%",)).fetchone()
+        if row is not None and _has_features(conn, row["id"], needs):
+            return dict(row)
+
     rows = conn.execute(
         """SELECT * FROM plasmid
            WHERE seq_length >= ? AND circular = 1 AND available_template = 1
@@ -106,7 +122,8 @@ def find_backbone_for(conn: sqlite3.Connection, family: str, needs: set,
     return dict(fallback) if fallback else None
 
 
-def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None:
+def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec,
+                   cfg: Config | None = None) -> dict | None:
     row = None
     if spec.backbone_plasmid_id:
         # An explicit id is the user's choice; honour it as given.
@@ -144,7 +161,8 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None
     elif spec.vector:
         # No backbone named, but a vector family was asked for: choose one
         # rather than building a payload with no vector around it.
-        return find_backbone_for(conn, spec.vector, required_architecture(spec))
+        return find_backbone_for(conn, spec.vector,
+                                 required_architecture(spec), cfg=cfg)
     return dict(row) if row else None
 
 
@@ -154,7 +172,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
 
     # Stage 4: resolve modules against the inventory
     resolved = resolve(conn, spec)
-    backbone = _load_backbone(conn, spec)
+    backbone = _load_backbone(conn, spec, cfg)
 
     # Expand any DIO module into its cassette before assembling, so the
     # molecule that gets validated is the one that would actually be built.

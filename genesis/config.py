@@ -61,14 +61,24 @@ class Config:
         "BsrGI", "MluI", "NcoI", "SmaI", "ApaI", "ClaI", "BsaI", "BsmBI",
     )
     preferred_assembly_kit: str = "NEBuilder HiFi"
+    #: Backbone to reach for when an AAV is requested and none is named.
+    default_aav_backbone: str = "PP072"
+    default_lenti_backbone: str = ""
     include_transformation_steps: bool = True
     include_sequencing_steps: bool = True
 
     # --- Stage 9: primer design -----------------------------------------
     primer_tm_target: float = 60.0
     primer_tm_tolerance: float = 3.0
+    #: Addgene's PCR cloning protocol: the region that hybridises to the
+    #: template is 18-21 bp, which is "usually sufficient to give specificity
+    #: and to also be compatible with a standard PCR reaction".
+    #: https://www.addgene.org/protocols/pcr-cloning/
     primer_min_len: int = 18
-    primer_max_len: int = 36
+    primer_max_len: int = 21
+    #: Extra bases 5' of a restriction site, so the enzyme has something to
+    #: hold on to. Addgene: "usually 3-6bp".
+    primer_leader: str = "TTAATT"
     primer_max_gc: float = 0.65
     primer_min_gc: float = 0.35
     overlap_length: int = 25              # Gibson/HiFi homology arm

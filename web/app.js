@@ -661,6 +661,190 @@ function buildMapSvg(width, span, list, opts) {
  * designs saved before the server returned `codon_markers` draw exactly as
  * they always did, with no extra row and no empty legend.
  */
+/* --------------------------------------------------------------------------
+ * Circular plasmid map
+ *
+ * A plasmid is a circle, and a linear track implies the ends are ends. The
+ * difference is not cosmetic: a cassette that wraps the coordinate origin -
+ * which real pAAV backbones do constantly - looks broken on a linear map and
+ * obvious on a circular one.
+ *
+ * Forward features sit on the outer ring, reverse features on an inner ring,
+ * and anything translated carries an arrowhead at its 3' end so the direction
+ * of translation can be read off the picture.
+ * ------------------------------------------------------------------------ */
+
+/* Types that are translated, and so have a direction worth drawing. */
+var CODING_TYPES = {
+  CDS: 1, p2A: 1, trafficking_motif: 1, tag: 1, linker: 1, IRES: 1
+};
+
+function polar(cx, cy, r, f) {
+  var a = -Math.PI / 2 + 2 * Math.PI * f;           /* 0 at twelve o'clock */
+  return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+}
+
+function arcPath(cx, cy, r, from, to) {
+  var span = to - from;
+  if (span <= 0) span += 1;
+  if (span >= 0.999) span = 0.999;                  /* keep it an arc */
+  var a = polar(cx, cy, r, from), b = polar(cx, cy, r, from + span);
+  var large = span > 0.5 ? 1 : 0;
+  return 'M ' + a[0].toFixed(2) + ' ' + a[1].toFixed(2) +
+         ' A ' + r + ' ' + r + ' 0 ' + large + ' 1 ' +
+         b[0].toFixed(2) + ' ' + b[1].toFixed(2);
+}
+
+/* A triangle at `f`, pointing the way the feature is read. */
+function arrowHead(cx, cy, r, f, forward, fill) {
+  var tipF = f + (forward ? 0.004 : -0.004);
+  var tip = polar(cx, cy, r, tipF);
+  var a = polar(cx, cy, r + 4.5, f);
+  var b = polar(cx, cy, r - 4.5, f);
+  return svg('polygon', {
+    points: [tip, a, b].map(function (p) {
+      return p[0].toFixed(2) + ',' + p[1].toFixed(2);
+    }).join(' '),
+    fill: fill
+  });
+}
+
+function circularMap(length, items, opts) {
+  opts = opts || {};
+  var span = Math.max(Number(length) || 0, 1);
+  var list = (items || []).filter(function (f) {
+    return f && typeof f.start === 'number' && typeof f.end === 'number' &&
+      f.type !== 'primer_binding_site' && f.type !== 'unknown';
+  });
+
+  var host = h('div', { class: 'map-circular' });
+  var lastWidth = 0;
+
+  function draw() {
+    var w = Math.round(host.clientWidth) || 560;
+    if (w === lastWidth) return;
+    lastWidth = w;
+    clear(host);
+
+    var size = Math.max(Math.min(w, 560), 320);
+    var cx = size / 2, cy = size / 2;
+    var radius = size / 2 - 86;                     /* room for labels */
+    var node = svg('svg', {
+      width: '100%', viewBox: '0 0 ' + size + ' ' + size,
+      class: 'circ-svg', role: 'img',
+      'aria-label': (opts.label || 'construct') + ', ' + span + ' base pairs, circular'
+    });
+
+    node.appendChild(svg('circle', {
+      cx: cx, cy: cy, r: radius, fill: 'none',
+      class: 'circ-backbone', 'stroke-width': 2
+    }));
+
+    /* position 1, at the top */
+    node.appendChild(svg('line', {
+      x1: cx, y1: cy - radius - 9, x2: cx, y2: cy - radius + 5,
+      class: 'circ-origin'
+    }));
+    node.appendChild(svg('text', {
+      x: cx, y: cy - radius - 13, 'text-anchor': 'middle', class: 'circ-tick'
+    }, '1'));
+
+    var placed = [];
+    list.forEach(function (f) {
+      var from = (f.start % span) / span;
+      var to = (f.end % span) / span;
+      if (f.end - f.start >= span) { from = 0; to = 0.999; }
+      if (to <= from) to += 1;
+      var reverse = f.strand === -1;
+      var r = radius + (reverse ? -11 : 0);
+      var colour = colorFor(f.type);
+
+      var g = svg('g', { class: 'circ-feature' });
+      g.appendChild(svg('title', null,
+        f.name + ' · ' + f.type + ' · ' + bp(f.end - f.start) +
+        ' · ' + (reverse ? 'reverse' : 'forward') + ' strand · ' +
+        (f.start + 1) + '–' + f.end));
+      g.appendChild(svg('path', {
+        d: arcPath(cx, cy, r, from, to), fill: 'none',
+        stroke: colour, 'stroke-width': 8, 'stroke-linecap': 'butt'
+      }));
+      /* direction of translation, at the 3' end of the coding sequence */
+      if (CODING_TYPES[f.type]) {
+        g.appendChild(arrowHead(cx, cy, r, reverse ? from : to % 1,
+                                !reverse, colour));
+      }
+      node.appendChild(g);
+      placed.push({ mid: ((from + to) / 2) % 1, f: f, r: r, colour: colour });
+    });
+
+    /* labels outside the circle, nudged apart so none overprint */
+    placed.sort(function (a, b) { return a.mid - b.mid; });
+    var usedLeft = [], usedRight = [];
+    placed.forEach(function (item) {
+      if (item.f.end - item.f.start < span * 0.01) return;
+      var anchor = polar(cx, cy, item.r + 5, item.mid);
+      var out = polar(cx, cy, radius + 16, item.mid);
+      var right = out[0] >= cx;
+      var used = right ? usedRight : usedLeft;
+      var y = out[1];
+      while (used.some(function (v) { return Math.abs(v - y) < 11; })) {
+        y += right ? 11 : -11;
+      }
+      used.push(y);
+      var x = right ? cx + radius + 18 : cx - radius - 18;
+      node.appendChild(svg('polyline', {
+        points: anchor[0].toFixed(1) + ',' + anchor[1].toFixed(1) + ' ' +
+                out[0].toFixed(1) + ',' + out[1].toFixed(1) + ' ' +
+                x.toFixed(1) + ',' + y.toFixed(1),
+        class: 'circ-leader', fill: 'none'
+      }));
+      node.appendChild(svg('text', {
+        x: right ? x + 4 : x - 4, y: y + 3,
+        'text-anchor': right ? 'start' : 'end',
+        class: 'circ-label', fill: item.colour
+      }, item.f.name || item.f.type));
+    });
+
+    (opts.markers || []).forEach(function (m) {
+      if (typeof m.start !== 'number') return;
+      var f = (m.start % span) / span;
+      var a = polar(cx, cy, radius - 16, f), b = polar(cx, cy, radius + 5, f);
+      var g = svg('g', { class: 'circ-codon ' + ('mark-' + m.kind) });
+      g.appendChild(svg('title', null,
+        m.label + ' · ' + m.module + ' · bp ' + (m.start + 1)));
+      g.appendChild(svg('line', {
+        x1: a[0].toFixed(1), y1: a[1].toFixed(1),
+        x2: b[0].toFixed(1), y2: b[1].toFixed(1)
+      }));
+      node.appendChild(g);
+    });
+
+    node.appendChild(svg('text', {
+      x: cx, y: cy - 2, 'text-anchor': 'middle', class: 'circ-name'
+    }, opts.label || ''));
+    node.appendChild(svg('text', {
+      x: cx, y: cy + 14, 'text-anchor': 'middle', class: 'circ-size'
+    }, bp(span)));
+    node.appendChild(svg('text', {
+      x: cx, y: cy + 28, 'text-anchor': 'middle', class: 'circ-topo'
+    }, 'circular'));
+
+    host.appendChild(node);
+  }
+
+  // Draw once up front: the element is not in the document yet, so a
+  // ResizeObserver has nothing to report and would leave the map blank
+  // until something happened to resize it.
+  draw();
+  if (typeof ResizeObserver === 'function') new ResizeObserver(draw).observe(host);
+  else requestAnimationFrame(draw);
+
+  var note = h('p', { class: 'map-note muted small' },
+    'Outer ring reads forward, inner ring reverse. Arrowheads point the way ' +
+    'a coding sequence is translated. Position 1 is at the top.');
+  return h('div', null, host, note);
+}
+
 function featureMap(length, items, opts) {
   opts = opts || {};
   var span = Math.max(Number(length) || 0, 1);
@@ -2194,9 +2378,39 @@ function renderConstruct(c) {
         seq ? 'every base and every element of the designed molecule'
             : 'this plan carries no sequence')));
 
-  card.appendChild(featureMap(c.length, layout, {
-    label: c.name, circular: !!c.circular, markers: c.codon_markers
-  }));
+  // A circular plasmid is shown as one by default; the linear track is
+  // still there for reading coordinates off, behind a toggle.
+  var mapHost = h('div', { class: 'map-host' });
+  function drawMap(mode) {
+    clear(mapHost);
+    mapHost.appendChild(mode === 'circular'
+      ? circularMap(c.length, layout,
+          { label: c.name, markers: c.codon_markers })
+      : featureMap(c.length, layout,
+          { label: c.name, circular: !!c.circular,
+            markers: c.codon_markers }));
+  }
+  if (c.circular) {
+    var mode = 'circular';
+    var toggle = h('div', { class: 'map-toggle' });
+    ['circular', 'linear'].forEach(function (option) {
+      var b = h('button', {
+        type: 'button',
+        class: option === mode ? 'active' : '',
+        onclick: function () {
+          mode = option;
+          [].forEach.call(toggle.children, function (child) {
+            child.className = child.textContent === mode ? 'active' : '';
+          });
+          drawMap(mode);
+        }
+      }, option);
+      toggle.appendChild(b);
+    });
+    card.appendChild(toggle);
+  }
+  card.appendChild(mapHost);
+  drawMap(c.circular ? 'circular' : 'linear');
 
   if (!seq) {
     card.appendChild(h('p', { class: 'muted' },

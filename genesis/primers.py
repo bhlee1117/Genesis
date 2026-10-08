@@ -66,7 +66,14 @@ class Junction:
 
 def pick_anneal(template: str, start: int, direction: str, cfg: Config,
                 circular: bool = False) -> str:
-    """Grow an annealing region from `start` until it reaches the target Tm.
+    """Choose the region of the primer that hybridises to the template.
+
+    Length is held inside the window Addgene specifies for PCR cloning
+    (18-21 bp by default), and within that window the length whose melting
+    temperature sits closest to the target is taken. Only this part of the
+    oligo is measured: the Tm that matters is "the Tm of the portion of the
+    primer that hybridizes to the sequence to be amplified", not the Tm of
+    the whole thing with its tail.
 
     `direction` 'F' extends rightwards from `start`; 'R' extends leftwards
     and the returned sequence is already reverse-complemented.
@@ -116,6 +123,10 @@ def validate_primer(primer: Primer, template: str, cfg: Config,
         elif t > cfg.primer_tm_target + cfg.primer_tm_tolerance + 4:
             w.append(f"annealing Tm {t:.1f} C is well above the {cfg.primer_tm_target:.0f} C target")
 
+    if not (cfg.primer_min_len <= len(anneal) <= cfg.primer_max_len):
+        w.append(f"the hybridising region is {len(anneal)} nt, outside the "
+                 f"{cfg.primer_min_len}-{cfg.primer_max_len} nt window this "
+                 f"protocol uses")
     if len(full) > 60:
         w.append(f"oligo is {len(full)} nt; synthesis cost and error rate rise "
                  f"sharply past ~60 nt")
@@ -204,16 +215,66 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     return fwd, rev
 
 
+#: Alternatives tried when the default leader would create a site of its
+#: own. All are 6 bp with no run longer than two, so they do not trip the
+#: homopolymer check either.
+_LEADERS = ("TTAATT", "ATCTAT", "TACTAC", "AGTAGT", "CATCAT", "GTAGTA")
+
+
+def choose_leader(site: str, cfg: Config, stocked: tuple = ()) -> str:
+    """Pick the extra bases that sit 5' of a restriction site.
+
+    Addgene calls for 3-6 bp so the enzyme has something to grip. The choice
+    is not arbitrary: a leader that happens to complete another recognition
+    sequence where it abuts the site would put an extra cut in the amplicon,
+    so each candidate is checked against the site it precedes and against
+    every enzyme the lab stocks.
+    """
+    from .enzymes import CATALOG
+    from .seqtools import find_all
+
+    candidates = [cfg.primer_leader] + [x for x in _LEADERS
+                                        if x != cfg.primer_leader]
+    names = stocked or tuple(CATALOG)
+    for leader in candidates:
+        junction = leader + site
+        clash = False
+        for name in names:
+            enzyme = CATALOG.get(name)
+            if enzyme is None:
+                continue
+            # Count distinct cut positions. A palindromic site is found by
+            # both the forward and the reverse-complement search at the same
+            # place, and counting that as two would reject every leader.
+            positions = set(find_all(junction, enzyme.site))
+            positions |= set(find_all(junction, revcomp(enzyme.site)))
+            expected = 1 if enzyme.site in (site, revcomp(site)) else 0
+            if len(positions) > expected:
+                clash = True
+                break
+        if not clash:
+            return leader
+    return cfg.primer_leader
+
+
 def design_re_pair(fragment_name: str, template: str, start: int, end: int,
                    left_enzyme: str, right_enzyme: str, cfg: Config,
                    circular_template: bool = False) -> tuple[Primer, Primer]:
-    """Primers that add restriction sites plus a 5' clamp for efficient cutting."""
+    """Primers that add restriction sites, with a leader so they can be cut.
+
+    Structure follows Addgene's PCR cloning protocol: a 3-6 bp leader, then
+    the 6-8 bp recognition site, then the 18-21 bp hybridising region.
+    """
     from .enzymes import CATALOG
-    clamp = "TTTT"
     f_anneal = pick_anneal(template, start, "F", cfg, circular_template)
     r_anneal = pick_anneal(template, end, "R", cfg, circular_template)
-    f_tail = clamp + CATALOG[left_enzyme].site if left_enzyme else ""
-    r_tail = clamp + revcomp(CATALOG[right_enzyme].site) if right_enzyme else ""
+    f_tail = r_tail = ""
+    if left_enzyme:
+        site = CATALOG[left_enzyme].site
+        f_tail = choose_leader(site, cfg, cfg.stocked_enzymes) + site
+    if right_enzyme:
+        site = revcomp(CATALOG[right_enzyme].site)
+        r_tail = choose_leader(site, cfg, cfg.stocked_enzymes) + site
 
     fwd = Primer(f"{fragment_name}-F", f_tail + f_anneal, f_anneal, f_tail, "F",
                  fragment_name, start, end)
