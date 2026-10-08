@@ -2140,3 +2140,127 @@ class TestBackboneInsertion(unittest.TestCase):
                        for i in construct.layout]
         result = missing_elements(annotations, "AAV")
         self.assertTrue(result["complete"], result)
+
+
+# --------------------------------------------------------------------------
+class TestPayloadArcGeometry(unittest.TestCase):
+    """Which arc of a circular backbone the payload replaces."""
+
+    def _ann(self, *spec):
+        return [{"feature_type": t, "name": n, "start": s, "end": e,
+                 "strand": 1} for t, n, s, e in spec]
+
+    def test_anchors_outside_the_itrs(self):
+        """The pAAV case: ori and AmpR sit outside the ITRs, so the span from
+        the first ITR to the last origin is the whole plasmid."""
+        from genesis.construct import payload_arc
+        ann = self._ann(("AAV_ITR", "ITR", 34, 164),
+                        ("promoter", "hSyn", 208, 656),
+                        ("CDS", "payload", 700, 4000),
+                        ("AAV_ITR", "ITR", 4807, 4937),
+                        ("origin", "f1 ori", 5022, 5478),
+                        ("resistance", "AmpR", 5864, 6725),
+                        ("origin", "ori", 6895, 7484))
+        self.assertEqual(payload_arc(ann, 7522), (164, 4807))
+
+    def test_a_cassette_that_wraps_the_origin(self):
+        from genesis.construct import payload_arc
+        ann = self._ann(("CDS", "payload", 0, 1300),
+                        ("AAV_ITR", "ITR", 4602, 4743),
+                        ("origin", "ori", 5421, 5876),
+                        ("resistance", "AmpR", 5901, 6867),
+                        ("AAV_ITR", "ITR", 9292, 9422),
+                        ("promoter", "p", 9441, 9756))
+        arc = payload_arc(ann, 9788)
+        self.assertEqual(arc, (9422, 4602))
+        self.assertGreater(arc[0], arc[1], "this arc must wrap")
+
+    def test_without_itrs_the_payload_is_the_complement_of_the_machinery(self):
+        from genesis.construct import payload_arc
+        ann = self._ann(("promoter", "p", 100, 500),
+                        ("CDS", "g", 500, 2000),
+                        ("origin", "ori", 2500, 3000),
+                        ("resistance", "AmpR", 3000, 3900))
+        self.assertEqual(payload_arc(ann, 5000), (3900, 2500))
+
+    def test_no_anchors_at_all(self):
+        from genesis.construct import payload_arc
+        self.assertIsNone(payload_arc(
+            self._ann(("CDS", "g", 0, 500)), 1000))
+
+
+# --------------------------------------------------------------------------
+class TestRecipientArchitecture(unittest.TestCase):
+    """A recipient must share the architecture, not just a few genes."""
+
+    def setUp(self):
+        import hashlib
+        self.conn = connect(":memory:")
+        self.cfg = Config()
+        self.shared = orf(200, 1100)
+        self.part = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum, seq_length)
+               VALUES ('CDS','shared',?,?,?)""",
+            (self.shared, hashlib.sha256(self.shared.encode()).hexdigest(),
+             len(self.shared))).lastrowid
+
+    def _plasmid(self, name, annotations):
+        body = self.shared + rand_seq(4000, 1101)
+        pl = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified, available_template)
+               VALUES (?,'t',?,?,?,1,'sequence_verified',1)""",
+            (name, body, len(body), name)).lastrowid
+        for ftype, label in annotations:
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,0,30,1)""",
+                (pl, ftype, label))
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,0,?,1)""",
+            (self.part, pl, len(self.shared)))
+        self.conn.commit()
+        return pl
+
+    def test_a_plasmid_without_lox_sites_is_not_offered(self):
+        """The Fsyn-Solaris case: shares a gene, has no Cre-lox system."""
+        from genesis.swap import rank_parents
+        self._plasmid("no-lox", [("promoter", "hSyn"), ("CDS", "shared")])
+        with_lox = self._plasmid(
+            "has-lox", [("promoter", "hSyn"), ("lox_site", "loxP"),
+                        ("lox_site", "lox2272")])
+        ranked = rank_parents(self.conn, [self.part], self.cfg,
+                              require_types={"lox_site"})
+        self.assertEqual([p.plasmid_id for p in ranked], [with_lox])
+
+    def test_without_a_requirement_both_are_offered(self):
+        from genesis.swap import rank_parents
+        self._plasmid("no-lox", [("CDS", "shared")])
+        self._plasmid("has-lox", [("lox_site", "loxP")])
+        self.assertEqual(len(rank_parents(self.conn, [self.part], self.cfg)), 2)
+
+    def test_a_design_needing_cre_lox_requires_lox_sites(self):
+        from genesis.design import required_architecture
+        spec = ConstructSpec.from_dict(
+            {"name": "x", "vector": "AAV",
+             "modules": [{"type": "DIO"}, {"type": "CDS", "name": "g"}]})
+        self.assertEqual(required_architecture(spec), {"lox_site", "AAV_ITR"})
+
+    def test_a_plain_design_requires_nothing_special(self):
+        from genesis.design import required_architecture
+        spec = ConstructSpec.from_dict(
+            {"name": "x", "modules": [{"type": "CDS", "name": "g"}]})
+        self.assertEqual(required_architecture(spec), set())
+
+    def test_no_suitable_recipient_says_so_rather_than_picking_a_bad_one(self):
+        from genesis.swap import analyse_swap
+        self._plasmid("no-lox", [("CDS", "shared")])
+        result = analyse_swap(
+            self.conn, [{"type": "CDS", "part_id": self.part,
+                         "part_name": "shared"}],
+            self.cfg, require_types={"lox_site"})
+        self.assertIsNotNone(result)
+        self.assertFalse(result.feasible)
+        self.assertTrue(any("architecture it needs" in n for n in result.notes),
+                        result.notes)

@@ -47,6 +47,65 @@ def plasmid_family(conn: sqlite3.Connection, plasmid_id: int,
     return classify_vector(ann, name)["family"]
 
 
+def required_architecture(spec: ConstructSpec) -> set:
+    """Structural features a recipient must already have for this design.
+
+    A Cre-lox construct has to start from a plasmid that already carries lox
+    sites, and an AAV from one that already carries ITRs. Sharing a few
+    coding sequences is not enough: a plasmid with the right genes and the
+    wrong architecture cannot be edited into this construct by swapping one
+    region.
+    """
+    needs: set = set()
+    types = {canonical_feature_type(
+        m["type"] if isinstance(m, dict) else m.type) for m in spec.modules}
+    if "Cre-lox" in types:
+        needs.add("lox_site")
+    if spec.vector == "AAV":
+        needs.add("AAV_ITR")
+    return needs
+
+
+def _has_features(conn: sqlite3.Connection, plasmid_id: int,
+                  needs: set) -> bool:
+    if not needs:
+        return True
+    present = {r["feature_type"] for r in conn.execute(
+        "SELECT DISTINCT feature_type FROM annotation WHERE plasmid_id = ?",
+        (plasmid_id,))}
+    return needs <= present
+
+
+def find_backbone_for(conn: sqlite3.Connection, family: str, needs: set,
+                      limit: int = 60) -> dict | None:
+    """Pick a backbone of the right family when none was named.
+
+    Preferred: a plasmid of the requested vector family that already has the
+    architecture this design needs, is sequence-verified, and is no larger
+    than it has to be - a smaller backbone is easier to amplify and leaves
+    more room under the AAV packaging limit.
+    """
+    rows = conn.execute(
+        """SELECT * FROM plasmid
+           WHERE seq_length >= ? AND circular = 1 AND available_template = 1
+             AND EXISTS (SELECT 1 FROM annotation a
+                         WHERE a.plasmid_id = plasmid.id
+                           AND a.feature_type = 'origin')
+             AND EXISTS (SELECT 1 FROM annotation a
+                         WHERE a.plasmid_id = plasmid.id
+                           AND a.feature_type = 'resistance')
+           ORDER BY (verified != 'unverified') DESC, seq_length ASC
+           LIMIT 400""", (MIN_BACKBONE_LENGTH,)).fetchall()
+    fallback = None
+    for row in rows:
+        if family and plasmid_family(conn, row["id"], row["name"]) != family:
+            continue
+        if _has_features(conn, row["id"], needs):
+            return dict(row)
+        fallback = fallback or row
+    return dict(fallback) if fallback else None
+
+
 def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None:
     row = None
     if spec.backbone_plasmid_id:
@@ -82,6 +141,10 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec) -> dict | None
                     break
         if row is None:
             row = rows[0] if rows else None
+    elif spec.vector:
+        # No backbone named, but a vector family was asked for: choose one
+        # rather than building a payload with no vector around it.
+        return find_backbone_for(conn, spec.vector, required_architecture(spec))
     return dict(row) if row else None
 
 
@@ -95,21 +158,27 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
 
     # Expand any DIO module into its cassette before assembling, so the
     # molecule that gets validated is the one that would actually be built.
-    resolved, dio_notes = expand_dio(resolved)
-
-    # Stage 4: build the intended final molecule. With a backbone the
-    # payload replaces that plasmid's existing cassette, so the result is a
-    # real plasmid carrying its ITRs, WPRE, polyA, origin and resistance -
-    # not the payload bolted onto the end of one.
-    backbone_annotations = []
+    # When the recipient already carries lox sites, the cassette is the
+    # vector's and the payload goes inside it.
+    from .construct import backbone_cassette
+    backbone_rows = []
     if backbone:
-        backbone_annotations = [
+        backbone_rows = [
             {"feature_type": r["feature_type"], "name": r["name"],
              "start": r["start"], "end": r["end"], "strand": r["strand"]}
             for r in conn.execute(
                 """SELECT feature_type, name, start, end, strand
                    FROM annotation WHERE plasmid_id = ? ORDER BY start""",
                 (backbone["id"],))]
+    reuse_sites = backbone_cassette(backbone_rows) is not None
+    resolved, dio_notes = expand_dio(resolved, sites_from_backbone=reuse_sites)
+
+    # Stage 4: build the intended final molecule. With a backbone the
+    # payload replaces that plasmid's existing cassette, so the result is a
+    # real plasmid carrying its ITRs, WPRE, polyA, origin and resistance -
+    # not the payload bolted onto the end of one.
+    backbone_annotations = backbone_rows
+    if backbone:
         spec_types = {canonical_feature_type(
             m["type"] if isinstance(m, dict) else m.type) for m in spec.modules}
         construct = assemble_into_backbone(
@@ -152,7 +221,11 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # Stage 5: validate before planning anything
     # Compare against the expanded architecture: after a DIO expansion the
     # assembled order legitimately differs from the order that was typed.
+    # Only the modules this design places are compared against the
+    # specification; the backbone's own features are not part of the request.
     expected = [rm.feature_type for rm in resolved if rm.seq] or None
+    placed_types = [i["type"] for i in construct.layout
+                    if not i.get("from_backbone")]
     issues = validate_construct(construct, expected_order=expected,
                                 stocked_enzymes=list(cfg.stocked_enzymes))
 
@@ -172,11 +245,16 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                if inferred["evidence"] else "")))
 
     if family in ("AAV", "lentiviral"):
+        backbone_types = {a["feature_type"] for a in backbone_annotations}
         for element in completeness["missing_required"]:
+            from_backbone = backbone is not None and element not in backbone_types
+            where = (f"; the backbone {backbone['name']} has none annotated "
+                     f"either, so check whether it is really absent or just "
+                     f"unlabelled" if from_backbone else "")
             issues.append(Issue(
                 "error", "packaging",
                 f"{_article(completeness['label'])} needs {element}, which "
-                f"this construct does not have"))
+                f"this construct does not have{where}"))
         for element in completeness["missing_named"]:
             issues.append(Issue(
                 "error", "packaging",
@@ -211,7 +289,9 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
 
     # The usual real-world route: start from the closest existing plasmid and
     # swap one region, rather than rebuilding the construct from parts.
-    analysis = analyse_swap(conn, module_rows, cfg)
+    analysis = analyse_swap(conn, module_rows, cfg,
+                            require_types=required_architecture(spec),
+                            require_family=spec.vector)
     # Only draw a scheme for a swap that is actually on offer; a rejected
     # analysis still carries a recipient, and drawing it would illustrate
     # a plan nobody should follow.
@@ -288,7 +368,8 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         "scheme": scheme,
         "closest_parents": [p.to_dict() for p in rank_parents(
             conn, [m["part_id"] for m in module_rows if m["part_id"]], cfg,
-            limit=6)],
+            limit=6, require_types=required_architecture(spec),
+            require_family=spec.vector)],
         "routes": [r.to_dict(cfg) for r in routes],
     }
 

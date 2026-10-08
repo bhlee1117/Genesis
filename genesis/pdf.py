@@ -573,3 +573,114 @@ def plasmid_track(doc: "PDF", title: str, subtitle: str, length: int,
     if overflow:
         doc.paragraph("also: " + ", ".join(overflow[:10]), 7, gray=0.5)
     doc.y -= 4
+
+
+# --------------------------------------------------------------------------
+# Circular plasmid maps
+# --------------------------------------------------------------------------
+
+import math as _math
+
+
+def _polar(cx, cy, radius, fraction):
+    """Point on a circle. Zero is at the top and angles run clockwise, which
+    is how plasmid maps are always drawn."""
+    angle = -_math.pi / 2 + 2 * _math.pi * fraction
+    return cx + radius * _math.cos(angle), cy + radius * _math.sin(angle)
+
+
+def _arc_path(doc, cx, cy, radius, start_f, end_f, width, rgb):
+    """Stroke an arc as a run of short segments.
+
+    PDF has Bezier curves but no arc operator, and approximating an arc with
+    Beziers for a shape this small buys nothing over flattening it.
+    """
+    span = (end_f - start_f) % 1.0 or 1.0
+    steps = max(int(span * 180), 2)
+    pts = [_polar(cx, cy, radius, start_f + span * i / steps)
+           for i in range(steps + 1)]
+    path = f"{pts[0][0]:.2f} {pts[0][1]:.2f} m " + " ".join(
+        f"{x:.2f} {y:.2f} l" for x, y in pts[1:])
+    doc.pages[-1].ops.append(
+        f"q {rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} RG {width} w 1 J "
+        f"{path} S Q")
+
+
+def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
+                 features: list, radius: float = 108,
+                 codon_marks: list | None = None):
+    """Draw a plasmid the way a plasmid is drawn: as a circle.
+
+    A linear track is fine for comparing two parents side by side, but it
+    misrepresents the molecule: it implies the ends are ends, when in a
+    plasmid they are the same point. A construct whose cassette wraps the
+    origin looks broken on a linear map and obvious on a circular one.
+    """
+    if not length:
+        return
+    needed = radius * 2 + 86
+    doc._ensure(needed)
+
+    doc.y -= 14
+    doc.text_at(title, doc.ml, doc.y, "F2", 9.5)
+    if subtitle:
+        doc.text_at(subtitle, doc.ml + text_width(title, "F2", 9.5) + 8,
+                    doc.y, "F1", 8, rgb=(0.45, 0.45, 0.48))
+
+    cx = doc.ml + doc.content_width / 2
+    cy = doc.y - radius - 16
+    doc.y = cy - radius - 26
+
+    # backbone circle
+    _arc_path(doc, cx, cy, radius, 0.0, 1.0, 1.2, (0.78, 0.78, 0.80))
+
+    # origin tick at twelve o'clock
+    ox, oy = _polar(cx, cy, radius + 7, 0.0)
+    doc.line(cx, cy + radius - 4, ox, oy, rgb=(0.55, 0.55, 0.58), width=0.7)
+    doc.text_at("1", cx, cy + radius + 10, "F1", 6.4, rgb=(0.5, 0.5, 0.5),
+                centre=True)
+
+    labelled = []
+    for f in features:
+        start_f = (f["start"] % length) / length
+        end_f = (f["end"] % length) / length or 1.0
+        if f["end"] - f["start"] >= length:
+            start_f, end_f = 0.0, 1.0
+        inner = f.get("strand", 1) == -1
+        r = radius - (9 if inner else 0)
+        _arc_path(doc, cx, cy, r, start_f, end_f, 7.5,
+                  _feature_rgb(f["feature_type"]))
+        mid = start_f + (((end_f - start_f) % 1.0) or 1.0) / 2
+        labelled.append((mid % 1.0, f, r))
+
+    # labels outside the circle, nudged apart so they stay readable
+    labelled.sort(key=lambda item: item[0])
+    last_y = {}
+    for mid, f, r in labelled:
+        if f["end"] - f["start"] < length * 0.012:
+            continue
+        lx, ly = _polar(cx, cy, radius + 13, mid)
+        right = lx >= cx
+        name = (f["name"] or f["feature_type"])[:26]
+        w = text_width(name, "F1", 6.6)
+        side = round(ly / 9)
+        while side in last_y:
+            side -= 1
+        last_y[side] = True
+        ly = side * 9
+        doc.line(*_polar(cx, cy, r + 4, mid), lx, ly, rgb=(0.6, 0.6, 0.62),
+                 width=0.4)
+        doc.text_at(name, lx + (3 if right else -3 - w), ly - 2, "F1", 6.6,
+                    rgb=_feature_rgb(f["feature_type"]))
+
+    for mark in codon_marks or []:
+        mf = (mark["start"] % length) / length
+        rgb = CODON_COLOURS.get(mark["kind"], (0.4, 0.4, 0.4))
+        x1, y1 = _polar(cx, cy, radius - 14, mf)
+        x2, y2 = _polar(cx, cy, radius + 3, mf)
+        doc.line(x1, y1, x2, y2, rgb=rgb, width=1.0)
+
+    doc.text_at(f"{length:,} bp", cx, cy + 2, "F2", 9, centre=True)
+    doc.text_at("circular", cx, cy - 10, "F1", 7, rgb=(0.5, 0.5, 0.52),
+                centre=True)
+    doc.y -= 6

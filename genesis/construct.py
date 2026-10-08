@@ -531,7 +531,37 @@ def resolve_mode(value: str) -> RecombinaseMode:
     return RECOMBINASE_MODES[key]
 
 
-def expand_dio(resolved: list[ResolvedModule]) -> tuple[list[ResolvedModule], list[str]]:
+def backbone_cassette(annotations: list[dict]) -> dict | None:
+    """Find an existing recombinase cassette in a recipient plasmid.
+
+    A pAAV-hSyn-DIO backbone already carries its lox sites. Building a new
+    construct in it means replacing what sits *between* them, not adding a
+    second cassette - four more lox sites would give Cre several ways to cut
+    and none of them the intended one.
+
+    Returns the interior of the cassette: the span between the innermost
+    sites, which is where a new payload goes.
+    """
+    sites = sorted((a for a in annotations if a["feature_type"] == "lox_site"),
+                   key=lambda a: a["start"])
+    if len(sites) < 4:
+        return None
+    names = {a["name"].lower() for a in sites}
+    if len(names) < 2:
+        return None          # a cassette needs two different site types
+    interior_start = sites[1]["end"]
+    interior_end = sites[-2]["start"]
+    if interior_end <= interior_start:
+        return None
+    return {"start": interior_start, "end": interior_end,
+            "sites": [a["name"] for a in sites],
+            "flanks": [sites[0]["name"], sites[1]["name"],
+                       sites[-2]["name"], sites[-1]["name"]]}
+
+
+def expand_dio(resolved: list[ResolvedModule],
+               sites_from_backbone: bool = False
+               ) -> tuple[list[ResolvedModule], list[str]]:
     """Turn a Cre-lox module into the cassette it actually denotes.
 
     Cre-lox is an architecture, not a part. It encloses the coding sequence
@@ -585,8 +615,9 @@ def expand_dio(resolved: list[ResolvedModule]) -> tuple[list[ResolvedModule], li
                                   seq if strand == 1 else revcomp(seq),
                                   "lox_site", [], [])
 
-        out.append(site(*mode.outer, 1))
-        out.append(site(*mode.inner, 1))
+        if not sites_from_backbone:
+            out.append(site(*mode.outer, 1))
+            out.append(site(*mode.inner, 1))
 
         # An inverted payload comes back in reverse order, each module on the
         # opposite strand, because the whole block is flipped as one.
@@ -602,8 +633,26 @@ def expand_dio(resolved: list[ResolvedModule]) -> tuple[list[ResolvedModule], li
                     **{**rm_payload.module.to_dict(), "orientation": "reverse"})
             out.append(flipped)
 
-        out.append(site(*mode.outer, -1))
-        out.append(site(*mode.inner, -1))
+        if not sites_from_backbone:
+            out.append(site(*mode.outer, -1))
+            out.append(site(*mode.inner, -1))
+            notes.append(
+                f"{mode.label} expanded to {mode.outer[0]} - {mode.inner[0]} "
+                f"- [" + " + ".join(p.part_name for p in payload) +
+                (" inverted" if mode.inverted else " forward") +
+                f"] - {mode.outer[0]}' - {mode.inner[0]}'; {mode.description}")
+            i = j
+            continue
+
+        notes.append(
+            f"the backbone already carries a recombinase cassette, so the "
+            f"payload (" + " + ".join(p.part_name for p in payload) +
+            (", inverted" if mode.inverted else ", forward") +
+            ") goes inside the existing lox sites rather than bringing its "
+            "own; adding a second set would give Cre several ways to cut and "
+            "none of them the intended one")
+        i = j
+        continue
 
         notes.append(
             f"{mode.label} expanded to {mode.outer[0]} - {mode.inner[0]} - [" +
@@ -712,29 +761,54 @@ CASSETTE_TYPES = {"promoter", "enhancer", "CDS", "Cre-lox", "DIO", "lox_site",
 VECTOR_TYPES = {"AAV_ITR", "origin", "resistance"}
 
 
-def vector_arc(annotations: list[dict], length: int) -> tuple | None:
-    """The arc of a circular backbone that must be kept, as ``(start, end)``.
+def payload_arc(annotations: list[dict], length: int) -> tuple | None:
+    """The arc of a circular backbone that a new payload replaces.
 
-    A transfer plasmid has two halves: the vector half, carrying the origin
-    and the resistance marker that let it be grown, and the payload half,
-    carrying the expression cassette. In an AAV the ITRs sit at the boundary
-    between them and belong to the vector half, because the payload has to
-    end up *between* the ITRs once the molecule is circular.
+    Returns ``(start, end)`` in the backbone's own coordinates. ``end`` may
+    be *less* than ``start``, meaning the arc wraps the coordinate origin,
+    which real plasmids do constantly.
 
-    The cassette frequently wraps the origin of the coordinate system - in
-    one of this lab's pAAV backbones the promoter is at 9441 and its own CDS
-    at 0 - so the payload cannot be described as a single ``start..end``
-    slice. Describing the *kept* arc instead works in both cases: whatever
-    is not kept is what the new payload replaces.
+    A transfer plasmid is two arcs. One carries the expression cassette; the
+    other carries the origin and resistance marker that let the plasmid be
+    grown. In an AAV the ITRs sit at the boundary, and the payload must end
+    up between them.
+
+    Taking the span from the first anchor to the last is wrong whenever the
+    anchors sit on opposite sides of the payload, which in a pAAV they
+    always do: in PP072 the first ITR is at 34 and the last origin at 7484,
+    so that span is the entire plasmid and would swallow the cassette it was
+    supposed to find.
     """
-    anchors = [a for a in annotations if a["feature_type"] in VECTOR_TYPES]
+    anchors = [a for a in annotations
+               if a["feature_type"] in ("origin", "resistance")]
+    itrs = sorted((a for a in annotations if a["feature_type"] == "AAV_ITR"),
+                  key=lambda a: a["start"])
     if not anchors:
         return None
-    start = min(a["start"] for a in anchors)
-    end = max(a["end"] for a in anchors)
-    if end <= start or (end - start) >= length:
+
+    def arc_contains(lo: int, hi: int, feature: dict) -> bool:
+        """Is this feature inside the arc lo -> hi, which may wrap?"""
+        if lo <= hi:
+            return lo <= feature["start"] and feature["end"] <= hi
+        return feature["start"] >= lo or feature["end"] <= hi
+
+    if len(itrs) >= 2:
+        left, right = itrs[0], itrs[-1]
+        between = (left["end"], right["start"])
+        outside = (right["end"], left["start"])
+        inside_anchors = sum(1 for a in anchors if arc_contains(*between, a))
+        outside_anchors = sum(1 for a in anchors if arc_contains(*outside, a))
+        # The payload is in the arc that does *not* hold the machinery.
+        if outside_anchors >= inside_anchors:
+            return between
+        return outside
+
+    # No ITRs: the payload is everything that is not the vector machinery.
+    lo = min(a["start"] for a in anchors)
+    hi = max(a["end"] for a in anchors)
+    if hi - lo >= length:
         return None
-    return start, end
+    return (hi, lo)
 
 
 def cassette_span(annotations: list[dict], replace_types: set) -> tuple | None:
@@ -794,21 +868,21 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
     payload = "".join(payload_parts)
 
     total = len(backbone_seq)
-    arc = vector_arc(backbone_annotations, total)
+    arc = payload_arc(backbone_annotations, total)
 
     if arc is None:
         rotation = 0
         arc_end = total
         warnings.append(
-            "the backbone has no ITR, origin or resistance annotated, so the "
+            "the backbone has no origin or resistance annotated, so the "
             "insertion point was taken from its annotated cassette alone; "
             "check it before building this")
     else:
-        keep_start, keep_end = arc
-        # Rotate so the payload region starts at 0 and the vector arc
-        # (ITRs, origin, resistance) sits at the end.
-        rotation = keep_end
-        arc_end = total - (keep_end - keep_start)
+        # Rotate so the payload arc starts at 0 and the vector machinery
+        # sits at the end, which makes the arc contiguous even when it
+        # wrapped the coordinate origin.
+        rotation = arc[0]
+        arc_end = (arc[1] - arc[0]) % total or total
 
     def rot(pos: int) -> int:
         return (pos - rotation) % total
@@ -830,6 +904,36 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                 f"boundary and was not carried over")
             continue
         rotated.append({**a, "start": start, "end": end})
+
+    # If the backbone already has a recombinase cassette, the payload
+    # belongs inside it: the lox sites are part of the vector and stay.
+    existing = backbone_cassette(rotated)
+    if existing is not None and existing["end"] <= arc_end:
+        seq = (rotated_seq[:existing["start"]] + payload
+               + rotated_seq[existing["end"]:])
+        shift = len(payload) - (existing["end"] - existing["start"])
+        layout: list[dict] = []
+        for a in rotated:
+            if a["start"] >= existing["start"] and a["end"] <= existing["end"]:
+                continue
+            offset = shift if a["start"] >= existing["end"] else 0
+            if a["end"] <= existing["start"] or a["start"] >= existing["end"]:
+                layout.append({"name": a["name"], "type": a["feature_type"],
+                               "start": a["start"] + offset,
+                               "end": a["end"] + offset,
+                               "strand": a.get("strand", 1),
+                               "from_backbone": True})
+        for item in payload_layout:
+            layout.append({**item,
+                           "start": item["start"] + existing["start"],
+                           "end": item["end"] + existing["start"],
+                           "from_backbone": False})
+        layout.sort(key=lambda i: (i["start"], i["end"]))
+        warnings.append(
+            "the payload was placed inside the backbone's existing "
+            + " / ".join(dict.fromkeys(existing["flanks"])) + " cassette")
+        return AssembledConstruct(seq, circular, layout, warnings,
+                                  missing_required)
 
     # The stretch to replace: from the first cassette feature in the payload
     # region, up to the first terminator element after it.

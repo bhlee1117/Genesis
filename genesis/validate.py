@@ -191,7 +191,11 @@ def validate_construct(construct: AssembledConstruct,
             f"synthesis for it"))
 
     # --- order and orientation ------------------------------------------
-    actual = [item["type"] for item in construct.layout if item["type"] != "backbone"]
+    # Only the modules this design places are compared. A backbone brings
+    # its own promoter, ITRs and origin, and those were never part of the
+    # request.
+    actual = [item["type"] for item in construct.layout
+              if item["type"] != "backbone" and not item.get("from_backbone")]
     if expected_order and actual != expected_order:
         issues.append(Issue("error", "dna",
                             f"module order differs from the specification: "

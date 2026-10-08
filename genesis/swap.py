@@ -101,7 +101,9 @@ class SwapAnalysis:
 
 def rank_parents(conn: sqlite3.Connection, part_ids: list[int],
                  cfg: Config, limit: int = 8,
-                 min_length: int = 1500) -> list[ParentMatch]:
+                 min_length: int = 1500,
+                 require_types: set | None = None,
+                 require_family: str = "") -> list[ParentMatch]:
     """Rank inventory plasmids by how much of the target they already contain.
 
     Scoring favours a plasmid that carries many of the wanted parts and few
@@ -126,8 +128,26 @@ def rank_parents(conn: sqlite3.Connection, part_ids: list[int],
             LIMIT 400""",
         (*part_ids, min_length)).fetchall()
 
+    require_types = require_types or set()
     matches: list[ParentMatch] = []
     for r in rows:
+        # Architecture first. A plasmid that shares three coding sequences
+        # but has no lox sites cannot become a Cre-lox construct by swapping
+        # one region, however well it scores on shared parts - which is
+        # exactly the kind of nonsense recipient this filter exists to stop.
+        if require_types:
+            present = {a["feature_type"] for a in conn.execute(
+                "SELECT DISTINCT feature_type FROM annotation WHERE plasmid_id = ?",
+                (r["id"],))}
+            if not require_types <= present:
+                continue
+        if require_family:
+            from .vectors import classify_vector
+            ann = [dict(a) for a in conn.execute(
+                "SELECT feature_type, name FROM annotation WHERE plasmid_id = ?",
+                (r["id"],))]
+            if classify_vector(ann, r["name"])["family"] != require_family:
+                continue
         ids = {int(x) for x in (r["parts"] or "").split(",") if x}
         m = ParentMatch(r["id"], r["name"], r["owner"], r["seq_length"],
                         bool(r["circular"]), r["verified"], ids, r["bp"] or 0)
@@ -161,7 +181,8 @@ def _occurrence(conn: sqlite3.Connection, plasmid_id: int,
 # --------------------------------------------------------------------------
 
 def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
-                 cfg: Config) -> SwapAnalysis | None:
+                 cfg: Config, require_types: set | None = None,
+                 require_family: str = "") -> SwapAnalysis | None:
     """Plan the shortest edit: one region out of a recipient, one piece in.
 
     ``resolved_modules`` is the plan's module list, in target order, each
@@ -173,8 +194,19 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
         return None
     part_ids = [m["part_id"] for m in wanted]
 
-    candidates = rank_parents(conn, part_ids, cfg)
+    candidates = rank_parents(conn, part_ids, cfg,
+                              require_types=require_types,
+                              require_family=require_family)
     if not candidates:
+        if require_types or require_family:
+            wanted = ", ".join(sorted(require_types)) or require_family
+            return SwapAnalysis(
+                ParentMatch(0, "", "", 0, False, ""), None, SwapRegion(0, 0),
+                None, None, None, [], [],
+                [f"no plasmid in the inventory has both the parts this design "
+                 f"needs and the architecture it needs ({wanted}), so there "
+                 f"is nothing to edit; this one has to be built from parts"],
+                feasible=False)
         return None
     recipient = candidates[0]
 

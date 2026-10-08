@@ -22,7 +22,7 @@ import datetime as _dt
 import re
 
 from .config import Config
-from .pdf import PDF, A4, plasmid_track
+from .pdf import PDF, A4, circular_map, plasmid_track
 from .seqtools import gc_fraction, tm
 
 # --------------------------------------------------------------------------
@@ -431,9 +431,19 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         doc.heading("Designed construct", 2)
         feats = [{"feature_type": i["type"], "name": i["name"],
                   "start": i["start"], "end": i["end"],
-                  "strand": i.get("strand", 1)} for i in layout]
-        plasmid_track(doc, name, f"{construct['length']:,} bp", 
-                      construct["length"], feats, codon_marks=marks)
+                  "strand": i.get("strand", 1)} for i in layout
+                 if i["type"] not in ("primer_binding_site", "unknown")]
+        if construct.get("circular"):
+            # A plasmid is a circle. A linear track implies the ends are
+            # ends, and a cassette that wraps the origin looks broken on one.
+            circular_map(doc, name, f"{construct['length']:,} bp",
+                         construct["length"], feats, codon_marks=marks)
+            doc.paragraph(
+                "Outer ring reads forward, inner ring reverse. Position 1 is "
+                "at the top.", 8.2, gray=0.45)
+        else:
+            plasmid_track(doc, name, f"{construct['length']:,} bp",
+                          construct["length"], feats, codon_marks=marks)
         problems = [m for m in marks
                     if m["kind"] in ("premature_stop", "missing_start",
                                      "missing_stop")]

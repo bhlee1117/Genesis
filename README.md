@@ -236,6 +236,21 @@ origin of the coordinate system: in one of this lab's backbones the promoter
 sits at 9441 and its own first CDS at 0, so the payload cannot be described
 as a single `start..end` slice at all.
 
+### Choosing a recipient
+
+A recipient has to share the construct's *architecture*, not just a few of
+its genes. A plasmid carrying three of the right coding sequences but no lox
+sites cannot be edited into a Cre-lox construct by swapping one region, and
+offering it produces a plan that looks plausible and is nonsense. So a
+design using Cre-lox only considers recipients that already carry lox sites,
+and an AAV design only considers AAV plasmids. When nothing in the inventory
+has both the parts and the architecture, Genesis says so rather than
+reaching for the best-scoring wrong answer.
+
+If the recipient already carries a recombinase cassette, the payload goes
+*inside* its existing lox sites rather than bringing its own. Four more sites
+would give Cre several ways to cut and none of them the intended one.
+
 ### Reading the design back
 
 Everything else works forward: modules are resolved, concatenated, and a
@@ -383,7 +398,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           172 tests, no lab share required
+tests/           181 tests, no lab share required
 ```
 
 ## Giving it to a labmate
