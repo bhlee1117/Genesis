@@ -1147,12 +1147,23 @@ def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
 
 #: Resistance markers, normalised. Two templates that select differently can
 #: be told apart by the plate, which is what makes DpnI skippable.
-_MARKERS = (("amp", "AmpR"), ("bla", "AmpR"), ("carb", "AmpR"),
-            ("kan", "KanR"), ("neo", "KanR"), ("chlor", "CmR"),
-            ("cam", "CmR"), ("spec", "SpecR"), ("strep", "SmR"),
-            ("tet", "TetR"), ("zeo", "ZeoR"), ("blast", "BsdR"),
-            ("puro", "PuroR"), ("hygro", "HygR"), ("gent", "GentR"),
-            ("aacc1", "GentR"))
+#: Matched as substrings of the lower-cased label, longest first, so that
+#: "cmr" is recognised as well as "chloramphenicol" and "neoR/KanR" resolves
+#: to KanR rather than stopping at the first thing that looks close.
+_MARKERS = (("chloramphenicol", "CmR"), ("ampicillin", "AmpR"),
+            ("kanamycin", "KanR"), ("spectinomycin", "SpecR"),
+            ("streptomycin", "SmR"), ("tetracycline", "TetR"),
+            ("blasticidin", "BsdR"), ("puromycin", "PuroR"),
+            ("hygromycin", "HygR"), ("gentamicin", "GentR"),
+            ("zeocin", "ZeoR"), ("carbenicillin", "AmpR"),
+            ("amp", "AmpR"), ("bla", "AmpR"), ("carb", "AmpR"),
+            ("kan", "KanR"), ("neo", "KanR"),
+            ("chlor", "CmR"), ("cmr", "CmR"), ("cam", "CmR"),
+            ("spec", "SpecR"), ("strep", "SmR"), ("smr", "SmR"),
+            ("tet", "TetR"), ("zeo", "ZeoR"),
+            ("blast", "BsdR"), ("bsd", "BsdR"),
+            ("puro", "PuroR"), ("hygro", "HygR"), ("hygr", "HygR"),
+            ("gent", "GentR"), ("aacc1", "GentR"))
 
 
 def resistance_marker(conn: sqlite3.Connection, plasmid_id: int) -> str | None:
