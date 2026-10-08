@@ -276,10 +276,52 @@ genesis/
   planner.py     Stages 7-8, 10: route generation and ranking
   design.py      orchestration
   export.py      Stage 12: protocol, primer CSV, GenBank
+  auth.py        accounts, password hashing, sessions, roles
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           95 tests, no lab share required
+tests/           119 tests, no lab share required
 ```
+
+## Accounts and sharing with the lab
+
+Genesis starts local-only and open. Create an account and the login turns on:
+
+```bash
+python3 -m genesis useradd bhl --admin     # prompts for a password
+python3 -m genesis users                   # list accounts
+python3 -m genesis passwd <name>           # set someone's password
+python3 -m genesis role <name> --role viewer
+python3 -m genesis role <name> --disable
+```
+
+Three roles: `viewer` reads and designs, `member` also saves designs and
+records outcomes, `admin` also manages accounts and runs imports.
+
+To let the lab reach it, set `host` to `0.0.0.0` in
+`~/.genesis/config.json` and give people your machine's address.
+
+### What the login does and does not protect
+
+It stops someone who can reach the server from reading the inventory without
+an account. Passwords go through PBKDF2-HMAC-SHA256 with a per-user salt and
+600,000 iterations, and only the derived key is stored. Session tokens are
+256-bit and held hashed, so a stolen copy of the database yields neither
+passwords nor live sessions. Repeated failures are throttled, a wrong
+password and an unknown username give the same message, and changing or
+disabling an account ends its sessions immediately.
+
+**It does not encrypt anything in transit.** Over plain HTTP on the lab
+network, a password and a session cookie are both readable by anything that
+can see the traffic. A login is not a substitute for TLS. Either point
+`tls_cert` and `tls_key` at a certificate, or put Genesis behind a reverse
+proxy that terminates TLS. The sign-in page says so when it is served
+unencrypted over a non-loopback address, and the server prints a warning on
+startup.
+
+Two configurations are refused outright, because they would put every
+unpublished construct in the lab on the network with nothing in front of
+them: binding a reachable address with `require_auth` off, and binding a
+reachable address before any account exists.
 
 ## Permissions
 

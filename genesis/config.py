@@ -23,6 +23,14 @@ class Config:
     backup_dir: str = "~/.genesis/backups"
     host: str = "127.0.0.1"
     port: int = 8777
+    #: Require a signed-in account. Binding anywhere other than loopback is
+    #: refused while this is off.
+    require_auth: bool = True
+    session_hours: float = 12.0
+    #: Paths to a TLS certificate and key. Without them the server speaks
+    #: plain HTTP, which means passwords cross the network in the clear.
+    tls_cert: str = ""
+    tls_key: str = ""
     copy_originals: bool = False          # index in place; never write to share
     allow_annotation_edits: bool = True
     design_visibility: str = "lab"        # private | lab | read-only

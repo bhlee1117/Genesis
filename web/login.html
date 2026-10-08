@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in &middot; Genesis</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* Scoped to the sign-in page; the app's own tokens come from style.css. */
+  body.login-page {
+    background: var(--bg); color: var(--text); font-family: var(--sans);
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; margin: 0; padding: 24px 16px; box-sizing: border-box;
+  }
+  .login-card {
+    width: 100%; max-width: 380px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px 26px 24px;
+  }
+  .login-card h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: -0.01em; }
+  .login-card .sub {
+    margin: 0 0 22px; font-size: 12.5px; color: var(--text-muted);
+  }
+  .login-card label {
+    display: block; font-size: 12px; font-weight: 600;
+    margin: 0 0 5px; color: var(--text-muted);
+  }
+  .login-card input[type=text], .login-card input[type=password] {
+    width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 14px;
+    margin-bottom: 15px; border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--text);
+    font-family: inherit;
+  }
+  .login-card input:focus {
+    outline: 2px solid var(--accent); outline-offset: -1px;
+    border-color: transparent;
+  }
+  .login-card button {
+    width: 100%; padding: 9px 12px; font-size: 14px; font-weight: 600;
+    border: 0; border-radius: 5px; cursor: pointer;
+    background: var(--accent); color: var(--accent-text);
+    font-family: inherit;
+  }
+  .login-card button:disabled { opacity: 0.6; cursor: default; }
+  .login-error {
+    display: none; margin: 0 0 15px; padding: 9px 11px; font-size: 12.5px;
+    border-radius: 5px; border: 1px solid var(--error-border);
+    color: var(--error-text); background: var(--error-bg);
+  }
+  .login-error.show { display: block; }
+  .login-note {
+    margin: 18px 0 0; padding-top: 14px; font-size: 11.5px; line-height: 1.5;
+    color: var(--text-muted); border-top: 1px solid var(--border);
+  }
+  .login-note strong { color: var(--warn-text); }
+</style>
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <h1>Genesis</h1>
+    <p class="sub">Cloning designer for the lab plasmid inventory</p>
+
+    <p class="login-error" id="error" role="alert"></p>
+
+    <form id="form" autocomplete="on">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username"
+             autocapitalize="none" autocorrect="off" spellcheck="false" required>
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             autocomplete="current-password" required>
+
+      <button type="submit" id="submit">Sign in</button>
+    </form>
+
+    <p class="login-note" id="note"></p>
+  </main>
+
+<script>
+(function () {
+  var form = document.getElementById('form');
+  var errorBox = document.getElementById('error');
+  var submit = document.getElementById('submit');
+  var note = document.getElementById('note');
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.classList.add('show');
+  }
+
+  // Say plainly when the connection is not encrypted. Over plain HTTP on a
+  // shared network this password is readable in transit, and the person
+  // typing it deserves to know that before they do.
+  fetch('api/auth-status').then(function (r) { return r.json(); }).then(function (s) {
+    if (!s.tls && location.hostname !== '127.0.0.1' && location.hostname !== 'localhost') {
+      note.innerHTML = '';
+      var warn = document.createElement('strong');
+      warn.textContent = 'This connection is not encrypted. ';
+      note.appendChild(warn);
+      note.appendChild(document.createTextNode(
+        'Your password and session are readable by anything that can see ' +
+        'traffic on this network. Ask whoever runs this server to put it ' +
+        'behind HTTPS.'));
+    } else {
+      note.textContent = 'No account? Ask whoever administers this Genesis ' +
+        'server to create one for you.';
+    }
+  }).catch(function () { /* the warning is best effort */ });
+
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    errorBox.classList.remove('show');
+    submit.disabled = true;
+    submit.textContent = 'Signing in…';
+
+    fetch('api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: document.getElementById('username').value,
+        password: document.getElementById('password').value
+      })
+    }).then(function (response) {
+      return response.json().then(function (data) {
+        return { ok: response.ok, data: data };
+      });
+    }).then(function (result) {
+      if (result.ok) {
+        window.location.replace('/');
+        return;
+      }
+      showError(result.data && result.data.error
+        ? result.data.error : 'Sign-in failed.');
+      submit.disabled = false;
+      submit.textContent = 'Sign in';
+      document.getElementById('password').value = '';
+      document.getElementById('password').focus();
+    }).catch(function () {
+      showError('Could not reach the server.');
+      submit.disabled = false;
+      submit.textContent = 'Sign in';
+    });
+  });
+
+  document.getElementById('username').focus();
+})();
+</script>
+</body>
+</html>

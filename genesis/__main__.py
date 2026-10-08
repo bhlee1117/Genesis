@@ -16,6 +16,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import auth
 from .config import Config
 from .construct import ConstructSpec
 from .db import connect
@@ -155,6 +156,77 @@ def cmd_design(args, cfg: Config):
         sys.exit(2)
 
 
+def _prompt_password(confirm: bool = True) -> str:
+    import getpass
+    while True:
+        pw = getpass.getpass("password: ")
+        problem = auth.password_problem(pw)
+        if problem:
+            print(f"  {problem}", file=sys.stderr)
+            continue
+        if confirm and getpass.getpass("confirm : ") != pw:
+            print("  passwords did not match", file=sys.stderr)
+            continue
+        return pw
+
+
+def cmd_useradd(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    auth.ensure_schema(conn)
+    password = _prompt_password()
+    try:
+        user = auth.create_user(conn, args.username, password,
+                                role="admin" if args.admin else args.role,
+                                display_name=args.name or "",
+                                must_change=False)
+    except auth.AuthError as exc:
+        sys.exit(f"error: {exc}")
+    print(f"created {user.username} ({user.role})")
+
+
+def cmd_users(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    auth.ensure_schema(conn)
+    rows = auth.list_users(conn)
+    if not rows:
+        print("no accounts yet; create one with: "
+              "python3 -m genesis useradd <name> --admin")
+        return
+    print(f"{'username':20s} {'role':8s} {'last login':20s} status")
+    for r in rows:
+        print(f"{r['username'][:20]:20s} {r['role']:8s} "
+              f"{(r['last_login'] or 'never')[:19]:20s} "
+              f"{'disabled' if r['disabled'] else 'active'}")
+
+
+def cmd_passwd(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    auth.ensure_schema(conn)
+    password = _prompt_password()
+    try:
+        auth.set_password(conn, args.username, password)
+    except auth.AuthError as exc:
+        sys.exit(f"error: {exc}")
+    print(f"password updated for {args.username}; their sessions were ended")
+
+
+def cmd_role(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+    auth.ensure_schema(conn)
+    try:
+        if args.disable:
+            auth.set_disabled(conn, args.username, True)
+            print(f"{args.username} disabled")
+        elif args.enable:
+            auth.set_disabled(conn, args.username, False)
+            print(f"{args.username} enabled")
+        else:
+            auth.set_role(conn, args.username, args.role)
+            print(f"{args.username} is now {args.role}")
+    except auth.AuthError as exc:
+        sys.exit(f"error: {exc}")
+
+
 def cmd_serve(args, cfg: Config):
     from .server import serve
     if args.port:
@@ -205,6 +277,27 @@ def main(argv=None):
     s.add_argument("--pdf", help="also write a printable PDF protocol here")
     s.add_argument("--save", action="store_true", help="store this design")
     s.set_defaults(fn=cmd_design)
+
+    s = sub.add_parser("useradd", help="create an account")
+    s.add_argument("username")
+    s.add_argument("--admin", action="store_true", help="make them an admin")
+    s.add_argument("--role", default="member", choices=auth.ROLES)
+    s.add_argument("--name", help="display name")
+    s.set_defaults(fn=cmd_useradd)
+
+    s = sub.add_parser("users", help="list accounts")
+    s.set_defaults(fn=cmd_users)
+
+    s = sub.add_parser("passwd", help="set someone's password")
+    s.add_argument("username")
+    s.set_defaults(fn=cmd_passwd)
+
+    s = sub.add_parser("role", help="change a role, or disable an account")
+    s.add_argument("username")
+    s.add_argument("--role", default="member", choices=auth.ROLES)
+    s.add_argument("--disable", action="store_true")
+    s.add_argument("--enable", action="store_true")
+    s.set_defaults(fn=cmd_role)
 
     s = sub.add_parser("serve", help="start the internal web interface")
     s.add_argument("--port", type=int)

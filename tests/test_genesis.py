@@ -1258,3 +1258,185 @@ class TestCodonMarkers(unittest.TestCase):
         c = self._c([("CDS", "geneA", "ATG" + "GCT" * 20)])
         marker = next(m for m in codon_markers(c) if m["kind"] == "missing_stop")
         self.assertEqual(marker["start"], c.length)
+
+
+# --------------------------------------------------------------------------
+class TestAuth(unittest.TestCase):
+    """Accounts, passwords and sessions."""
+
+    GOOD = "correct-horse-battery-staple"
+
+    def setUp(self):
+        from genesis import auth
+        self.auth = auth
+        self.conn = connect(":memory:")
+        auth.ensure_schema(self.conn)
+
+    # -- password storage ------------------------------------------------
+    def test_password_is_not_stored(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        row = self.conn.execute(
+            "SELECT salt, password_hash, iterations FROM user").fetchone()
+        self.assertNotIn(self.GOOD.encode(), row["password_hash"])
+        self.assertNotIn(self.GOOD.encode(), row["salt"])
+        self.assertGreaterEqual(row["iterations"], 100_000)
+
+    def test_same_password_gets_different_hashes(self):
+        self.auth.create_user(self.conn, "a", self.GOOD)
+        self.auth.create_user(self.conn, "b", self.GOOD)
+        rows = self.conn.execute("SELECT salt, password_hash FROM user").fetchall()
+        self.assertNotEqual(rows[0]["salt"], rows[1]["salt"])
+        self.assertNotEqual(rows[0]["password_hash"], rows[1]["password_hash"])
+
+    def test_verification_round_trip(self):
+        salt, derived, iters = self.auth.hash_password(self.GOOD)
+        self.assertTrue(self.auth.check_password(self.GOOD, salt, derived, iters))
+        self.assertFalse(self.auth.check_password("other", salt, derived, iters))
+
+    def test_weak_passwords_are_refused(self):
+        for bad in ("short", "password1234", "Password123!", "qwertyuiop12"):
+            with self.assertRaises(self.auth.AuthError, msg=bad):
+                self.auth.create_user(self.conn, f"u{abs(hash(bad))}", bad)
+
+    def test_long_passphrase_is_accepted(self):
+        self.assertIsNone(self.auth.password_problem("voltron imaging rig 7"))
+
+    # -- login -----------------------------------------------------------
+    def test_login_and_token_resolution(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD, role="admin")
+        token, user = self.auth.login(self.conn, "alice", self.GOOD)
+        self.assertEqual(user.role, "admin")
+        self.assertEqual(self.auth.user_for_token(self.conn, token).username,
+                         "alice")
+
+    def test_username_is_case_insensitive(self):
+        self.auth.create_user(self.conn, "Alice", self.GOOD)
+        token, _ = self.auth.login(self.conn, "ALICE", self.GOOD)
+        self.assertIsNotNone(self.auth.user_for_token(self.conn, token))
+
+    def test_session_token_is_stored_hashed(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        token, _ = self.auth.login(self.conn, "alice", self.GOOD)
+        stored = self.conn.execute(
+            "SELECT token_hash FROM session").fetchone()["token_hash"]
+        self.assertNotEqual(stored, token)
+        self.assertNotIn(token, stored)
+
+    def test_unknown_user_and_wrong_password_look_identical(self):
+        """The error must not reveal which usernames exist."""
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        with self.assertRaises(self.auth.AuthError) as wrong:
+            self.auth.login(self.conn, "alice", "not-the-password")
+        with self.assertRaises(self.auth.AuthError) as unknown:
+            self.auth.login(self.conn, "nobody-at-all", "not-the-password")
+        self.assertEqual(str(wrong.exception), str(unknown.exception))
+
+    def test_repeated_failures_are_throttled(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        for _ in range(4):
+            with self.assertRaises(self.auth.AuthError):
+                self.auth.login(self.conn, "alice", "wrong")
+        with self.assertRaises(self.auth.AuthError) as ctx:
+            self.auth.login(self.conn, "alice", self.GOOD)
+        self.assertIn("too many failed attempts", str(ctx.exception))
+
+    def test_successful_login_clears_the_throttle(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        for _ in range(2):          # below the threshold
+            with self.assertRaises(self.auth.AuthError):
+                self.auth.login(self.conn, "alice", "wrong")
+        self.auth.login(self.conn, "alice", self.GOOD)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM login_attempt").fetchone()["c"], 0)
+
+    # -- sessions --------------------------------------------------------
+    def test_forged_and_empty_tokens_are_rejected(self):
+        import secrets
+        self.assertIsNone(self.auth.user_for_token(self.conn, ""))
+        self.assertIsNone(self.auth.user_for_token(
+            self.conn, secrets.token_urlsafe(32)))
+
+    def test_expired_session_is_rejected_and_removed(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        token, _ = self.auth.login(self.conn, "alice", self.GOOD,
+                                   session_hours=-1)      # already expired
+        self.assertIsNone(self.auth.user_for_token(self.conn, token))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM session").fetchone()["c"], 0)
+
+    def test_logout_revokes_only_that_session(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        a, _ = self.auth.login(self.conn, "alice", self.GOOD)
+        b, _ = self.auth.login(self.conn, "alice", self.GOOD)
+        self.auth.logout(self.conn, a)
+        self.assertIsNone(self.auth.user_for_token(self.conn, a))
+        self.assertIsNotNone(self.auth.user_for_token(self.conn, b))
+
+    def test_password_change_ends_every_session(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        a, _ = self.auth.login(self.conn, "alice", self.GOOD)
+        b, _ = self.auth.login(self.conn, "alice", self.GOOD)
+        self.auth.set_password(self.conn, "alice", "a-different-passphrase")
+        for token in (a, b):
+            self.assertIsNone(self.auth.user_for_token(self.conn, token))
+
+    def test_disabling_an_account_ends_its_sessions(self):
+        self.auth.create_user(self.conn, "admin1", self.GOOD, role="admin")
+        self.auth.create_user(self.conn, "bob", self.GOOD)
+        token, _ = self.auth.login(self.conn, "bob", self.GOOD)
+        self.auth.set_disabled(self.conn, "bob", True)
+        self.assertIsNone(self.auth.user_for_token(self.conn, token))
+        with self.assertRaises(self.auth.AuthError):
+            self.auth.login(self.conn, "bob", self.GOOD)
+
+    # -- roles -----------------------------------------------------------
+    def test_role_ranking(self):
+        User = self.auth.User
+        self.assertTrue(User(1, "a", "a", "admin").can("member"))
+        self.assertTrue(User(1, "a", "a", "member").can("member"))
+        self.assertFalse(User(1, "a", "a", "viewer").can("member"))
+        self.assertFalse(User(1, "a", "a", "member").can("admin"))
+
+    def test_cannot_strip_or_disable_the_last_admin(self):
+        self.auth.create_user(self.conn, "root", self.GOOD, role="admin")
+        with self.assertRaises(self.auth.AuthError):
+            self.auth.set_role(self.conn, "root", "viewer")
+        with self.assertRaises(self.auth.AuthError):
+            self.auth.set_disabled(self.conn, "root", True)
+        # with a second admin it is allowed
+        self.auth.create_user(self.conn, "root2", self.GOOD, role="admin")
+        self.auth.set_role(self.conn, "root", "viewer")
+        self.assertEqual(self.conn.execute(
+            "SELECT role FROM user WHERE username='root'").fetchone()["role"],
+            "viewer")
+
+    def test_duplicate_username_is_refused(self):
+        self.auth.create_user(self.conn, "alice", self.GOOD)
+        with self.assertRaises(self.auth.AuthError):
+            self.auth.create_user(self.conn, "ALICE", self.GOOD)
+
+
+# --------------------------------------------------------------------------
+class TestUnsafeBindRefusal(unittest.TestCase):
+    """The server must not put an unprotected inventory on the network."""
+
+    def test_refuses_reachable_bind_without_auth(self):
+        from genesis.server import serve
+        cfg = Config()
+        cfg.host, cfg.require_auth = "0.0.0.0", False
+        with self.assertRaises(SystemExit) as ctx:
+            serve(cfg, ":memory:")
+        self.assertIn("require_auth is off", str(ctx.exception))
+
+    def test_refuses_reachable_bind_with_no_accounts(self):
+        from genesis.server import serve
+        cfg = Config()
+        cfg.host, cfg.require_auth = "0.0.0.0", True
+        with self.assertRaises(SystemExit) as ctx:
+            serve(cfg, ":memory:")
+        self.assertIn("no accounts exist", str(ctx.exception))
+
+    def test_loopback_without_auth_is_allowed(self):
+        """Local-only use must not require anyone to set up accounts."""
+        from genesis.server import LOOPBACK
+        self.assertIn("127.0.0.1", LOOPBACK)

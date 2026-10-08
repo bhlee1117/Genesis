@@ -7,7 +7,7 @@ behind the lab network or a VPN rather than on a public host.
 
 API
 ---
-GET  /api/stats                         inventory counts
+GET  /api/auth-status                   whether a login is needed\nGET  /api/me                            the signed-in user\nPOST /api/login     {username,password} open a session\nPOST /api/logout                        end it\nPOST /api/password  {current,new}       change your own password\nGET  /api/users                         list accounts (admin)\nPOST /api/users     {action,...}        manage accounts (admin)\nGET  /api/stats                         inventory counts
 GET  /api/owners                        people with plasmids
 GET  /api/plasmids?q=&owner=&limit=     search the inventory
 GET  /api/plasmid/<id>                  sequence + annotations
@@ -31,10 +31,13 @@ import json
 import sqlite3
 import threading
 import traceback
+import ssl
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from . import auth
 from .config import Config
 from .construct import ConstructSpec
 from .db import connect
@@ -59,6 +62,47 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter console
         if "/api/" in str(args):
             super().log_message(fmt, *args)
+
+    COOKIE = "genesis_session"
+
+    #: Endpoints reachable without a session. Everything else needs one.
+    PUBLIC_PATHS = {"/login", "/login.html", "/api/login", "/api/auth-status",
+                    "/style.css", "/login.js"}
+
+    #: Minimum role for the endpoints that change something.
+    WRITE_ENDPOINTS = {
+        "/api/save": "member", "/api/outcome": "member",
+        "/api/import": "admin", "/api/users": "admin",
+    }
+
+    def cookie_token(self) -> str:
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return ""
+        try:
+            jar = SimpleCookie(raw)
+        except Exception:
+            return ""
+        morsel = jar.get(self.COOKIE)
+        return morsel.value if morsel else ""
+
+    def current_user(self):
+        if getattr(self, "_user_cached", False):
+            return self._user
+        self._user_cached = True
+        self._user = auth.user_for_token(self.conn, self.cookie_token())
+        return self._user
+
+    def set_session_cookie(self, token: str, max_age: int) -> list[tuple]:
+        flags = [f"{self.COOKIE}={token}", "Path=/", "HttpOnly",
+                 "SameSite=Strict", f"Max-Age={max_age}"]
+        if getattr(self.server, "is_tls", False):
+            flags.append("Secure")
+        return [("Set-Cookie", "; ".join(flags))]
+
+    def clear_session_cookie(self) -> list[tuple]:
+        return [("Set-Cookie",
+                 f"{self.COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")]
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -94,10 +138,33 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length) or b"{}")
 
     # -- routing ---------------------------------------------------------
+    #: Set by serve(); False when no account exists yet, since a login with
+    #: no accounts would simply lock everyone out.
+    auth_active = False
+
+    def guard(self, path: str) -> bool:
+        """Return True if the request may proceed."""
+        if not self.auth_active:
+            return True
+        if path in self.PUBLIC_PATHS:
+            return True
+        if self.current_user() is not None:
+            return True
+        if path.startswith("/api/"):
+            self.json({"error": "not signed in", "login_required": True}, 401)
+        else:
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        return False
+
     def do_GET(self):
         url = urlparse(self.path)
         path, query = url.path, parse_qs(url.query)
         try:
+            if not self.guard(path):
+                return
             if path.startswith("/api/"):
                 return self.api_get(path, query)
             return self.static(path)
@@ -108,6 +175,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         try:
+            if not self.guard(url.path):
+                return
+            required = self.WRITE_ENDPOINTS.get(url.path)
+            if required and self.auth_active:
+                user = self.current_user()
+                if user is None or not user.can(required):
+                    return self.json(
+                        {"error": f"this needs the {required} role; you are "
+                                  f"signed in as "
+                                  f"{user.role if user else 'nobody'}"}, 403)
             return self.api_post(url.path, self.body_json())
         except Exception as exc:
             traceback.print_exc()
@@ -116,6 +193,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- static files ----------------------------------------------------
     def static(self, path: str):
+        if path == "/login":
+            path = "/login.html"
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
         target = (WEB_DIR / rel).resolve()
         if not str(target).startswith(str(WEB_DIR.resolve())) or not target.is_file():
@@ -131,6 +210,23 @@ class Handler(BaseHTTPRequestHandler):
         c = self.conn
         one = lambda s, *a: c.execute(s, a).fetchone()
         rows = lambda s, *a: [dict(r) for r in c.execute(s, a).fetchall()]
+
+        if path == "/api/auth-status":
+            return self.json({
+                "require_auth": self.auth_active,
+                "any_users": auth.count_users(c) > 0,
+                "tls": bool(getattr(self.server, "is_tls", False)),
+            })
+
+        if path == "/api/me":
+            user = self.current_user()
+            return self.json({"user": user.to_dict() if user else None})
+
+        if path == "/api/users":
+            user = self.current_user()
+            if self.auth_active and (user is None or not user.can("admin")):
+                return self.json({"error": "admin role required"}, 403)
+            return self.json(auth.list_users(c))
 
         if path == "/api/stats":
             return self.json({
@@ -300,6 +396,65 @@ class Handler(BaseHTTPRequestHandler):
     def api_post(self, path: str, body: dict):
         c = self.conn
 
+        if path == "/api/login":
+            try:
+                token, user = auth.login(
+                    c, body.get("username", ""), body.get("password", ""),
+                    user_agent=self.headers.get("User-Agent", ""),
+                    session_hours=self.cfg.session_hours)
+            except auth.AuthError as exc:
+                return self.json({"error": str(exc)}, 401)
+            payload = json.dumps({"user": user.to_dict()}).encode()
+            return self._send(200, payload, "application/json",
+                              dict(self.set_session_cookie(
+                                  token, int(self.cfg.session_hours * 3600))))
+
+        if path == "/api/logout":
+            auth.logout(c, self.cookie_token())
+            return self._send(200, b'{"ok":true}', "application/json",
+                              dict(self.clear_session_cookie()))
+
+        if path == "/api/password":
+            user = self.current_user()
+            if user is None:
+                return self.json({"error": "not signed in"}, 401)
+            try:
+                # Re-authenticate before changing anything.
+                auth.login(c, user.username, body.get("current", ""),
+                           session_hours=0.01)
+                auth.set_password(c, user.username, body.get("new", ""))
+            except auth.AuthError as exc:
+                return self.json({"error": str(exc)}, 400)
+            return self._send(200, b'{"ok":true}', "application/json",
+                              dict(self.clear_session_cookie()))
+
+        if path == "/api/users":
+            user = self.current_user()
+            action = body.get("action", "create")
+            try:
+                if action == "create":
+                    created = auth.create_user(
+                        c, body["username"], body["password"],
+                        role=body.get("role", "member"),
+                        display_name=body.get("display_name", ""),
+                        must_change=bool(body.get("must_change", True)))
+                    return self.json({"user": created.to_dict()})
+                if action == "role":
+                    auth.set_role(c, body["username"], body["role"])
+                elif action == "disable":
+                    auth.set_disabled(c, body["username"], True)
+                elif action == "enable":
+                    auth.set_disabled(c, body["username"], False)
+                elif action == "reset":
+                    auth.set_password(c, body["username"], body["password"])
+                else:
+                    return self.json({"error": f"unknown action {action}"}, 400)
+            except auth.AuthError as exc:
+                return self.json({"error": str(exc)}, 400)
+            except KeyError as exc:
+                return self.json({"error": f"missing field {exc}"}, 400)
+            return self.json({"ok": True})
+
         if path == "/api/design":
             spec_in = body.get("spec")
             if isinstance(spec_in, str):
@@ -368,14 +523,68 @@ class Handler(BaseHTTPRequestHandler):
         return self.json({"error": "unknown endpoint"}, 404)
 
 
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
 def serve(cfg: Config, db_path: str | None = None) -> None:
     Handler.cfg = cfg
     Handler.db_path = str(db_path or cfg.resolved_db)
-    connect(Handler.db_path).close()
+    conn = connect(Handler.db_path)
+    auth.ensure_schema(conn)
+    n_users = auth.count_users(conn)
+    auth.purge_expired(conn)
+    conn.close()
+
+    reachable = cfg.host not in LOOPBACK
+
+    # Refuse to put an unauthenticated inventory on the network. This is the
+    # one configuration that would expose every unpublished construct in the
+    # lab to anyone who can route to this machine.
+    if reachable and not cfg.require_auth:
+        raise SystemExit(
+            f"refusing to bind {cfg.host}: require_auth is off, so anyone who "
+            f"can reach this machine could read the whole inventory.\n"
+            f"Set require_auth to true, or bind 127.0.0.1.")
+    if reachable and cfg.require_auth and n_users == 0:
+        raise SystemExit(
+            f"refusing to bind {cfg.host}: no accounts exist yet, so nobody "
+            f"could sign in and the login would be the only thing served.\n"
+            f"Create the first account:  python3 -m genesis useradd <name> --admin")
+
+    # Auth cannot work before anyone has an account. On loopback that would
+    # lock the owner out of their own machine, so run open and say so; a
+    # reachable bind in the same state was already refused above.
+    effective_auth = cfg.require_auth and n_users > 0
+    Handler.auth_active = effective_auth
+
+    ssl_context = None
+    if cfg.tls_cert and cfg.tls_key:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(cfg.tls_cert, cfg.tls_key)
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
     httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
-    print(f"Genesis listening on http://{cfg.host}:{cfg.port}")
+    httpd.is_tls = ssl_context is not None
+    if ssl_context is not None:
+        httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
+
+    scheme = "https" if httpd.is_tls else "http"
+    print(f"Genesis listening on {scheme}://{cfg.host}:{cfg.port}")
     print(f"  database : {Handler.db_path}")
     print(f"  DNA root : {cfg.dna_root}")
+    if effective_auth:
+        print(f"  accounts : {n_users}  (login required)")
+    elif n_users == 0:
+        print("  accounts : none yet - running without a login, local only.")
+        print("             Create one to turn the login on:")
+        print("               python3 -m genesis useradd <name> --admin")
+    else:
+        print(f"  accounts : {n_users}  (LOGIN DISABLED in config)")
+    if reachable and not httpd.is_tls:
+        print("  WARNING  : plain HTTP on a reachable address - passwords and")
+        print("             session cookies cross the network unencrypted.")
+        print("             Configure tls_cert / tls_key, or put this behind")
+        print("             a reverse proxy that terminates TLS.")
     print("  Ctrl-C to stop.")
     try:
         httpd.serve_forever()
