@@ -180,7 +180,8 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
                        template: str, start: int, end: int,
                        upstream_seq: str, downstream_seq: str,
                        cfg: Config, circular_template: bool = False,
-                       carry_downstream: bool = True) -> tuple[Primer, Primer]:
+                       carry_downstream: bool = True,
+                       unique_in: str = "") -> tuple[Primer, Primer]:
     """Design the primer pair that amplifies one fragment with HiFi overlaps.
 
     The forward primer carries the 3' end of the *upstream* fragment as a
@@ -198,8 +199,10 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     f_anneal = pick_anneal(template, start, "F", cfg, circular_template)
     r_anneal = pick_anneal(template, end, "R", cfg, circular_template)
 
-    f_tail = pick_overlap(upstream_seq, cfg, from_end=True)
-    r_tail = (revcomp(pick_overlap(downstream_seq, cfg, from_end=False))
+    f_tail = pick_overlap(upstream_seq, cfg, from_end=True,
+                          unique_in=unique_in)
+    r_tail = (revcomp(pick_overlap(downstream_seq, cfg, from_end=False,
+                                   unique_in=unique_in))
               if carry_downstream else "")
 
     fwd = Primer(
@@ -323,26 +326,61 @@ def homology_range(cfg: Config) -> tuple:
     return max(low, cfg.overlap_min_length), max(high, cfg.overlap_length)
 
 
-def pick_overlap(neighbour: str, cfg: Config, from_end: bool = True) -> str:
+#: How far an arm may be grown to get past a repeat. Beyond this the oligo
+#: stops being orderable as a stock primer.
+UNIQUE_ARM_MAX = 60
+
+
+def _occurrences(arm: str, host: str) -> int:
+    """How many times an arm appears in a circular molecule, either strand."""
+    if not arm or not host:
+        return 1
+    arm = arm.upper()
+    host = host.upper()
+    wrapped = host + host[:len(arm) - 1]
+    return wrapped.count(arm) + wrapped.count(revcomp(arm))
+
+
+def pick_overlap(neighbour: str, cfg: Config, from_end: bool = True,
+                 unique_in: str = "") -> str:
     """Take the shortest homology arm that still anneals at the assembly
-    temperature.
+    temperature, and that occurs only once.
 
     Using the maximum every time makes every oligo longer than it needs to
     be. The arm is grown from the kit's minimum until its Tm reaches the
     threshold, and only then does it stop.
+
+    Length is not the only requirement. An arm has to say *where* a fragment
+    goes, which it cannot do if the same bases occur twice. A Cre-lox
+    construct carries each lox site twice by design, so an arm taken from
+    one of them matches both, and the payload assembles either way round -
+    in the simulation, and in the tube. Where that happens the arm keeps
+    growing until it reaches past the repeat into sequence that occurs once.
     """
     low, high = homology_range(cfg)
     if not neighbour:
         return ""
+
+    def arm_of(n: int) -> str:
+        return neighbour[-n:] if from_end else neighbour[:n]
+
     best = ""
-    for length in range(low, high + 1):
-        arm = neighbour[-length:] if from_end else neighbour[:length]
-        if len(arm) < length:
-            break
+    limit = min(high, len(neighbour))
+    for length in range(low, limit + 1):
+        arm = arm_of(length)
         best = arm
         t = tm(arm, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
         if t == t and t >= cfg.overlap_tm_min:
-            return arm
+            if _occurrences(arm, unique_in) <= 1:
+                return arm
+            break
+
+    if unique_in and best and _occurrences(best, unique_in) > 1:
+        for length in range(limit + 1, min(UNIQUE_ARM_MAX,
+                                           len(neighbour)) + 1):
+            arm = arm_of(length)
+            if _occurrences(arm, unique_in) <= 1:
+                return arm
     return best
 
 

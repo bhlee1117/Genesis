@@ -315,8 +315,9 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             0, piece["name"], backbone["seq"],
             piece["source_start"], piece["source_end"], up, down, cfg,
             circular_template=bool(backbone.get("circular")),
-            carry_downstream=False)
+            carry_downstream=False, unique_in=construct.seq)
         _carry(fwd, carried.get(k, ""), route, cfg)
+        _check_unique(fwd, construct.seq, route)
         primers += [fwd, rev]
         if len(bb_seq) > cfg.max_pcr_length:
             route.warnings.append(
@@ -364,7 +365,8 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
 
         fwd, rev = design_gibson_pair(
             i, frag.name, tpl, start, end, up, down, cfg,
-            circular_template=circ, carry_downstream=False)
+            circular_template=circ, carry_downstream=False,
+            unique_in=construct.seq)
         _carry(fwd, carried.get(piece_index, ""), route, cfg)
         # Report where the part is in the donor, not where it is in the
         # strand the primers were written against.
@@ -823,6 +825,30 @@ def failure_history(conn: sqlite3.Connection) -> dict:
 # region out of it, and put a piece from a second plasmid in its place.
 # Two parents, one junction pair, one assembly reaction.
 # --------------------------------------------------------------------------
+
+def _check_unique(primer: Primer, construct_seq: str, route: "Route") -> None:
+    """Say so when an overlap arm cannot point at one place only.
+
+    An arm has to say *where* a fragment goes.  When the same bases occur
+    twice in the finished molecule - two copies of a WPRE, the pair of lox
+    sites a Cre-lox cassette needs - the arm matches both and the fragment
+    can go in either place, either way round.  That is not something the
+    assembly resolves on its own, so it has to be said before anyone orders
+    the oligo.
+    """
+    from .primers import _occurrences
+    tail = primer.tail or ""
+    if not tail or not construct_seq:
+        return
+    n = _occurrences(tail, construct_seq)
+    if n > 1:
+        route.warnings.append(
+            f"primer {primer.name}: its {len(tail)} bp overlap occurs {n} "
+            f"times in the construct, so this fragment has more than one "
+            f"place it can join and the assembly may put it in either; "
+            f"a repeated element here needs a different backbone, or the "
+            f"junction moved")
+
 
 def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
     """Put an un-amplifiable arc onto the primer that makes the next piece.

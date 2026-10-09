@@ -3325,3 +3325,66 @@ class TestBackboneArcs(unittest.TestCase):
         joined = "".join(s["seq"] for s in con.backbone_segments)
         self.assertNotIn(old_cds, joined)
         self.assertNotIn(old_cds, con.seq)
+
+
+class TestUniqueOverlaps(unittest.TestCase):
+    """An overlap arm has to say where a fragment goes."""
+
+    def setUp(self):
+        self.cfg = Config()
+
+    def test_occurrences_counts_circularly_on_both_strands(self):
+        from genesis.primers import _occurrences
+        from genesis.seqtools import revcomp
+        body = rand_seq(500, 61)
+        motif = body[100:140]
+        self.assertEqual(_occurrences(motif, body), 1)
+        self.assertEqual(_occurrences(revcomp(motif), body), 1)
+        twice = body + rand_seq(200, 62) + motif
+        self.assertEqual(_occurrences(motif, twice), 2)
+
+    def test_an_arm_grows_past_a_repeat_until_it_is_unique(self):
+        """A lox site appears twice by design; an arm inside one is useless."""
+        from genesis.primers import pick_overlap, _occurrences
+        lox = rand_seq(34, 63)
+        unique_left = rand_seq(200, 64)
+        payload = rand_seq(300, 65)
+        tail_side = rand_seq(300, 66)
+        # The construct carries the same lox twice.
+        construct = unique_left + lox + payload + lox + tail_side
+        neighbour = unique_left + lox      # the piece before the payload
+
+        short = pick_overlap(neighbour, self.cfg, from_end=True)
+        self.assertGreater(_occurrences(short, construct), 1,
+                           "the default arm should be the ambiguous one")
+
+        grown = pick_overlap(neighbour, self.cfg, from_end=True,
+                             unique_in=construct)
+        self.assertEqual(_occurrences(grown, construct), 1)
+        self.assertGreater(len(grown), len(short))
+        self.assertTrue(neighbour.endswith(grown),
+                        "the arm must still be the neighbour's own end")
+
+    def test_an_arm_that_cannot_be_made_unique_is_reported(self):
+        from genesis.planner import _check_unique, Route
+        from genesis.primers import Primer
+        repeat = rand_seq(60, 67)
+        construct = rand_seq(300, 68) + repeat + rand_seq(300, 69) + repeat
+        route = Route(id="x", strategy="hifi", title="t")
+        p = Primer(name="frag-F", sequence=repeat[-15:] + "ACGTACGTACGTACGTAC",
+                   anneal="ACGTACGTACGTACGTAC", tail=repeat[-15:],
+                   direction="F")
+        _check_unique(p, construct, route)
+        self.assertTrue(any("more than one place" in w for w in route.warnings),
+                        route.warnings)
+
+    def test_a_unique_arm_is_not_reported(self):
+        from genesis.planner import _check_unique, Route
+        from genesis.primers import Primer
+        construct = rand_seq(800, 70)
+        route = Route(id="x", strategy="hifi", title="t")
+        arm = construct[100:115]
+        p = Primer(name="frag-F", sequence=arm + "ACGTACGTACGTACGTAC",
+                   anneal="ACGTACGTACGTACGTAC", tail=arm, direction="F")
+        _check_unique(p, construct, route)
+        self.assertEqual(route.warnings, [])
