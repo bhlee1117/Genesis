@@ -180,6 +180,176 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec,
     return dict(row) if row else None
 
 
+#: Module types that can sit in one open reading frame together, which is
+#: what a 2A peptide is for: one promoter, one transcript, several proteins.
+FUSED_TYPES = {"CDS", "p2A", "linker", "tag", "trafficking_motif", "IRES"}
+
+
+def _prefer_fused_source(conn: sqlite3.Connection,
+                         resolved: list) -> list[str]:
+    """Take a 2A fusion from a plasmid that already carries it whole.
+
+    Asking for X - P2A - Y names three modules, and the planner will
+    happily amplify three fragments and join them with two junctions it has
+    to design, check and screen. But these constructs are built from each
+    other: the lab has plenty of plasmids where X-P2A-Y is already sitting
+    in one piece, because somebody made it that way, and a fusion taken
+    whole is one reaction with no internal junction to get wrong.
+
+    So where a run of modules that share a reading frame exists intact in
+    one plasmid, every module in it is sourced from there - which is all it
+    takes, because fragments from the same plasmid at adjoining
+    coordinates are already merged into one amplification.
+    """
+    notes: list[str] = []
+    runs: list[list] = []
+    current: list = []
+    for rm in resolved:
+        if rm.seq and rm.feature_type in FUSED_TYPES:
+            current.append(rm)
+        else:
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+    if len(current) > 1:
+        runs.append(current)
+
+    for run in runs:
+        if not any(rm.feature_type == "p2A" for rm in run):
+            continue
+        # The longest intact stretch is worth most, so start from the whole
+        # run and give up a module at a time from the end.
+        for size in range(len(run), 1, -1):
+            for start in range(0, len(run) - size + 1):
+                piece = run[start:start + size]
+                if not any(rm.feature_type == "p2A" for rm in piece):
+                    continue
+                found = _locate_fusion(conn, piece)
+                if found is None:
+                    continue
+                plasmid, places = found
+                for rm, where in zip(piece, places):
+                    rm.sources = [{**where, "id": plasmid["id"],
+                                   "name": plasmid["name"],
+                                   "owner": plasmid["owner"] or "",
+                                   "verified": plasmid["verified"],
+                                   "available_template": 1,
+                                   "circular": plasmid["circular"],
+                                   "seq_length": plasmid["seq_length"]}] + [
+                        x for x in rm.sources if x["id"] != plasmid["id"]]
+                    rm.pinned_source = True
+                notes.append(
+                    " + ".join(rm.part_name for rm in piece)
+                    + f" is already one piece in {plasmid['name']}, so it is "
+                      f"amplified as one rather than joined from "
+                      f"{len(piece)}")
+                break
+            else:
+                continue
+            break
+    return notes
+
+
+def _locate_fusion(conn: sqlite3.Connection, piece: list):
+    """Find a plasmid carrying this run of modules end to end.
+
+    An exact match on the whole run is the easy case and the rare one. The
+    usual case is that the plasmid joins the same two proteins through its
+    own 2A peptide, which is not the one a generic "P2A" resolves to -
+    P2A, T2A and E2A all do the job and the lab's plasmids use all three.
+    So the pair is located and whatever sits between them is read off that
+    plasmid, after checking that it really is a 2A: in frame, the right
+    length, and no stop codon in the middle of it.
+    """
+    from .seqtools import translate
+
+    joined = "".join(rm.seq for rm in piece).upper()
+    if len(joined) < 60:
+        return None
+
+    # Only a pair joined through a single 2A is handled; a longer run is
+    # tried as its pairs by the caller.
+    pair = (len(piece) == 3 and piece[1].feature_type == "p2A"
+            and piece[0].seq and piece[2].seq)
+
+    seen: set = set()
+    for src in piece[0].sources[:40]:
+        if src["id"] in seen:
+            continue
+        seen.add(src["id"])
+        row = conn.execute(
+            "SELECT id, name, owner, verified, circular, seq_length, seq "
+            "FROM plasmid WHERE id = ?", (src["id"],)).fetchone()
+        if row is None or not row["seq"]:
+            continue
+        host = row["seq"].upper()
+
+        for strand, text in ((1, host), (-1, revcomp(host))):
+            at = text.find(joined)
+            if at >= 0:
+                return dict(row), _places(piece, at, len(text), strand)
+            if not pair:
+                continue
+            left, right = piece[0].seq.upper(), piece[2].seq.upper()
+            lo = text.find(left)
+            if lo < 0:
+                continue
+            after = lo + len(left)
+            # The window bounds where the next protein may *start*; find
+            # needs room for the whole of it, or a 762 bp segment can never
+            # be found inside a 120 bp window.
+            gap_end = text.find(right, after, after + MAX_2A + len(right))
+            if gap_end < 0:
+                continue
+            spacer = text[after:gap_end]
+            if not _is_2a(spacer, translate):
+                continue
+            # Take this plasmid's own 2A, so the three pieces really are
+            # one stretch of its DNA and come out of one reaction.
+            piece[1].seq = spacer if strand == 1 else revcomp(spacer)
+            kind = ("2A peptide" if "NPG" in translate(spacer).upper()
+                    else "linker")
+            piece[1].warnings.append(
+                f"taken as the {len(spacer)} bp {kind} already joining "
+                f"{piece[0].part_name} to {piece[2].part_name} in "
+                f"{row['name']}, so the three come out of one reaction")
+            total = len(left) + len(spacer) + len(right)
+            return dict(row), _places(piece, lo, len(text), strand, total)
+    return None
+
+
+#: How far past one protein the next may start and still be a 2A fusion.
+MAX_2A = 120
+
+
+def _is_2a(spacer: str, translate) -> bool:
+    """Whether this stretch could be the 2A peptide joining two proteins."""
+    if not 45 <= len(spacer) <= MAX_2A or len(spacer) % 3:
+        return False
+    protein = translate(spacer)
+    return "*" not in protein
+
+
+def _places(piece: list, at: int, text_length: int, strand: int,
+            total: int | None = None) -> list[dict]:
+    """Where each module of a located run sits, in the plasmid's own frame."""
+    total = total if total is not None else sum(len(rm.seq) for rm in piece)
+    places, offset = [], 0
+    for rm in piece:
+        if strand == 1:
+            places.append({"start": at + offset,
+                           "end": at + offset + len(rm.seq), "strand": 1})
+        else:
+            # The search ran on the other strand, so map back: what starts
+            # `offset` into the match there ends the same distance from its
+            # far end here.
+            end = text_length - (at + offset)
+            places.append({"start": end - len(rm.seq), "end": end,
+                           "strand": -1})
+        offset += len(rm.seq)
+    return places
+
+
 def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
     """Take a part from the recipient when the recipient already has it.
 
@@ -276,6 +446,8 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                 rm.sources = chosen + [x for x in rm.sources
                                        if x["id"] != wanted]
                 rm.pinned_source = True
+
+    fused_notes = _prefer_fused_source(conn, resolved)
 
     from_recipient = (_prefer_backbone_as_source(resolved, backbone)
                       if backbone else [])

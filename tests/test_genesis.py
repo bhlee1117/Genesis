@@ -3715,3 +3715,94 @@ class TestDonorAccuracy(unittest.TestCase):
         self.assertTrue(options[0]["exact"])
         # The relative is still offered, just not first.
         self.assertFalse(options[-1]["exact"])
+
+
+class TestFusedSource(unittest.TestCase):
+    """A 2A fusion that already exists is taken whole."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.cfg = Config()
+        self.a = orf(120, 131)                   # first protein
+        self.b = orf(90, 132)                    # second protein
+        # The plasmid's own 2A: in frame, no stop, and not the generic one
+        # a specification resolves "P2A" to.
+        self.spacer = "GGA" * 20
+        self.generic = "GGC" * 22
+        self.parts = {}
+        for nm, sq, ft in (("A", self.a, "CDS"), ("B", self.b, "CDS"),
+                           ("P2A", self.generic, "p2A")):
+            self.parts[nm] = self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ft, nm, sq, nm, len(sq))).lastrowid
+
+    def _plasmid(self, name, body, carries):
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,1,'unverified')""",
+            (name, body, len(body), name)).lastrowid
+        for part_name in carries:
+            sq = {"A": self.a, "B": self.b, "P2A": self.generic}[part_name]
+            at = body.find(sq)
+            self.conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,1)""",
+                (self.parts[part_name], pid, at, at + len(sq)))
+        self.conn.commit()
+        return pid
+
+    def _modules(self):
+        from genesis.construct import ResolvedModule, Module
+        return [
+            ResolvedModule(module=Module("CDS", "A"), part_id=self.parts["A"],
+                           part_name="A", seq=self.a, feature_type="CDS",
+                           sources=[], warnings=[]),
+            ResolvedModule(module=Module("p2A", "P2A"),
+                           part_id=self.parts["P2A"], part_name="P2A",
+                           seq=self.generic, feature_type="p2A",
+                           sources=[], warnings=[]),
+            ResolvedModule(module=Module("CDS", "B"), part_id=self.parts["B"],
+                           part_name="B", seq=self.b, feature_type="CDS",
+                           sources=[], warnings=[]),
+        ]
+
+    def _with_sources(self, mods, pid):
+        row = self.conn.execute(
+            "SELECT id, name, owner, verified, circular, seq_length "
+            "FROM plasmid WHERE id = ?", (pid,)).fetchone()
+        for rm in mods:
+            rm.sources = [dict(row, **{"start": 0, "end": 1, "strand": 1})]
+        return mods
+
+    def test_a_pair_joined_by_a_2a_is_taken_from_one_plasmid(self):
+        from genesis.design import _prefer_fused_source
+        fused = self.a + self.spacer + self.b
+        pid = self._plasmid("fusion", fused + rand_seq(600, 133),
+                            ["A", "B"])
+        mods = self._with_sources(self._modules(), pid)
+        notes = _prefer_fused_source(self.conn, mods)
+        self.assertTrue(notes, "the fusion should have been found")
+        # All three now come off that plasmid, at adjoining coordinates.
+        self.assertTrue(all(m.sources[0]["id"] == pid for m in mods))
+        self.assertEqual(mods[0].sources[0]["end"], mods[1].sources[0]["start"])
+        self.assertEqual(mods[1].sources[0]["end"], mods[2].sources[0]["start"])
+        # And the 2A is the one that plasmid actually uses.
+        self.assertEqual(mods[1].seq, self.spacer)
+
+    def test_proteins_too_far_apart_are_not_a_fusion(self):
+        from genesis.design import _prefer_fused_source
+        apart = self.a + rand_seq(400, 134) + self.b
+        pid = self._plasmid("not-a-fusion", apart + rand_seq(300, 135),
+                            ["A", "B"])
+        mods = self._with_sources(self._modules(), pid)
+        self.assertEqual(_prefer_fused_source(self.conn, mods), [])
+        self.assertEqual(mods[1].seq, self.generic, "the 2A is unchanged")
+
+    def test_a_spacer_with_a_stop_codon_is_not_a_2a(self):
+        from genesis.design import _prefer_fused_source
+        stopped = self.a + "GGA" * 9 + "TAA" + "GGA" * 10 + self.b
+        pid = self._plasmid("stopped", stopped + rand_seq(300, 136),
+                            ["A", "B"])
+        mods = self._with_sources(self._modules(), pid)
+        self.assertEqual(_prefer_fused_source(self.conn, mods), [])

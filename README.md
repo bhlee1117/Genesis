@@ -493,7 +493,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           271 tests, no lab share required
+tests/           274 tests, no lab share required
 ```
 
 ## Giving it to a labmate
