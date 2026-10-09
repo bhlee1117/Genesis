@@ -10,6 +10,7 @@ import json
 import sqlite3
 
 from .config import Config
+from .seqtools import revcomp
 from .construct import (ConstructSpec, assemble,
                         assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
@@ -179,6 +180,50 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec,
     return dict(row) if row else None
 
 
+def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
+    """Take a part from the recipient when the recipient already has it.
+
+    Modules are resolved against the whole catalogue before any backbone is
+    chosen, so "hSyn" binds to whichever part the search ranks first and
+    carries that part's home plasmid with it.  Nothing afterwards asks
+    whether the recipient has the same bases.  It usually does - a
+    pAAV-hSyn vector is being used precisely because it has hSyn - and
+    amplifying them from an unrelated, often unverified plasmid instead
+    adds a template, a reaction and two junctions, for a molecule that is
+    identical either way.
+
+    Only an exact match counts.  A promoter that merely resembles the
+    recipient's is a different promoter, and swapping it is the whole point
+    of naming it.
+    """
+    host = (backbone.get("seq") or "").upper()
+    if not host:
+        return []
+    moved: list[str] = []
+    for rm in resolved:
+        if not rm.seq or len(rm.seq) < 40:
+            continue
+        if rm.sources and rm.sources[0]["id"] == backbone["id"]:
+            continue
+        wanted = rm.seq.upper()
+        at, strand = host.find(wanted), 1
+        if at < 0:
+            at, strand = host.find(revcomp(wanted)), -1
+        if at < 0:
+            continue
+        rm.sources = [{
+            "id": backbone["id"], "name": backbone["name"],
+            "owner": backbone.get("owner", ""),
+            "verified": backbone.get("verified", "unverified"),
+            "available_template": backbone.get("available_template", 1),
+            "circular": backbone.get("circular", 1),
+            "seq_length": backbone.get("seq_length") or len(host),
+            "start": at, "end": at + len(wanted), "strand": strand,
+        }] + [x for x in rm.sources if x["id"] != backbone["id"]]
+        moved.append(rm.part_name)
+    return moved
+
+
 def design(conn: sqlite3.Connection, spec: ConstructSpec,
            cfg: Config | None = None) -> dict:
     cfg = cfg or Config()
@@ -207,6 +252,9 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     backbone = _load_backbone(
         conn, spec, cfg,
         preferred_id=ranked[0]["plasmid_id"] if ranked else None)
+
+    from_recipient = (_prefer_backbone_as_source(resolved, backbone)
+                      if backbone else [])
 
     # Expand any DIO module into its cassette before assembling, so the
     # molecule that gets validated is the one that would actually be built.

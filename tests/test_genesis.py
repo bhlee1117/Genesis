@@ -3214,6 +3214,47 @@ class TestBackboneArcs(unittest.TestCase):
         for s in kept:
             self.assertNotIn(old_cds, s["seq"])
 
+    def test_a_wider_part_does_not_duplicate_the_recipients_bases(self):
+        """The part and the recipient's annotation disagree on boundaries.
+
+        The catalogued promoter is wider than the span the recipient marks.
+        Replacing the marked span with the part leaves the bases they
+        disagree about on both sides of the join: once in the arc that is
+        kept, and again inside the piece put in its place.
+        """
+        from genesis.construct import (assemble_into_backbone, ResolvedModule,
+                                       Module)
+        lead = rand_seq(120, 51)
+        promoter = rand_seq(400, 52)       # the catalogued part
+        old_cds = rand_seq(450, 53)
+        tail = rand_seq(900, 54)
+        backbone = lead + promoter + old_cds + tail
+        # The recipient marks only the middle 300 bp of that promoter.
+        anns = [
+            {"feature_type": "promoter", "name": "its own",
+             "start": 120 + 50, "end": 120 + 350, "strand": 1},
+            {"feature_type": "CDS", "name": "old",
+             "start": 520, "end": 970, "strand": 1},
+            {"feature_type": "origin", "name": "ori",
+             "start": 1000, "end": 1300, "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR",
+             "start": 1300, "end": 1700, "strand": 1},
+        ]
+        mods = [
+            ResolvedModule(module=Module("promoter", "P"), part_id=1,
+                           part_name="P", seq=promoter,
+                           feature_type="promoter", sources=[], warnings=[]),
+            ResolvedModule(module=Module("CDS", "new"), part_id=2,
+                           part_name="new", seq=rand_seq(300, 55),
+                           feature_type="CDS", sources=[], warnings=[]),
+        ]
+        con = assemble_into_backbone(mods, backbone, anns, {"promoter", "CDS"})
+        self.assertEqual(con.seq.count(promoter), 1,
+                         "the promoter should appear once, not overlap itself")
+        # The bases either side of it must not be repeated across the join.
+        self.assertEqual(con.seq.count(promoter[:50]), 1)
+        self.assertEqual(con.seq.count(promoter[-50:]), 1)
+
     def test_an_unamplifiable_arc_rides_on_a_primer(self):
         """There is no such thing as a 25 bp PCR."""
         from genesis.planner import _carry

@@ -1027,8 +1027,26 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                if a["feature_type"] in REGULATORY_TYPES
                and a["end"] <= lower and a["start"] < arc_end]
         if own:
-            edits.append({"start": min(a["start"] for a in own),
-                          "end": max(a["end"] for a in own),
+            lo = min(a["start"] for a in own)
+            hi = max(a["end"] for a in own)
+            # The part and the recipient's annotation almost never agree on
+            # where a promoter starts and stops: the catalogued hSyn is 485
+            # bp, the recipient marks 448 bp of the same promoter, and
+            # neither is wrong.  Replacing the annotated span with the part
+            # then leaves the bases they disagree about on both sides of the
+            # join - present once in the arc that is kept, and again inside
+            # the piece put in its place, as a direct repeat the construct
+            # never asked for.  So when the recipient actually contains
+            # these bases, the region replaced is where they really are.
+            at = rotated_seq.upper().find(regulatory_seq.upper())
+            if (0 <= at
+                    # It has to stay in its own slot: a promoter part can be
+                    # long enough to reach into the payload, and replacing
+                    # that far would delete the coding sequence going in.
+                    and at + len(regulatory_seq) <= lower
+                    and abs(at - lo) <= len(regulatory_seq)):
+                lo, hi = at, at + len(regulatory_seq)
+            edits.append({"start": lo, "end": hi,
                           "seq": regulatory_seq, "layout": regulatory_layout})
         else:
             edits.append({"start": lower, "end": lower, "seq": regulatory_seq,
