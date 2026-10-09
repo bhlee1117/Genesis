@@ -391,6 +391,11 @@ class AssembledConstruct:
     #: these is not the construct that was asked for, so no route may be
     #: offered for it.
     missing_required: list = field(default_factory=list)
+    #: The arcs of the recipient this construct keeps, in the order they
+    #: appear in it, each with its coordinates in the original plasmid. A
+    #: route has to amplify these rather than the whole plasmid, or the
+    #: product carries the payload that was supposed to be replaced.
+    backbone_segments: list = field(default_factory=list)
 
     @property
     def length(self) -> int:
@@ -1032,10 +1037,36 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                 "the backbone has no promoter upstream of its cassette, so "
                 "the one specified was inserted rather than replacing one")
 
+    # Which arcs of the recipient survive, and where each lands in the
+    # finished molecule.  Everything not covered by an edit is kept, so
+    # walking the edits in order gives the pieces between them.
+    kept: list[dict] = []
+    cursor_rot = 0
+    cursor_final = 0
+    for e in sorted(edits, key=lambda d: d["start"]):
+        if e["start"] > cursor_rot:
+            kept.append({
+                "seq": rotated_seq[cursor_rot:e["start"]],
+                "source_start": (cursor_rot + rotation) % total,
+                "source_end": (e["start"] + rotation) % total,
+                "construct_start": cursor_final,
+            })
+            cursor_final += e["start"] - cursor_rot
+        cursor_rot = max(cursor_rot, e["end"])
+        cursor_final += len(e["seq"])
+    if cursor_rot < len(rotated_seq):
+        kept.append({
+            "seq": rotated_seq[cursor_rot:],
+            "source_start": (cursor_rot + rotation) % total,
+            "source_end": rotation % total,
+            "construct_start": cursor_final,
+        })
+
     seq, layout, dropped = _splice(rotated_seq, rotated, edits)
     for name in dropped:
         warnings.append(
             f"the backbone feature {name!r} straddles an insertion point "
             f"and was disrupted")
 
-    return AssembledConstruct(seq, circular, layout, warnings, missing_required)
+    return AssembledConstruct(seq, circular, layout, warnings,
+                              missing_required, backbone_segments=kept)

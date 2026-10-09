@@ -3181,3 +3181,57 @@ class TestArchitectureCandidates(unittest.TestCase):
         self.assertFalse(top["exact"])
         self.assertTrue(any("as XXX-relative" in x for x in top["carries"]),
                         top["carries"])
+
+
+class TestBackboneArcs(unittest.TestCase):
+    """The route amplifies what the construct keeps, not the whole plasmid."""
+
+    def test_the_kept_arcs_are_recorded(self):
+        from genesis.construct import assemble_into_backbone, ResolvedModule
+        from genesis.construct import Module
+        payload = rand_seq(300, 21)
+        old_cds = rand_seq(450, 22)
+        backbone = rand_seq(600, 23) + old_cds + rand_seq(900, 24)
+        anns = [
+            {"feature_type": "CDS", "name": "old", "start": 600,
+             "end": 1050, "strand": 1},
+            {"feature_type": "origin", "name": "ori", "start": 1200,
+             "end": 1500, "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR", "start": 1500,
+             "end": 1900, "strand": 1},
+        ]
+        rm = ResolvedModule(module=Module("CDS", "new"), part_id=1,
+                            part_name="new", seq=payload, feature_type="CDS",
+                            sources=[], warnings=[])
+        con = assemble_into_backbone([rm], backbone, anns, {"CDS"})
+
+        kept = con.backbone_segments
+        self.assertTrue(kept, "no backbone arcs recorded")
+        total = sum(len(s["seq"]) for s in kept)
+        # The construct is the arcs it keeps plus what was put in.
+        self.assertEqual(total + len(payload), len(con.seq))
+        # And the replaced coding sequence is not among them.
+        for s in kept:
+            self.assertNotIn(old_cds, s["seq"])
+
+    def test_the_old_payload_does_not_come_along(self):
+        """An arc-amplified route cannot carry what it replaced."""
+        from genesis.construct import assemble_into_backbone, ResolvedModule
+        from genesis.construct import Module
+        old_cds = rand_seq(450, 31)
+        backbone = rand_seq(600, 32) + old_cds + rand_seq(900, 33)
+        anns = [
+            {"feature_type": "CDS", "name": "old", "start": 600,
+             "end": 1050, "strand": 1},
+            {"feature_type": "origin", "name": "ori", "start": 1200,
+             "end": 1500, "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR", "start": 1500,
+             "end": 1900, "strand": 1},
+        ]
+        rm = ResolvedModule(module=Module("CDS", "new"), part_id=1,
+                            part_name="new", seq=rand_seq(300, 34),
+                            feature_type="CDS", sources=[], warnings=[])
+        con = assemble_into_backbone([rm], backbone, anns, {"CDS"})
+        joined = "".join(s["seq"] for s in con.backbone_segments)
+        self.assertNotIn(old_cds, joined)
+        self.assertNotIn(old_cds, con.seq)

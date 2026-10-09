@@ -244,11 +244,32 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         realised[idx] = (tpl, st, en,
                          slice_region(tpl, st, en, circular=circ), circ)
 
-    pieces: list[tuple[str, str]] = []
-    if backbone:
-        pieces.append(("backbone", backbone["seq"]))
+    # The finished molecule in order: the arcs of the recipient it keeps,
+    # and the fragments supplying everything else.  Amplifying the whole
+    # recipient instead of the arcs it keeps is how a product came to carry
+    # the payload it was supposed to replace.
+    ordered: list[dict] = []
+    segments = construct.backbone_segments if backbone else []
+    for i, seg in enumerate(segments):
+        ordered.append({
+            "kind": "backbone",
+            "name": "backbone" if len(segments) == 1 else f"backbone{i + 1}",
+            "seq": seg["seq"], "at": seg["construct_start"],
+            "source_start": seg["source_start"], "source_end": seg["source_end"],
+        })
+    if backbone and not segments:
+        # Nothing recorded which arcs survive, so the whole plasmid stands in.
+        ordered.append({"kind": "backbone", "name": "backbone",
+                        "seq": backbone["seq"], "at": -1,
+                        "source_start": 0, "source_end": len(backbone["seq"])})
     for idx, f in enumerate(fragments):
-        pieces.append((f.name, realised[idx][3]))
+        ordered.append({
+            "kind": "fragment", "name": f.name, "seq": realised[idx][3],
+            "at": f.modules[0]["start"] if f.modules else 0, "index": idx,
+        })
+    ordered.sort(key=lambda o: o["at"])
+
+    pieces: list[tuple[str, str]] = [(o["name"], o["seq"]) for o in ordered]
     if not pieces:
         route.feasible = False
         route.warnings.append("nothing to assemble")
@@ -258,33 +279,40 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     templates_needing_dpni: list[str] = []
 
     # --- backbone amplification ------------------------------------------
-    if backbone:
-        bb_seq = backbone["seq"]
-        up = pieces[-1][1]
-        down = pieces[1][1] if n > 1 else bb_seq
+    for k, piece in enumerate(ordered):
+        if piece["kind"] != "backbone":
+            continue
+        bb_seq = piece["seq"]
+        up = pieces[k - 1][1]
+        down = pieces[(k + 1) % n][1]
         fwd, rev = design_gibson_pair(
-            0, "backbone", bb_seq, 0, len(bb_seq), up, down, cfg,
+            0, piece["name"], backbone["seq"],
+            piece["source_start"], piece["source_end"], up, down, cfg,
             circular_template=bool(backbone.get("circular")),
             carry_downstream=False)
         primers += [fwd, rev]
         if len(bb_seq) > cfg.max_pcr_length:
             route.warnings.append(
-                f"the backbone amplicon is {len(bb_seq)} bp, above the "
+                f"the {piece['name']} amplicon is {len(bb_seq)} bp, above the "
                 f"{cfg.max_pcr_length} bp PCR limit in the configuration; "
                 f"linearising the backbone with a restriction digest is "
                 f"usually more reliable than amplifying it")
         steps.append(Step(
             0, "PCR",
-            f"Amplify the {len(bb_seq)} bp backbone from {backbone['name']} "
-            f"with primers {fwd.name} / {rev.name}",
+            f"Amplify the {len(bb_seq):,} bp {piece['name']} arc "
+            f"({piece['source_start']:,}-{piece['source_end']:,}) from "
+            f"{backbone['name']} with primers {fwd.name} / {rev.name}",
             inputs=[backbone["name"], f"{fwd.name}+{rev.name}"],
-            output="backbone amplicon",
+            output=f"{piece['name']} amplicon",
             details={"length": len(bb_seq), "template": backbone["name"]}))
-        templates_needing_dpni.append(backbone["name"])
+        if backbone["name"] not in templates_needing_dpni:
+            templates_needing_dpni.append(backbone["name"])
 
     # --- insert amplification ---------------------------------------------
+    where = {o["index"]: k for k, o in enumerate(ordered)
+             if o["kind"] == "fragment"}
     for i, frag in enumerate(fragments):
-        piece_index = i + (1 if backbone else 0)
+        piece_index = where.get(i, i)
         up = pieces[piece_index - 1][1]
         down = pieces[(piece_index + 1) % n][1]
 

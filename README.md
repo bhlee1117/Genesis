@@ -493,7 +493,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           249 tests, no lab share required
+tests/           251 tests, no lab share required
 ```
 
 ## Giving it to a labmate
@@ -548,10 +548,12 @@ design asked for. A route whose steps lose a part is marked unusable.
 
 This exists because reading the designed molecule back cannot catch a
 design that verifies perfectly while the protocol under it builds something
-else. It found three real faults on its first run: overlaps written onto
+else. It found four real faults: overlaps written onto
 both sides of every junction, a fragment amplified the right way up when
 the construct needs it inverted, and overlaps taken from a catalogued part
-rather than from the amplicon the reaction actually yields.
+rather than from the amplicon the reaction actually yields, and a route
+amplifying the whole recipient instead of the arcs the construct keeps, so
+the product carried the payload it was meant to replace.
 
 ### Keeping the inventory current
 

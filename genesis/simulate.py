@@ -220,8 +220,13 @@ def _templates(conn: sqlite3.Connection, plan: dict) -> dict:
     backbone = plan.get("backbone") or {}
     row = _plasmid(conn, backbone.get("id"))
     if row is not None:
-        out.setdefault("backbone", (row["seq"], bool(row["circular"]),
-                                    row["name"]))
+        entry = (row["seq"], bool(row["circular"]), row["name"])
+        out.setdefault("backbone", entry)
+        out.setdefault(row["name"], entry)
+        # The recipient is amplified as the arcs the construct keeps, so a
+        # route can cite backbone1, backbone2 ... all off the same plasmid.
+        for i in range(1, 17):
+            out.setdefault(f"backbone{i}", entry)
 
     for frag in plan.get("fragments") or []:
         row = _plasmid(conn, frag.get("source_plasmid_id"))
