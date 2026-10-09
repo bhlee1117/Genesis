@@ -3214,6 +3214,31 @@ class TestBackboneArcs(unittest.TestCase):
         for s in kept:
             self.assertNotIn(old_cds, s["seq"])
 
+    def test_an_unamplifiable_arc_rides_on_a_primer(self):
+        """There is no such thing as a 25 bp PCR."""
+        from genesis.planner import _carry
+        from genesis.primers import Primer
+        from genesis.planner import Route
+        route = Route(id="x", strategy="hifi", title="t")
+        arc = rand_seq(25, 41)
+        fwd = Primer(name="next-F", sequence="ggggg" + "ACGTACGTACGTACGTAC",
+                     anneal="ACGTACGTACGTACGTAC", tail="ggggg", direction="F")
+        _carry(fwd, arc, route, Config())
+        # The bases still exist, and in the right place: overlap, arc, body.
+        self.assertEqual(fwd.sequence, "ggggg" + arc + "ACGTACGTACGTACGTAC")
+        self.assertTrue(fwd.sequence.startswith("ggggg"))
+        self.assertEqual(route.warnings, [])
+
+    def test_a_very_long_carry_is_flagged(self):
+        from genesis.planner import _carry, Route
+        from genesis.primers import Primer
+        route = Route(id="x", strategy="hifi", title="t")
+        fwd = Primer(name="next-F", sequence="A" * 20, anneal="A" * 20,
+                     tail="", direction="F")
+        _carry(fwd, rand_seq(90, 42), route, Config())
+        self.assertTrue(any("ultramer" in w for w in route.warnings),
+                        route.warnings)
+
     def test_the_old_payload_does_not_come_along(self):
         """An arc-amplified route cannot carry what it replaced."""
         from genesis.construct import assemble_into_backbone, ResolvedModule

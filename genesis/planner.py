@@ -269,7 +269,33 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         })
     ordered.sort(key=lambda o: o["at"])
 
-    pieces: list[tuple[str, str]] = [(o["name"], o["seq"]) for o in ordered]
+    # A kept arc can be a handful of bases - the gap between a promoter and
+    # the coding sequence after it - and there is no such thing as a 25 bp
+    # PCR.  Anything too short to amplify is carried on the next piece's
+    # forward primer instead, which puts the same bases in the same place
+    # for the cost of a longer oligo.
+    carried: dict[int, str] = {}
+    keep: list[dict] = []
+    pending = ""
+    for o in ordered:
+        if o["kind"] == "backbone" and len(o["seq"]) < cfg.min_pcr_length:
+            pending += o["seq"]
+            continue
+        if pending:
+            carried[len(keep)] = pending
+            pending = ""
+        keep.append(o)
+    if keep:
+        if pending:
+            # Arcs after the last amplified piece wrap onto the first.
+            carried[0] = pending + carried.get(0, "")
+        ordered = keep
+    else:
+        carried = {}
+
+    pieces: list[tuple[str, str]] = [
+        (o["name"], carried.get(i, "") + o["seq"])
+        for i, o in enumerate(ordered)]
     if not pieces:
         route.feasible = False
         route.warnings.append("nothing to assemble")
@@ -290,6 +316,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             piece["source_start"], piece["source_end"], up, down, cfg,
             circular_template=bool(backbone.get("circular")),
             carry_downstream=False)
+        _carry(fwd, carried.get(k, ""), route, cfg)
         primers += [fwd, rev]
         if len(bb_seq) > cfg.max_pcr_length:
             route.warnings.append(
@@ -338,6 +365,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         fwd, rev = design_gibson_pair(
             i, frag.name, tpl, start, end, up, down, cfg,
             circular_template=circ, carry_downstream=False)
+        _carry(fwd, carried.get(piece_index, ""), route, cfg)
         # Report where the part is in the donor, not where it is in the
         # strand the primers were written against.
         for pr in (fwd, rev):
@@ -795,6 +823,25 @@ def failure_history(conn: sqlite3.Connection) -> dict:
 # region out of it, and put a piece from a second plasmid in its place.
 # Two parents, one junction pair, one assembly reaction.
 # --------------------------------------------------------------------------
+
+def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
+    """Put an un-amplifiable arc onto the primer that makes the next piece.
+
+    The bases still have to exist in some tube.  Adding them after the
+    overlap means the amplicon reads overlap-arc-body, which is the same
+    molecule a separate reaction would have given, at the price of a longer
+    oligo rather than a PCR nobody can run.
+    """
+    if not extra:
+        return
+    fwd.tail = fwd.tail + extra
+    fwd.sequence = fwd.tail + fwd.anneal
+    if len(fwd.sequence) > 100:
+        route.warnings.append(
+            f"primer {fwd.name} is {len(fwd.sequence)} nt because it carries "
+            f"a {len(extra)} bp stretch of the recipient that is too short to "
+            f"amplify; order it as an ultramer, or synthesise that junction")
+
 
 def _amplification_frame(template: str, start: int, end: int,
                          strand: int, wanted: str = "",
