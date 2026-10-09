@@ -755,7 +755,7 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
             out += [f"- {i['category']}: {i['message']}" for i in items]
             out.append("")
 
-    cand = p.get("candidates") or {}
+    cand = plan.get("candidates") or {}
     if cand.get("recipients") or cand.get("donors"):
         out += ["### Candidate parents", "",
                 "The request read as an ordered architecture: "
