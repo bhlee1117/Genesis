@@ -1311,3 +1311,33 @@ tr.row-bad td {
   border-radius: 3px;
   vertical-align: middle;
 }
+
+/* ---- candidate parents -------------------------------------------- */
+.cand-list { display: flex; flex-direction: column; gap: 2px; margin: 6px 0 10px; }
+.cand-row {
+  display: grid;
+  grid-template-columns: 20px 46px minmax(140px, 1.4fr) minmax(120px, 1fr) 2fr;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.cand-row:hover { background: var(--row-hover, rgba(127, 127, 127, 0.10)); }
+.cand-on { background: var(--row-hover, rgba(127, 127, 127, 0.16)); }
+.cand-score {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: right;
+}
+.cand-name { font-weight: 600; overflow-wrap: anywhere; }
+.cand-has { overflow-wrap: anywhere; }
+.cand-donor {
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+  margin: 8px 0 12px;
+}
+@media (max-width: 820px) {
+  .cand-row { grid-template-columns: 20px 46px 1fr; }
+  .cand-row .muted { grid-column: 3; }
+}

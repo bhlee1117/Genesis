@@ -203,6 +203,8 @@ def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
     for rm in resolved:
         if not rm.seq or len(rm.seq) < 40:
             continue
+        if getattr(rm, "pinned_source", False):
+            continue          # somebody said where this comes from
         if rm.sources and rm.sources[0]["id"] == backbone["id"]:
             continue
         wanted = rm.seq.upper()
@@ -262,6 +264,18 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     backbone = _load_backbone(
         conn, spec, cfg,
         preferred_id=ranked[0]["plasmid_id"] if ranked else None)
+
+    # An explicit choice of where to take a part from outranks the search
+    # that ranked the sources, and outranks the recipient too: somebody
+    # saying "that tube" has a reason the inventory cannot see.
+    for rm in resolved:
+        wanted = spec.source_plasmid_ids.get(rm.part_id or -1)
+        if wanted and rm.sources:
+            chosen = [x for x in rm.sources if x["id"] == wanted]
+            if chosen:
+                rm.sources = chosen + [x for x in rm.sources
+                                       if x["id"] != wanted]
+                rm.pinned_source = True
 
     from_recipient = (_prefer_backbone_as_source(resolved, backbone)
                       if backbone else [])
@@ -471,6 +485,11 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
             "type": r.feature_type, "requested": r.module.name,
             "part_id": r.part_id, "part_name": r.part_name,
             "length": r.length,
+            # What this module actually resolved to, which is not always the
+            # catalogued part: one the recipient already carries is rebound
+            # to the recipient's own copy, and anything checking the finished
+            # molecule has to look for those bases rather than the part's.
+            "seq": r.seq,
             "sources": [{"plasmid_id": s["id"], "name": s["name"],
                          "owner": s["owner"], "verified": s["verified"],
                          "start": s["start"], "end": s["end"],

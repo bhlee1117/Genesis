@@ -3421,3 +3421,129 @@ class TestInvertedPayload(unittest.TestCase):
                             [{"start": 0, "strand": -1}], placed_strand=-1)
         self.assertEqual(f.placed_seq, body)
         self.assertNotEqual(f.placed_seq, revcomp(body))
+
+
+class TestContiguousMerge(unittest.TestCase):
+    """Neighbouring stretches of one plasmid are one reaction."""
+
+    def _piece(self, kind, name, seq, at, start, end, index=None):
+        p = {"kind": kind, "name": name, "seq": seq, "at": at,
+             "source_start": start, "source_end": end}
+        if index is not None:
+            p["index"] = index
+        return p
+
+    def test_arcs_and_a_module_from_the_same_plasmid_merge(self):
+        from genesis.planner import _merge_contiguous
+        a, b, c = rand_seq(100, 81), rand_seq(400, 82), rand_seq(60, 83)
+        pieces = [
+            self._piece("backbone", "backbone1", a, 0, 130, 230),
+            self._piece("fragment", "hsyn", b, 100, 230, 630, index=0),
+            self._piece("backbone", "backbone2", c, 500, 630, 690),
+        ]
+        merged, absorbed = _merge_contiguous(pieces, 5829)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["source_start"], 130)
+        self.assertEqual(merged[0]["source_end"], 690)
+        self.assertEqual(merged[0]["seq"], a + b + c)
+        self.assertIn(0, absorbed, "the module no longer needs its own PCR")
+
+    def test_a_gap_is_not_merged(self):
+        from genesis.planner import _merge_contiguous
+        pieces = [
+            self._piece("backbone", "b1", rand_seq(100, 84), 0, 130, 230),
+            self._piece("fragment", "x", rand_seq(100, 85), 100, 900, 1000,
+                        index=0),
+        ]
+        merged, absorbed = _merge_contiguous(pieces, 5829)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(absorbed, set())
+
+    def test_a_piece_from_another_plasmid_is_not_merged(self):
+        """A fragment off a donor carries no recipient coordinates."""
+        from genesis.planner import _merge_contiguous
+        pieces = [
+            self._piece("backbone", "b1", rand_seq(100, 86), 0, 130, 230),
+            {"kind": "fragment", "name": "donor-cds", "seq": rand_seq(300, 87),
+             "at": 100, "index": 0},
+        ]
+        merged, absorbed = _merge_contiguous(pieces, 5829)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(absorbed, set())
+
+    def test_the_join_across_position_one_still_merges(self):
+        from genesis.planner import _merge_contiguous
+        head = self._piece("backbone", "b-head", rand_seq(200, 88), 0, 0, 200)
+        tail = self._piece("backbone", "b-tail", rand_seq(300, 89), 900,
+                           5000, 5829)
+        merged, _ = _merge_contiguous([head, tail], 5829)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["source_start"], 5000)
+        self.assertEqual(merged[0]["source_end"], 200)
+
+
+class TestVectorElementReuse(unittest.TestCase):
+    """The recipient's own WPRE is only reused if it survives."""
+
+    def _backbone(self, wpre_inside):
+        """A recipient whose WPRE sits inside or outside the payload arc."""
+        prom = rand_seq(300, 91)
+        old_cds = rand_seq(600, 92)
+        wpre = rand_seq(400, 93)
+        tail = rand_seq(500, 94)
+        if wpre_inside:
+            seq = prom + old_cds + wpre + tail
+            w_start = len(prom) + len(old_cds)
+        else:
+            seq = prom + old_cds + tail + wpre
+            w_start = len(prom) + len(old_cds) + len(tail)
+        anns = [
+            {"feature_type": "promoter", "name": "p", "start": 0,
+             "end": len(prom), "strand": 1},
+            {"feature_type": "CDS", "name": "old", "start": len(prom),
+             "end": len(prom) + len(old_cds), "strand": 1},
+            {"feature_type": "WPRE", "name": "its WPRE", "start": w_start,
+             "end": w_start + len(wpre), "strand": 1},
+            {"feature_type": "origin", "name": "ori",
+             "start": len(seq) - 300, "end": len(seq) - 150, "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR",
+             "start": len(seq) - 150, "end": len(seq), "strand": 1},
+        ]
+        return seq, anns, wpre
+
+    def _modules(self, wpre):
+        from genesis.construct import ResolvedModule, Module
+        return [
+            ResolvedModule(module=Module("CDS", "new"), part_id=1,
+                           part_name="new", seq=rand_seq(300, 95),
+                           feature_type="CDS", sources=[], warnings=[]),
+            ResolvedModule(module=Module("WPRE", "WPRE"), part_id=2,
+                           part_name="WPRE", seq=wpre, feature_type="WPRE",
+                           sources=[], warnings=[]),
+        ]
+
+    def test_the_construct_ends_up_with_exactly_one(self):
+        """Reused or inserted, never both and never neither.
+
+        Whether the recipient's own copy survives depends on where it sits
+        relative to the stretch being replaced. Either answer is fine; two
+        copies is a repeat nothing can disambiguate, and none is a construct
+        missing what it was asked for.
+        """
+        from genesis.construct import assemble_into_backbone
+        for inside in (True, False):
+            seq, anns, wpre = self._backbone(wpre_inside=inside)
+            con = assemble_into_backbone(self._modules(wpre), seq, anns,
+                                         {"CDS", "WPRE"})
+            self.assertEqual(con.seq.count(wpre), 1,
+                             f"wpre_inside={inside}: {con.warnings}")
+
+    def test_a_copy_inside_the_arc_is_not_relied_on(self):
+        """It gets cut away, so the construct would end up without one."""
+        from genesis.construct import assemble_into_backbone
+        seq, anns, wpre = self._backbone(wpre_inside=True)
+        con = assemble_into_backbone(self._modules(wpre), seq, anns,
+                                     {"CDS", "WPRE"})
+        self.assertIn(wpre, con.seq, "the construct must still have a WPRE")
+        self.assertFalse(any("already carries" in w for w in con.warnings),
+                         con.warnings)

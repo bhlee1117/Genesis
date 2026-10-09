@@ -1798,6 +1798,10 @@ function usingYaml() {
    which is the default and must stay reachable once something is pinned. */
 var pinnedParents = { recipient: null, donor: null };
 
+/* Which plasmid to take each part from, as {part_id: plasmid_id}. Chosen in
+   the Candidate parents card; the planner otherwise ranks the sources. */
+var pinnedSources = {};
+
 /* A pinned parent has to survive whichever way the spec is being written.
    In YAML mode collectSpec hands back the user's own text, so the pins are
    merged into it rather than silently dropped. */
@@ -1846,6 +1850,7 @@ function collectSpec() {
   else spec.backbone = backbone;
   if (pinnedParents.recipient) spec.recipient_plasmid_id = pinnedParents.recipient;
   if (pinnedParents.donor) spec.donor_plasmid_id = pinnedParents.donor;
+  if (Object.keys(pinnedSources).length) spec.source_plasmid_ids = pinnedSources;
   return spec;
 }
 
@@ -2001,6 +2006,7 @@ function clearSpec() {
   // recipient or donor to be pinned to.
   pinnedParents.recipient = null;
   pinnedParents.donor = null;
+  pinnedSources = {};
   state.plan = null;
   state.spec = null;
   state.routeId = null;
@@ -2423,6 +2429,9 @@ function renderPlan() {
   }
   out.appendChild(summary);
 
+  var cands = renderCandidates(plan);
+  if (cands) out.appendChild(cands);
+
   var scheme = schemeCard(plan);
   if (scheme) out.appendChild(scheme);
 
@@ -2692,6 +2701,115 @@ function renderConstruct(c) {
  * for. Note that `problems` can be non-empty on a pass: a part that occurs
  * more than once is reported but is not by itself a failure.
  */
+/* ------------------------------------------------------------------ */
+/* Plan: choosing the parents before anything is designed              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The request read as an architecture, with the parents on offer.
+ *
+ * The planner picks the plasmid that already carries the longest leading
+ * run, and takes whatever is left from as few donors as it can. Both are
+ * only ever the best guess from what is catalogued: somebody may know that
+ * one of these is on their own bench, or sequenced, or simply the one the
+ * lab uses. Choosing here re-plans from that choice.
+ */
+function renderCandidates(plan) {
+  var cand = plan.candidates || {};
+  var recipients = cand.recipients || [];
+  var donors = cand.donors || [];
+  if (!recipients.length && !donors.length) return null;
+
+  var chosenBackbone = (plan.backbone && plan.backbone.id) || null;
+
+  var card = h('div', { class: 'card cand-card' },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'Candidate parents'),
+      h('span', { class: 'muted small' },
+        'start from the one that already has the most of this')));
+  card.appendChild(h('p', { class: 'muted small' },
+    'Read as an architecture: ' + (cand.modules || []).join(' – ') + '.'));
+
+  if (recipients.length) {
+    card.appendChild(h('h4', null, 'Start from'));
+    var list = h('div', { class: 'cand-list' });
+    recipients.forEach(function (r) {
+      var on = r.plasmid_id === chosenBackbone;
+      var row = h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
+        h('input', {
+          type: 'radio', name: 'cand-recipient',
+          checked: on ? 'checked' : null,
+          onchange: function () {
+            $('spec-backbone').value = String(r.plasmid_id);
+            generatePlan();
+          }
+        }),
+        h('span', { class: 'cand-score' },
+          r.run + '/' + (cand.modules || []).length),
+        h('span', { class: 'cand-name' }, r.name),
+        h('span', { class: 'muted small' },
+          bp(r.length) + (r.owner ? ' · ' + r.owner : '') +
+          (r.has_cassette ? ' · has lox cassette' : '')),
+        h('span', { class: 'muted small cand-has' },
+          'already has ' + (r.carries || []).join(', ')));
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+  }
+
+  if (donors.length) {
+    var n = cand.n_donors || 0;
+    card.appendChild(h('h4', null,
+      'Then take the rest from ' + n + ' donor' + (n === 1 ? '' : 's')));
+    donors.forEach(function (d) {
+      var box = h('div', { class: 'cand-donor' },
+        h('div', null, h('strong', null, (d.covers || []).join(' – '))));
+      if (d.note) {
+        box.appendChild(h('p', { class: 'issue issue-warning' }, d.note));
+      }
+      (d.options || []).forEach(function (o) {
+        var ids = partIdsFor(plan, d.covers || []);
+        var on = ids.length && ids.every(function (id) {
+          return pinnedSources[id] === o.plasmid_id;
+        });
+        box.appendChild(h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
+          h('input', {
+            type: 'radio', name: 'cand-donor-' + (d.covers || []).join('-'),
+            checked: on ? 'checked' : null,
+            onchange: function () {
+              ids.forEach(function (id) { pinnedSources[id] = o.plasmid_id; });
+              generatePlan();
+            }
+          }),
+          h('span', { class: 'cand-name' }, o.name),
+          h('span', { class: 'muted small' },
+            bp(o.length) + (o.owner ? ' · ' + o.owner : '')),
+          h('span', { class: 'muted small cand-has' },
+            'has ' + (o.carries || []).join(', '))));
+      });
+      card.appendChild(box);
+    });
+  }
+
+  if (Object.keys(pinnedSources).length) {
+    card.appendChild(h('p', { class: 'muted small' },
+      h('button', {
+        type: 'button', class: 'secondary',
+        onclick: function () { pinnedSources = {}; generatePlan(); }
+      }, 'Clear donor choices')));
+  }
+  return card;
+}
+
+/** The part ids behind a donor segment, so pinning one pins those parts. */
+function partIdsFor(plan, names) {
+  var wanted = {};
+  names.forEach(function (n) { wanted[n] = true; });
+  return (plan.modules || []).filter(function (m) {
+    return wanted[m.part_name] && m.part_id;
+  }).map(function (m) { return m.part_id; });
+}
+
 /* ------------------------------------------------------------------ */
 /* Plan: the protocol run on paper                                     */
 /* ------------------------------------------------------------------ */

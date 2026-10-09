@@ -50,6 +50,10 @@ class ConstructSpec:
     #: None means the specification did not mention one, which lets the
     #: configured default apply - distinct from asking for "auto".
     vector: str | None = None
+    #: Which plasmid to take a given part from, as {part_id: plasmid_id}.
+    #: A part usually sits in several plasmids and the search ranks them;
+    #: this is how somebody says "that one, it is on my bench".
+    source_plasmid_ids: dict = field(default_factory=dict)
     #: Pin the two parents of a swap. Left unset, Genesis recommends.
     recipient_plasmid_id: int | None = None
     donor_plasmid_id: int | None = None
@@ -85,6 +89,11 @@ class ConstructSpec:
                     if "vector" in data else None),
             recipient_plasmid_id=data.get("recipient_plasmid_id"),
             donor_plasmid_id=data.get("donor_plasmid_id"),
+            source_plasmid_ids={
+                int(k): int(v)
+                for k, v in (data.get("source_plasmid_ids") or {}).items()
+                if str(k).lstrip("-").isdigit() and str(v).lstrip("-").isdigit()
+            },
         )
 
     @classmethod
@@ -173,6 +182,8 @@ class ResolvedModule:
     feature_type: str
     sources: list = field(default_factory=list)   # candidate plasmid rows
     warnings: list = field(default_factory=list)
+    #: True when the specification named which plasmid to take this from.
+    pinned_source: bool = False
 
     @property
     def length(self) -> int:
@@ -985,11 +996,29 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
     # the order check, the read-back - is looking for what is really there.
     satisfied: list[tuple] = []
     taken: set = set()
+    # Only a copy that survives is any use.  The payload arc is the stretch
+    # this design replaces, so the recipient's own WPRE is kept only when it
+    # lies outside it; one sitting inside the cassette is cut away with
+    # everything else, and relying on it would leave the construct without
+    # the element it was asked for.
+    arc_now = payload_arc(backbone_annotations, len(backbone_seq))
+
+    def outside_the_arc(a: dict) -> bool:
+        if arc_now is None:
+            return False
+        lo, hi = arc_now
+        total_bp = len(backbone_seq)
+        if lo <= hi:
+            return a["end"] <= lo or a["start"] >= hi
+        return hi <= a["start"] and a["end"] <= lo
+
     while payload and payload[-1].feature_type in VECTOR_ELEMENTS:
         rm = payload[-1]
         match = None
         for a in backbone_annotations:
             if a["feature_type"] != rm.feature_type or id(a) in taken:
+                continue
+            if not outside_the_arc(a):
                 continue
             span = backbone_seq[a["start"]:a["end"]]
             if not span:

@@ -274,12 +274,28 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         ordered.append({"kind": "backbone", "name": "backbone",
                         "seq": backbone["seq"], "at": -1,
                         "source_start": 0, "source_end": len(backbone["seq"])})
+    bb_id = backbone["id"] if backbone else None
+    bb_len = len(backbone["seq"]) if backbone else 0
     for idx, f in enumerate(fragments):
-        ordered.append({
+        tpl = realised[idx][0]
+        entry = {
             "kind": "fragment", "name": f.name, "seq": realised[idx][3],
             "at": f.modules[0]["start"] if f.modules else 0, "index": idx,
-        })
+        }
+        # A module the recipient itself supplies is, as far as the bench is
+        # concerned, part of the recipient: same template, same strand,
+        # neighbouring coordinates.
+        if (bb_id is not None and f.source_plasmid_id == bb_id
+                and tpl == backbone["seq"]):
+            entry["source_start"] = realised[idx][1]
+            entry["source_end"] = realised[idx][2]
+        ordered.append(entry)
     ordered.sort(key=lambda o: o["at"])
+
+    if backbone:
+        ordered, absorbed = _merge_contiguous(ordered, bb_len)
+    else:
+        absorbed = set()
 
     # A kept arc can be a handful of bases - the gap between a promoter and
     # the coding sequence after it - and there is no such thing as a 25 bp
@@ -352,6 +368,8 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     where = {o["index"]: k for k, o in enumerate(ordered)
              if o["kind"] == "fragment"}
     for i, frag in enumerate(fragments):
+        if i in absorbed:
+            continue            # amplified as part of the recipient's arc
         piece_index = where.get(i, i)
         up = pieces[piece_index - 1][1]
         down = pieces[(piece_index + 1) % n][1]
@@ -860,6 +878,65 @@ def _check_unique(primer: Primer, construct_seq: str, route: "Route") -> None:
             f"place it can join and the assembly may put it in either; "
             f"a repeated element here needs a different backbone, or the "
             f"junction moved")
+
+
+def _merge_contiguous(ordered: list[dict], template_length: int
+                      ) -> tuple[list[dict], set]:
+    """Amplify neighbouring stretches of the same plasmid in one reaction.
+
+    The recipient's kept arcs and any module the recipient itself supplies
+    are the same DNA, lying next to each other on the same plasmid. Planning
+    them as separate reactions asks for three PCRs and two assembly
+    junctions to rebuild a stretch that was never taken apart - and it was
+    only separate because one of them answers a module in the specification
+    and the others do not.
+
+    Returns the merged list, and the indices of the fragments swallowed, so
+    nothing designs primers for a piece that no longer exists.
+    """
+    absorbed: set = set()
+    if template_length <= 0 or len(ordered) < 2:
+        return ordered, absorbed
+
+    def joins(a: dict, b: dict) -> bool:
+        for piece in (a, b):
+            if not isinstance(piece.get("source_start"), int):
+                return False
+            if not isinstance(piece.get("source_end"), int):
+                return False
+        return a["source_end"] % template_length == \
+            b["source_start"] % template_length
+
+    pieces = list(ordered)
+    changed = True
+    while changed and len(pieces) > 1:
+        changed = False
+        for i in range(len(pieces)):
+            j = (i + 1) % len(pieces)
+            if i == j:
+                break
+            a, b = pieces[i], pieces[j]
+            if not joins(a, b):
+                continue
+            merged = {
+                "kind": "backbone",
+                "name": a["name"] if a["kind"] == "backbone" else b["name"],
+                "seq": a["seq"] + b["seq"],
+                "at": a["at"],
+                "source_start": a["source_start"],
+                "source_end": b["source_end"],
+            }
+            for piece in (a, b):
+                if piece["kind"] == "fragment":
+                    absorbed.add(piece["index"])
+            if j == 0:
+                # Wrapped: the merged piece takes the first slot.
+                pieces = [merged] + pieces[1:i]
+            else:
+                pieces = pieces[:i] + [merged] + pieces[j + 1:]
+            changed = True
+            break
+    return pieces, absorbed
 
 
 def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
