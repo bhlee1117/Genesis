@@ -525,6 +525,12 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         else:
             for w in sim.get("warnings", []):
                 route["warnings"].append(f"simulation: {w}")
+
+    # Ranking happened before any of this, so a route the simulation has
+    # just ruled out would otherwise keep the position it was ranked into -
+    # and lead the list while being unusable. Feasible ones first; the
+    # sort is stable, so the ranking survives within each group.
+    plan["routes"].sort(key=lambda r: not r.get("feasible"))
     return plan
 
 

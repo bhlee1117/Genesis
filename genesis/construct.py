@@ -907,6 +907,27 @@ def _splice(seq: str, annotations: list[dict], edits: list[dict]) -> tuple:
     return out_seq, layout, dropped
 
 
+#: Elements that belong to the vector rather than the payload.  Naming one
+#: in a specification means "the construct must have this", not "add another
+#: one": every AAV transfer plasmid already carries a WPRE and a polyA.
+VECTOR_ELEMENTS = {"WPRE", "polyA"}
+
+
+def _coverage(wanted: str, region: str, k: int = 40) -> float:
+    """How much of `wanted` is present in `region`, either strand."""
+    wanted = (wanted or "").upper()
+    region = (region or "").upper()
+    if not wanted or not region:
+        return 0.0
+    if len(wanted) < k:
+        return 1.0 if wanted in region or revcomp(wanted) in region else 0.0
+    both = region + "\x00" + revcomp(region)
+    index = {both[i:i + k] for i in range(len(both) - k + 1)}
+    total = len(wanted) - k + 1
+    return (sum(1 for i in range(total) if wanted[i:i + k] in index) / total
+            if total else 0.0)
+
+
 def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                            backbone_annotations: list[dict],
                            spec_types: set, circular: bool = True
@@ -953,6 +974,40 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                 "part_id": rm.part_id})
             cursor += len(rm.seq)
         return "".join(parts), layout
+
+    # The vector's own WPRE and polyA sit after the cassette, and a
+    # specification that names one is asking for the element, not for a
+    # second copy of it.  Adding one anyway leaves two near-identical
+    # stretches in the plasmid: no diagnostic digest can tell them apart,
+    # and no assembly overlap can point at one of them, so the payload can
+    # go in either way round.  The recipient's own copy is used instead,
+    # and the module is rebound to those bases so everything downstream -
+    # the order check, the read-back - is looking for what is really there.
+    satisfied: list[tuple] = []
+    taken: set = set()
+    while payload and payload[-1].feature_type in VECTOR_ELEMENTS:
+        rm = payload[-1]
+        match = None
+        for a in backbone_annotations:
+            if a["feature_type"] != rm.feature_type or id(a) in taken:
+                continue
+            span = backbone_seq[a["start"]:a["end"]]
+            if not span:
+                continue
+            if (_coverage(rm.seq, span) >= 0.9
+                    or _coverage(span, rm.seq) >= 0.9):
+                match = (a, span)
+                break
+        if match is None:
+            break
+        payload.pop()
+        taken.add(id(match[0]))
+        warnings.append(
+            f"the recipient already carries {match[0]['name']} after its "
+            f"cassette; that copy was used rather than adding a second "
+            f"{rm.part_name}")
+        rm.seq = match[1]
+        satisfied.append((rm, match[0]))
 
     payload_seq, payload_layout = block(payload)
     regulatory_seq, regulatory_layout = block(regulatory)
@@ -1081,6 +1136,22 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
         })
 
     seq, layout, dropped = _splice(rotated_seq, rotated, edits)
+    # A module the recipient supplies is still a module of this design, so
+    # the entry that carries it stops counting as the backbone's own.
+    for rm, ann in satisfied:
+        for item in layout:
+            if (item.get("from_backbone")
+                    and item["type"] == rm.feature_type
+                    and item["name"] == ann["name"]):
+                item["from_backbone"] = False
+                item["part_id"] = rm.part_id
+                item["name"] = rm.part_name
+                # It counts as a module of this design - the order check
+                # should see it - but nothing has to supply it, because the
+                # recipient arc it sits in is already being amplified.
+                item["supplied_by_recipient"] = True
+                break
+
     for name in dropped:
         warnings.append(
             f"the backbone feature {name!r} straddles an insertion point "

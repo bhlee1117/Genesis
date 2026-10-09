@@ -101,18 +101,25 @@ class PlannedFragment:
 
     @property
     def amplified_strand(self) -> int:
-        """Which strand of the donor to amplify to get construct orientation."""
-        return self.strand * self.placed_strand
+        """Which strand of the donor to amplify to get construct orientation.
+
+        Only a fallback: the frame is chosen by which orientation of the
+        donor slice actually equals the sequence wanted.
+        """
+        return self.strand
 
     @property
     def placed_seq(self) -> str:
         """This fragment as the finished molecule reads it.
 
-        `seq` is the part the right way up.  An assembly overlap has to be
-        taken from the sequence the neighbouring amplicon actually ends
-        with, which for an inverted fragment is the other strand.
+        Which is `seq` itself.  A Cre-lox payload is inverted by expand_dio,
+        which hands back a module whose sequence is already the other strand
+        and merely labels it as reverse; flipping it again here counted the
+        inversion twice and cancelled it out, so the payload was amplified
+        the right way up and assembled into a construct that wanted it
+        upside down.
         """
-        return self.seq if self.placed_strand == 1 else revcomp(self.seq)
+        return self.seq
 
 
 def _pair_with_layout(placed: list, items: list[dict]) -> list[tuple]:
@@ -136,6 +143,11 @@ def _pair_with_layout(placed: list, items: list[dict]) -> list[tuple]:
     for rm in placed:
         for j in range(cursor, len(items)):
             it = items[j]
+            if it.get("supplied_by_recipient"):
+                # The recipient's own copy, kept rather than replaced. No
+                # fragment, no reaction: the arc around it is amplified
+                # anyway.
+                continue
             same = (it.get("part_id") is not None
                     and it.get("part_id") == rm.part_id)
             if same or (it.get("name") == rm.part_name

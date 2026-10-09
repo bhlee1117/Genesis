@@ -3388,3 +3388,36 @@ class TestUniqueOverlaps(unittest.TestCase):
                    anneal="ACGTACGTACGTACGTAC", tail=arm, direction="F")
         _check_unique(p, construct, route)
         self.assertEqual(route.warnings, [])
+
+
+class TestInvertedPayload(unittest.TestCase):
+    """A Cre-lox payload is inverted once, not twice."""
+
+    def test_expand_dio_hands_back_the_other_strand(self):
+        from genesis.construct import expand_dio, ResolvedModule, Module
+        from genesis.seqtools import revcomp
+        cds = rand_seq(300, 71)
+        mods = [
+            ResolvedModule(module=Module("Cre-lox", "DIO"), part_id=None,
+                           part_name="DIO", seq="", feature_type="Cre-lox",
+                           sources=[], warnings=[]),
+            ResolvedModule(module=Module("CDS", "X"), part_id=1,
+                           part_name="X", seq=cds, feature_type="CDS",
+                           sources=[], warnings=[]),
+        ]
+        out, _notes = expand_dio(mods, sites_from_backbone=True)
+        payload = [m for m in out if m.feature_type == "CDS"]
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0].seq, revcomp(cds),
+                         "the payload comes back on the other strand")
+        self.assertEqual(payload[0].module.orientation, "reverse")
+
+    def test_placed_seq_does_not_flip_it_again(self):
+        """The sequence expand_dio returns is already the construct's."""
+        from genesis.planner import PlannedFragment
+        from genesis.seqtools import revcomp
+        body = rand_seq(300, 72)
+        f = PlannedFragment("X", body, 1, "donor", 0, len(body), 1, False,
+                            [{"start": 0, "strand": -1}], placed_strand=-1)
+        self.assertEqual(f.placed_seq, body)
+        self.assertNotEqual(f.placed_seq, revcomp(body))
