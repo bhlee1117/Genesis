@@ -396,6 +396,57 @@ def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
     return moved
 
 
+def scan_sources(conn: sqlite3.Connection, spec: ConstructSpec,
+                 cfg: Config | None = None) -> dict:
+    """Resolve the specification and say what it could be built from.
+
+    Everything design() does before it commits to anything: what each
+    module resolves to, which plasmid carries the longest leading run of
+    the architecture, and where the rest would have to come from. Designing
+    primers is the expensive half and depends on those choices, so this
+    stops short of it - the parents are worth settling before a protocol
+    is written around them.
+    """
+    cfg = cfg or Config()
+    resolved = resolve(conn, spec)
+
+    architecture = [{
+        "type": r.feature_type, "part_id": r.part_id,
+        "part_name": ("Cre-lox" if canonical_feature_type(r.feature_type)
+                      == "Cre-lox" else r.part_name),
+        "seq": r.seq,
+    } for r in resolved
+        if r.seq or canonical_feature_type(r.feature_type) == "Cre-lox"]
+
+    wants_cassette = any(
+        canonical_feature_type(m["type"] if isinstance(m, dict) else m.type)
+        == "Cre-lox" for m in spec.modules)
+    candidates = architecture_candidates(
+        conn, architecture, family=spec.vector or "",
+        prefer_cassette=wants_cassette)
+    ranked = candidates.get("recipients", [])
+    backbone = _load_backbone(
+        conn, spec, cfg,
+        preferred_id=ranked[0]["plasmid_id"] if ranked else None)
+
+    return {
+        "construct": {"name": spec.name},
+        "backbone": ({"id": backbone["id"], "name": backbone["name"],
+                      "length": backbone["seq_length"],
+                      "owner": backbone["owner"]} if backbone else None),
+        "modules": [{
+            "type": r.feature_type, "requested": r.module.name,
+            "part_id": r.part_id, "part_name": r.part_name,
+            "length": r.length,
+            "sources": [{"plasmid_id": x["id"], "name": x["name"],
+                         "owner": x["owner"], "verified": x["verified"]}
+                        for x in r.sources[:5]],
+            "warnings": r.warnings,
+        } for r in resolved],
+        "candidates": candidates,
+    }
+
+
 def design(conn: sqlite3.Connection, spec: ConstructSpec,
            cfg: Config | None = None) -> dict:
     cfg = cfg or Config()

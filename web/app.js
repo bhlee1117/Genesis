@@ -2008,6 +2008,7 @@ function clearSpec() {
   pinnedParents.donor = null;
   pinnedSources = {};
   state.plan = null;
+  state.scan = null;
   state.spec = null;
   state.routeId = null;
   state.saved = null;
@@ -2038,6 +2039,73 @@ function clearSpecWithConfirm() {
     ],
     onConfirm: function (api_) { api_.close(); clearSpec(); }
   });
+}
+
+/**
+ * Resolve the specification and show what it could be built from.
+ *
+ * Designing primers is the expensive half and every one of them depends on
+ * which parents are used, so the parents come first: this stops at the
+ * candidates, and the protocol is written once they are settled.
+ */
+async function scanSources() {
+  var status = $('design-status');
+  var out = $('plan-out');
+  setStatus(status, 'resolving modules...', 'busy');
+  clear(out);
+  out.appendChild(h('div', { class: 'card' },
+    h('p', { class: 'muted' }, 'Looking for what these parts are in...')));
+  try {
+    var spec = collectSpec();
+    var scan = await postJSON('/api/scan', { spec: spec });
+    state.spec = spec;
+    state.scan = scan;
+    state.plan = null;              /* the old protocol is not this spec's */
+    state.routeId = null;
+    refreshSaveButtons();
+    renderScan();
+    setStatus(status,
+      'scanned - choose the parents, then generate the protocol', 'ok');
+  } catch (err) {
+    clear(out);
+    out.appendChild(errorBox(err.message));
+    setStatus(status, 'scan failed', 'bad');
+  }
+}
+
+function renderScan() {
+  var out = $('plan-out');
+  clear(out);
+  var scan = state.scan;
+  if (!scan) return;
+
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'card-head' },
+      h('h2', null, scan.construct.name || '(unnamed construct)'),
+      h('span', { class: 'muted small' },
+        scan.backbone
+          ? 'would start from ' + scan.backbone.name +
+            ' (' + bp(scan.backbone.length) + ')'
+          : 'no backbone chosen yet')));
+  card.appendChild(h('p', { class: 'muted small' },
+    'Nothing has been designed yet. Settle the parents below, then ' +
+    'generate the protocol.'));
+  if ((scan.modules || []).length) {
+    card.appendChild(table([
+      { label: 'Type', cell: function (m) { return typeTag(m.type); } },
+      { label: 'Requested', key: 'requested' },
+      { label: 'Resolved part', key: 'part_name' },
+      { label: 'Length', numeric: true,
+        cell: function (m) { return bp(m.length); } },
+      { label: 'Found in', numeric: true,
+        cell: function (m) { return (m.sources || []).length; } },
+      { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
+    ], scan.modules));
+  }
+  out.appendChild(card);
+
+  var cands = renderCandidates(scan);
+  if (cands) out.appendChild(cands);
 }
 
 async function generatePlan() {
@@ -2771,7 +2839,7 @@ function renderCandidates(plan) {
           checked: on ? 'checked' : null,
           onchange: function () {
             $('spec-backbone').value = String(r.plasmid_id);
-            generatePlan();
+            replan();
           }
         }),
         h('span', {
@@ -2819,7 +2887,7 @@ function renderCandidates(plan) {
             checked: on ? 'checked' : null,
             onchange: function () {
               ids.forEach(function (id) { pinnedSources[id] = o.plasmid_id; });
-              generatePlan();
+              replan();
             }
           }),
           /* keeps a donor row on the same columns as a recipient row */
@@ -2844,10 +2912,21 @@ function renderCandidates(plan) {
     card.appendChild(h('p', { class: 'muted small' },
       h('button', {
         type: 'button', class: 'secondary',
-        onclick: function () { pinnedSources = {}; generatePlan(); }
+        onclick: function () { pinnedSources = {}; replan(); }
       }, 'Clear donor choices')));
   }
   return card;
+}
+
+/**
+ * Redo whichever half the user is looking at.
+ *
+ * Changing a parent while only the scan is on screen should not spend a
+ * minute designing primers nobody asked for yet; changing one after the
+ * protocol exists should rebuild it.
+ */
+function replan() {
+  if (state.plan) generatePlan(); else scanSources();
 }
 
 /** The part ids behind a donor segment, so pinning one pins those parts. */
@@ -3709,6 +3788,7 @@ async function init() {
     state.modules.push(newModule('CDS'));
     renderModules();
   });
+  $('scan').addEventListener('click', scanSources);
   $('generate').addEventListener('click', generatePlan);
   $('clear-spec').addEventListener('click', clearSpecWithConfirm);
   $('save-version').addEventListener('click', function () { saveDesign('version'); });

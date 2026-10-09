@@ -17,6 +17,7 @@ GET  /api/part/<id>/sources             source plasmids for a part
 GET  /api/enzymes                       enzyme catalogue
 GET  /api/vocab                         controlled feature vocabulary
 GET  /api/config                        effective configuration
+POST /api/scan          {spec}          resolve modules, list candidate parents
 POST /api/design        {spec}          run Stages 4-10, return a plan
 POST /api/save   {spec, plan, mode, design_id}\n                     mode: version | overwrite | save_as\nPOST /api/delete-design {design_id} or {construct_id}
 GET  /api/designs                       stored designs
@@ -41,7 +42,8 @@ from . import auth
 from .config import Config
 from .construct import ConstructSpec
 from .db import connect
-from .design import delete_construct, delete_design, design, save_design
+from .design import (delete_construct, delete_design, design, save_design,
+                     scan_sources)
 from .enzymes import CATALOG
 from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
                      to_genbank)
@@ -499,6 +501,13 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError as exc:
                 return self.json({"error": f"missing field {exc}"}, 400)
             return self.json({"ok": True})
+
+        if path == "/api/scan":
+            spec_in = body.get("spec")
+            spec = (ConstructSpec.from_yaml(spec_in)
+                    if isinstance(spec_in, str)
+                    else ConstructSpec.from_dict(spec_in or {}))
+            return self.json(scan_sources(c, spec, self.cfg))
 
         if path == "/api/design":
             spec_in = body.get("spec")

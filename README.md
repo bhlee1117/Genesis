@@ -520,6 +520,18 @@ need the DNA share mounted unless they want to re-scan it themselves.
 
 To refresh later, re-copy the database, or run `python3 -m genesis scan`.
 
+### Two steps, not one
+
+**Scan the source** resolves the modules and shows what the construct could
+be built from: which plasmid carries the longest leading run of the
+architecture, and where the rest would have to come from. It takes under a
+second because it designs nothing.
+
+**Generate protocol** does the expensive half - primers, routes,
+simulation - once the parents are settled. Every primer depends on which
+parents are used, so designing them before that choice is made is work
+thrown away.
+
 ### Reading a request as an architecture
 
 ```bash
