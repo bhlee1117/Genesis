@@ -955,6 +955,10 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             "run": run,
             "carries": [_label(modules[i], holders[i].get(pid, ""))
                         for i in range(run_start, run_start + run)],
+            # A Cre-lox cassette in the vector is only wanted when the
+            # request asks for one; dropping a plain payload between someone
+            # else's lox sites makes it Cre-dependent by accident.
+            "has_cassette": "lox_site" in types.get(pid, set()),
             "exact": all(holders[i].get(pid, "") ==
                          (modules[i].get("part_name") or "")
                          for i in range(run_start, run_start + run)),

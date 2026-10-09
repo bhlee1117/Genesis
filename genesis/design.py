@@ -124,7 +124,8 @@ def find_backbone_for(conn: sqlite3.Connection, family: str, needs: set,
 
 
 def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec,
-                   cfg: Config | None = None) -> dict | None:
+                   cfg: Config | None = None,
+                   preferred_id: int | None = None) -> dict | None:
     row = None
     if spec.backbone_plasmid_id:
         # An explicit id is the user's choice; honour it as given.
@@ -159,9 +160,20 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec,
                     break
         if row is None:
             row = rows[0] if rows else None
+    elif preferred_id is not None:
+        # Nobody named a backbone, so start from whatever already carries the
+        # longest leading run of the architecture asked for.  Picking by
+        # family alone is what put a plain hSyn payload inside a DIO
+        # plasmid's lox cassette.
+        row = conn.execute("SELECT * FROM plasmid WHERE id = ?",
+                           (preferred_id,)).fetchone()
+        if row is None and spec.vector:
+            return find_backbone_for(conn, spec.vector,
+                                     required_architecture(spec), cfg=cfg)
     elif spec.vector:
-        # No backbone named, but a vector family was asked for: choose one
-        # rather than building a payload with no vector around it.
+        # No backbone named, and nothing in the inventory matches the
+        # architecture: choose by family rather than building a payload with
+        # no vector around it.
         return find_backbone_for(conn, spec.vector,
                                  required_architecture(spec), cfg=cfg)
     return dict(row) if row else None
@@ -173,16 +185,31 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
 
     # Stage 4: resolve modules against the inventory
     resolved = resolve(conn, spec)
-    backbone = _load_backbone(conn, spec, cfg)
 
-    # Expand any DIO module into its cassette before assembling, so the
-    # molecule that gets validated is the one that would actually be built.
     # The architecture in the order the user wrote it, kept before the
     # cassette expansion inverts the payload.
     logical_modules = [{
         "type": r.feature_type, "part_id": r.part_id,
         "part_name": r.part_name, "seq": r.seq,
     } for r in resolved if r.seq]
+
+    # Read the request as an ordered architecture first, because what to
+    # start from follows from it.
+    candidates = architecture_candidates(
+        conn, logical_modules, family=spec.vector or "")
+    wants_cassette = any(
+        canonical_feature_type(m["type"] if isinstance(m, dict) else m.type)
+        == "Cre-lox" for m in spec.modules)
+    ranked = sorted(
+        candidates.get("recipients", []),
+        key=lambda c: (-c["run"], c["has_cassette"] != wants_cassette,
+                       c["length"]))
+    backbone = _load_backbone(
+        conn, spec, cfg,
+        preferred_id=ranked[0]["plasmid_id"] if ranked else None)
+
+    # Expand any DIO module into its cassette before assembling, so the
+    # molecule that gets validated is the one that would actually be built.
 
     # When the recipient already carries lox sites, the cassette is the
     # vector's and the payload goes inside it.

@@ -3147,6 +3147,23 @@ class TestArchitectureCandidates(unittest.TestCase):
         self.assertEqual(last["options"], [])
         self.assertIn("synthesised", last["note"])
 
+    def test_a_cassette_in_the_vector_is_reported(self):
+        """So a plain payload is not dropped between someone else's lox sites."""
+        from genesis.swap import architecture_candidates
+        plain = self._plasmid("pAAV-hSyn-plain", ["hSyn"])
+        dio = self._plasmid("pAAV-hSyn-DIO", ["hSyn"])
+        for name in ("lox2272", "loxP", "lox2272", "loxP"):
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,'lox_site',?,0,34,1)""",
+                (dio, name))
+        self.conn.commit()
+        got = {c["plasmid_id"]: c["has_cassette"]
+               for c in architecture_candidates(self.conn, self._modules())
+               ["recipients"]}
+        self.assertFalse(got[plain])
+        self.assertTrue(got[dio])
+
     def test_a_relative_is_named_as_itself(self):
         """A plasmid holding ASAP3 does not hold ASAP7y."""
         from genesis.swap import architecture_candidates
