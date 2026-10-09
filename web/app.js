@@ -720,7 +720,7 @@ function circularMap(length, items, opts) {
   var span = Math.max(Number(length) || 0, 1);
   var list = (items || []).filter(function (f) {
     return f && typeof f.start === 'number' && typeof f.end === 'number' &&
-      f.type !== 'primer_binding_site' && f.type !== 'unknown';
+      typeOf(f) !== 'primer_binding_site' && typeOf(f) !== 'unknown';
   });
 
   var host = h('div', { class: 'map-circular' });
@@ -766,11 +766,11 @@ function circularMap(length, items, opts) {
       if (to <= from) to += 1;
       var reverse = f.strand === -1;
       var r = radius + (reverse ? -11 : 0);
-      var colour = colorFor(f.type);
+      var colour = f.colour || colorFor(typeOf(f));
 
       var g = svg('g', { class: 'circ-feature' });
       g.appendChild(svg('title', null,
-        f.name + ' · ' + f.type + ' · ' + bp(f.end - f.start) +
+        f.name + ' · ' + typeOf(f) + ' · ' + bp(f.end - f.start) +
         ' · ' + (reverse ? 'reverse' : 'forward') + ' strand · ' +
         (f.start + 1) + '–' + f.end));
       g.appendChild(svg('path', {
@@ -778,7 +778,7 @@ function circularMap(length, items, opts) {
         stroke: colour, 'stroke-width': 8, 'stroke-linecap': 'butt'
       }));
       /* direction of translation, at the 3' end of the coding sequence */
-      if (CODING_TYPES[f.type]) {
+      if (CODING_TYPES[typeOf(f)]) {
         g.appendChild(arrowHead(cx, cy, r, reverse ? from : to % 1,
                                 !reverse, colour));
       }
@@ -811,7 +811,7 @@ function circularMap(length, items, opts) {
         x: right ? x + 4 : x - 4, y: y + 3,
         'text-anchor': right ? 'start' : 'end',
         class: 'circ-label', fill: item.colour
-      }, item.f.name || item.f.type));
+      }, item.f.name || typeOf(item.f)));
     });
 
     /* The region being cut from a recipient, or taken from a donor. */
@@ -1106,8 +1106,8 @@ async function showPlasmid(id) {
         'Also found in: ' + p.alt_sources.map(function (a) { return a.rel_path; }).join(', ')));
     }
 
-    side.appendChild(h('h4', null, 'Feature map'));
-    side.appendChild(featureMap(p.seq_length, p.annotations || [],
+    side.appendChild(h('h4', null, 'Map'));
+    side.appendChild(mapWithToggle(p.seq_length, p.annotations || [],
       { label: p.name, circular: !!p.circular }));
 
     side.appendChild(h('h4', null, 'Annotations (' + (p.annotations || []).length + ')'));
@@ -2585,6 +2585,54 @@ function sequenceWrapped(seq) {
  * sequence is only built when it is first opened, so a 15 kb construct costs
  * nothing until somebody asks to read it.
  */
+/**
+ * A map with a circular/linear toggle, defaulting to the molecule's own
+ * topology.
+ *
+ * A plasmid is a circle and a linear track misrepresents it - a cassette
+ * that wraps the origin looks broken on one and obvious on the other -
+ * but the track is still the easier thing to read coordinates off. So
+ * both, with the honest one first.
+ */
+function mapWithToggle(length, items, opts) {
+  opts = opts || {};
+  var host = h('div');
+  var mapHost = h('div', { class: 'map-host' });
+  var mode = opts.circular ? 'circular' : 'linear';
+
+  function draw() {
+    clear(mapHost);
+    mapHost.appendChild(mode === 'circular'
+      ? circularMap(length, items, {
+          label: opts.label, markers: opts.markers,
+          highlight: opts.highlight, highlightKind: opts.highlightKind })
+      : featureMap(length, items, {
+          label: opts.label, circular: !!opts.circular,
+          markers: opts.markers }));
+  }
+
+  if (opts.circular) {
+    var toggle = h('div', { class: 'map-toggle' });
+    ['circular', 'linear'].forEach(function (option) {
+      toggle.appendChild(h('button', {
+        type: 'button',
+        class: option === mode ? 'active' : '',
+        onclick: function () {
+          mode = option;
+          [].forEach.call(toggle.children, function (child) {
+            child.className = child.textContent === mode ? 'active' : '';
+          });
+          draw();
+        }
+      }, option));
+    });
+    host.appendChild(toggle);
+  }
+  host.appendChild(mapHost);
+  draw();
+  return host;
+}
+
 function renderConstruct(c) {
   var seq = typeof c.sequence === 'string' ? c.sequence : '';
   var layout = (c.layout || []).filter(function (f) {
@@ -2599,39 +2647,8 @@ function renderConstruct(c) {
         seq ? 'every base and every element of the designed molecule'
             : 'this plan carries no sequence')));
 
-  // A circular plasmid is shown as one by default; the linear track is
-  // still there for reading coordinates off, behind a toggle.
-  var mapHost = h('div', { class: 'map-host' });
-  function drawMap(mode) {
-    clear(mapHost);
-    mapHost.appendChild(mode === 'circular'
-      ? circularMap(c.length, layout,
-          { label: c.name, markers: c.codon_markers })
-      : featureMap(c.length, layout,
-          { label: c.name, circular: !!c.circular,
-            markers: c.codon_markers }));
-  }
-  if (c.circular) {
-    var mode = 'circular';
-    var toggle = h('div', { class: 'map-toggle' });
-    ['circular', 'linear'].forEach(function (option) {
-      var b = h('button', {
-        type: 'button',
-        class: option === mode ? 'active' : '',
-        onclick: function () {
-          mode = option;
-          [].forEach.call(toggle.children, function (child) {
-            child.className = child.textContent === mode ? 'active' : '';
-          });
-          drawMap(mode);
-        }
-      }, option);
-      toggle.appendChild(b);
-    });
-    card.appendChild(toggle);
-  }
-  card.appendChild(mapHost);
-  drawMap(c.circular ? 'circular' : 'linear');
+  card.appendChild(mapWithToggle(c.length, layout, {
+    label: c.name, markers: c.codon_markers, circular: !!c.circular }));
 
   if (!seq) {
     card.appendChild(h('p', { class: 'muted' },
