@@ -2732,7 +2732,20 @@ function renderCandidates(plan) {
 
   if (recipients.length) {
     card.appendChild(h('h4', null, 'Start from'));
+    card.appendChild(h('p', { class: 'muted small' },
+      'The score counts how many of these a plasmid really carries, in ' +
+      'order from the start: 2/2 has both and only the vector has to be ' +
+      'opened, 1/2 has the first and the rest must be built. A plasmid ' +
+      'marked variant holds something close rather than the part itself, ' +
+      'which is a reason to start from it and not a reason to take the ' +
+      'part out of it.'));
     var list = h('div', { class: 'cand-list' });
+    list.appendChild(h('div', { class: 'cand-row cand-head' },
+      h('span', null, ''),
+      h('span', { class: 'cand-score' }, 'has'),
+      h('span', null, 'plasmid'),
+      h('span', null, 'size · owner'),
+      h('span', null, 'already has')));
     recipients.forEach(function (r) {
       var on = r.plasmid_id === chosenBackbone;
       var row = h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
@@ -2744,9 +2757,20 @@ function renderCandidates(plan) {
             generatePlan();
           }
         }),
-        h('span', { class: 'cand-score' },
-          r.run + '/' + (cand.modules || []).length),
-        h('span', { class: 'cand-name' }, r.name),
+        h('span', {
+          class: 'cand-score' + (r.exact ? '' : ' cand-score-soft'),
+          title: 'matches the first ' + r.run + ' of ' +
+                 (cand.modules || []).length + ' modules in order; ' +
+                 r.exact_run + ' of those ' +
+                 (r.exact_run === 1 ? 'is the part itself'
+                                    : 'are the parts themselves') +
+                 ', the rest are relatives that would be replaced'
+        }, r.exact_run + '/' + (cand.modules || []).length),
+        h('span', { class: 'cand-name' }, r.name,
+          r.exact ? null : h('span', { class: 'pill pill-soft',
+                                       title: 'a relative, not the part ' +
+                                              'itself - this is what gets ' +
+                                              'swapped out' }, 'variant')),
         h('span', { class: 'muted small' },
           bp(r.length) + (r.owner ? ' · ' + r.owner : '') +
           (r.has_cassette ? ' · has lox cassette' : '')),
@@ -2781,7 +2805,13 @@ function renderCandidates(plan) {
               generatePlan();
             }
           }),
-          h('span', { class: 'cand-name' }, o.name),
+          h('span', { class: 'cand-name' }, o.name,
+            h('span', {
+              class: 'pill ' + (o.exact ? 'pill-ok' : 'pill-soft'),
+              title: o.exact
+                ? 'carries the part that was asked for'
+                : 'carries a relative; taking it would clone that instead'
+            }, o.exact ? 'exact' : 'variant')),
           h('span', { class: 'muted small' },
             bp(o.length) + (o.owner ? ' · ' + o.owner : '')),
           h('span', { class: 'muted small cand-has' },

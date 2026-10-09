@@ -1341,3 +1341,15 @@ tr.row-bad td {
   .cand-row { grid-template-columns: 20px 46px 1fr; }
   .cand-row .muted { grid-column: 3; }
 }
+
+.cand-head {
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  cursor: default;
+}
+.cand-head:hover { background: none; }
+.cand-name .pill { margin-left: 7px; font-size: 0.72rem; vertical-align: middle; }
+.pill-soft { background: var(--line); color: var(--muted); }
+.cand-score-soft { opacity: 0.65; }

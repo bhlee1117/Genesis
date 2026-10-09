@@ -3665,3 +3665,53 @@ class TestDonorIsAskedFor(unittest.TestCase):
         self.assertTrue(c["recipients"], "the variant holder is still a start")
         self.assertEqual(c["n_donors"], 1, c["donors"])
         self.assertEqual(c["donors"][0]["covers"], ["ASAP7y"])
+
+
+class TestDonorAccuracy(unittest.TestCase):
+    """A donor is ranked on carrying the part, not on being small."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.want = rand_seq(900, 121)
+        # A relative: most of the same bases under another name, which is
+        # what the catalogue search turns up.
+        self.relative = self.want[:400] + rand_seq(60, 122) + self.want[460:]
+        self.parts = {}
+        for nm, sq in (("ASAP7y", self.want), ("ASAP1", self.relative)):
+            self.parts[nm] = self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (nm, sq, nm, len(sq))).lastrowid
+        self.conn.commit()
+
+    def _plasmid(self, name, body, part_name, sq):
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,1,'unverified')""",
+            (name, body, len(body), name)).lastrowid
+        at = body.find(sq)
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,?,?,1)""",
+            (self.parts[part_name], pid, at, at + len(sq)))
+        self.conn.commit()
+        return pid
+
+    def test_the_plasmid_with_the_part_leads_however_large(self):
+        from genesis.swap import architecture_candidates
+        # A small plasmid holding a relative, a large one holding the part.
+        self._plasmid("small-relative", self.relative + rand_seq(200, 123),
+                      "ASAP1", self.relative)
+        real = self._plasmid("large-but-right",
+                             rand_seq(5000, 124) + self.want, "ASAP7y",
+                             self.want)
+        modules = [{"type": "CDS", "part_id": self.parts["ASAP7y"],
+                    "part_name": "ASAP7y", "seq": self.want}]
+        c = architecture_candidates(self.conn, modules)
+        self.assertTrue(c["donors"], c)
+        options = c["donors"][0]["options"]
+        self.assertEqual(options[0]["plasmid_id"], real,
+                         [o["name"] for o in options])
+        self.assertTrue(options[0]["exact"])
+        # The relative is still offered, just not first.
+        self.assertFalse(options[-1]["exact"])

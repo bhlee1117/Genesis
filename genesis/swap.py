@@ -853,7 +853,8 @@ def rank_recipients(conn: sqlite3.Connection, candidates: list,
 _VECTOR_ESSENTIALS = {"origin", "resistance"}
 
 
-def _holders(conn: sqlite3.Connection, modules: list[dict]) -> list[dict]:
+def _holders(conn: sqlite3.Connection,
+             modules: list[dict]) -> tuple[list[dict], list[set]]:
     """For each module, every plasmid that carries it and under what name.
 
     Asked by sequence rather than by catalogue id: the same protein lives
@@ -865,6 +866,7 @@ def _holders(conn: sqlite3.Connection, modules: list[dict]) -> list[dict]:
     bench would discover.
     """
     out: list[dict] = []
+    exact: list[set] = []
     for m in modules:
         seq = m.get("seq") or ""
         pid = m.get("part_id")
@@ -883,9 +885,11 @@ def _holders(conn: sqlite3.Connection, modules: list[dict]) -> list[dict]:
                 if r["n"] >= 4 and r["kinds"] >= 2:
                     holders[r["pid"]] = "Cre-lox cassette"
             out.append(holders)
+            exact.append(set(holders))
             continue
         if not seq or not pid:
             out.append({})
+            exact.append(set())
             continue
         ids = {pid}
         ids.update(variant_part_ids(conn, seq, pid))
@@ -893,6 +897,7 @@ def _holders(conn: sqlite3.Connection, modules: list[dict]) -> list[dict]:
                                       m.get("type", "CDS")))
         marks = ",".join("?" * len(ids))
         found: dict[int, str] = {}
+        is_exact: set = set()
         for r in conn.execute(
                 f"SELECT o.plasmid_id AS pid, p.name AS nm, p.id AS part "
                 f"FROM part_occurrence o JOIN part p ON p.id = o.part_id "
@@ -900,8 +905,11 @@ def _holders(conn: sqlite3.Connection, modules: list[dict]) -> list[dict]:
             # An exact hit beats a relative, so it wins the label.
             if r["pid"] not in found or r["part"] == pid:
                 found[r["pid"]] = r["nm"]
+            if r["part"] == pid:
+                is_exact.add(r["pid"])
         out.append(found)
-    return out
+        exact.append(is_exact)
+    return out, exact
 
 
 def _label(module: dict, actual: str) -> str:
@@ -938,7 +946,7 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     two-donor build, and saying so beats quietly dropping one of them.
     """
     n = len(modules)
-    holders = _holders(conn, modules)
+    holders, exact_holders = _holders(conn, modules)
 
     everywhere: set = set()
     for h in holders:
@@ -960,6 +968,33 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     covered = {pid: {i for i in range(n) if pid in holders[i]}
                for pid in everywhere}
 
+    seq_cache: dict[int, str] = {}
+
+    def host_seq(pid: int) -> str:
+        if pid not in seq_cache:
+            row = conn.execute("SELECT seq FROM plasmid WHERE id = ?",
+                               (pid,)).fetchone()
+            seq_cache[pid] = (row["seq"] or "").upper() if row else ""
+        return seq_cache[pid]
+
+    def really_has(pid: int, index: int) -> bool:
+        """Whether this plasmid contains the module's own bases.
+
+        The catalogue answers a looser question - it links a plasmid to a
+        part through variants and protein matches, which is what finds a
+        candidate in the first place. Whether the part is actually in there
+        is a question for the DNA, and it is the one that decides what has
+        to be built.
+        """
+        module = modules[index]
+        if canonical_feature_type(module.get("type", "")) == "Cre-lox":
+            return pid in holders[index]
+        want = (module.get("seq") or "").upper()
+        if not want:
+            return False
+        host = host_seq(pid)
+        return bool(host) and (want in host or revcomp(want) in host)
+
     def describe(pid: int, run_start: int) -> dict:
         got = covered[pid]
         run = _run_from(run_start, got, n)
@@ -975,9 +1010,15 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             # request asks for one; dropping a plain payload between someone
             # else's lox sites makes it Cre-dependent by accident.
             "has_cassette": "lox_site" in types.get(pid, set()),
-            "exact": all(holders[i].get(pid, "") ==
-                         (modules[i].get("part_name") or "")
+            # Carrying the very part asked for, rather than a relative of
+            # it.  A relative is a reason to start from a plasmid and never
+            # a reason to take the part out of it.
+            "exact": all(really_has(pid, i)
                          for i in range(run_start, run_start + run)),
+            # How much of the leading run is genuinely there, which is how
+            # much of it does not have to be built again.
+            "exact_run": sum(1 for i in range(run_start, run_start + run)
+                             if really_has(pid, i)),
             "also_has": sorted(
                 _label(modules[i], holders[i].get(pid, ""))
                 for i in got if not run_start <= i < run_start + run),
@@ -1000,7 +1041,11 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         prefer_cassette = any(
             canonical_feature_type(m.get("type", "")) == "Cre-lox"
             for m in modules)
-    recipients.sort(key=lambda c: (-c["run"],
+    # Accuracy first: a plasmid that really carries these modules saves
+    # building them, where one that merely resembles them saves nothing -
+    # the resemblance is the thing being swapped out.  Then how far the run
+    # reaches, then the cassette, then size.
+    recipients.sort(key=lambda c: (-c["exact_run"], -c["run"],
                                    c["has_cassette"] != prefer_cassette,
                                    c["length"]))
     recipients = recipients[:limit]
@@ -1061,8 +1106,14 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             reach += 1
         best = min(max(o["run"] for o in options), reach - cursor)
         best = max(best, 1)
+        # A donor is where the part is taken from, so carrying the part
+        # itself outranks carrying more of the architecture, and both
+        # outrank being a conveniently small plasmid.  Sorting by size
+        # alone put every ASAP relative above the two plasmids that
+        # actually hold ASAP7y, and hid the one the plan then used.
         options = sorted((o for o in options if o["run"] >= best),
-                         key=lambda o: o["length"])[:limit]
+                         key=lambda o: (-o["exact_run"], not o["exact"],
+                                        -o["run"], o["length"]))[:limit]
         donors.append({
             "covers": [modules[i].get("part_name") or modules[i].get("type")
                        for i in range(cursor, cursor + best)],
