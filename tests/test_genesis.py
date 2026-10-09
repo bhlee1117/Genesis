@@ -3547,3 +3547,121 @@ class TestVectorElementReuse(unittest.TestCase):
         self.assertIn(wpre, con.seq, "the construct must still have a WPRE")
         self.assertFalse(any("already carries" in w for w in con.warnings),
                          con.warnings)
+
+
+class TestUnwantedCassette(unittest.TestCase):
+    """A recipient's lox sites are not inherited by accident."""
+
+    def _recipient(self):
+        """pAAV-hSyn-DIO-<cds>: a cassette around the coding sequence."""
+        prom = rand_seq(300, 101)
+        lox_a, lox_b = rand_seq(34, 102), rand_seq(34, 103)
+        old_cds = rand_seq(600, 104)
+        tail = rand_seq(700, 105)
+        seq = prom + lox_a + lox_b + old_cds + lox_a + lox_b + tail
+        at = len(prom)
+        anns = [{"feature_type": "promoter", "name": "hSyn", "start": 0,
+                 "end": len(prom), "strand": 1}]
+        for i, nm in enumerate(("lox2272", "loxP")):
+            anns.append({"feature_type": "lox_site", "name": nm,
+                         "start": at + i * 34, "end": at + (i + 1) * 34,
+                         "strand": 1})
+        cds_at = at + 68
+        anns.append({"feature_type": "CDS", "name": "old", "start": cds_at,
+                     "end": cds_at + 600, "strand": 1})
+        at2 = cds_at + 600
+        for i, nm in enumerate(("lox2272", "loxP")):
+            anns.append({"feature_type": "lox_site", "name": nm,
+                         "start": at2 + i * 34, "end": at2 + (i + 1) * 34,
+                         "strand": -1})
+        anns += [
+            {"feature_type": "origin", "name": "ori",
+             "start": len(seq) - 400, "end": len(seq) - 200, "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR",
+             "start": len(seq) - 200, "end": len(seq), "strand": 1},
+        ]
+        return seq, anns
+
+    def _payload(self):
+        from genesis.construct import ResolvedModule, Module
+        return [ResolvedModule(module=Module("CDS", "new"), part_id=1,
+                               part_name="new", seq=rand_seq(300, 106),
+                               feature_type="CDS", sources=[], warnings=[])]
+
+    def test_a_plain_design_does_not_inherit_the_lox_sites(self):
+        """Dropping a payload between someone else's lox sites makes the
+        construct Cre-dependent, which is a different experiment."""
+        from genesis.construct import assemble_into_backbone
+        seq, anns = self._recipient()
+        con = assemble_into_backbone(self._payload(), seq, anns, {"CDS"})
+        kinds = [i["type"] for i in con.layout]
+        self.assertNotIn("lox_site", kinds,
+                         [i["name"] for i in con.layout])
+
+    def test_a_cre_lox_design_keeps_them(self):
+        from genesis.construct import assemble_into_backbone
+        seq, anns = self._recipient()
+        con = assemble_into_backbone(self._payload(), seq, anns,
+                                     {"CDS", "Cre-lox"})
+        kinds = [i["type"] for i in con.layout]
+        self.assertIn("lox_site", kinds)
+
+
+class TestDonorIsAskedFor(unittest.TestCase):
+    """Resembling a part is not supplying it."""
+
+    def test_a_recipient_holding_a_variant_still_needs_a_donor(self):
+        from genesis.swap import architecture_candidates
+        conn = connect(":memory:")
+        want = rand_seq(600, 111)          # the part asked for
+        # A real relative, not an unrelated sequence: most of the same bases
+        # under a different name, which is what the catalogue search finds
+        # and what made it report that no donor was needed.
+        variant = want[:260] + rand_seq(40, 112) + want[300:]
+        prom = rand_seq(300, 113)
+        parts = {}
+        for nm, sq, ft in (("hSyn", prom, "promoter"), ("ASAP7y", want, "CDS"),
+                           ("ASAP4c", variant, "CDS")):
+            parts[nm] = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ft, nm, sq, nm, len(sq))).lastrowid
+
+        def plasmid(name, body, carries):
+            pid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'unverified')""",
+                (name, body, len(body), name)).lastrowid
+            at = 0
+            for part_name, sq in carries:
+                conn.execute(
+                    """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                            end, strand) VALUES (?,?,?,?,1)""",
+                    (parts[part_name], pid, at, at + len(sq)))
+                at += len(sq)
+            for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+                conn.execute(
+                    """INSERT INTO annotation(plasmid_id, feature_type, name,
+                            start, end, strand) VALUES (?,?,?,0,30,1)""",
+                    (pid, ftype, nm))
+            return pid
+
+        # The recipient has the promoter and a *different* ASAP.
+        plasmid("pAAV-hSyn-ASAP4c", prom + variant + rand_seq(900, 114),
+                [("hSyn", prom), ("ASAP4c", variant)])
+        # The real part lives elsewhere.
+        plasmid("donor-ASAP7y", want + rand_seq(900, 115),
+                [("ASAP7y", want)])
+        conn.commit()
+
+        modules = [
+            {"type": "promoter", "part_id": parts["hSyn"],
+             "part_name": "hSyn", "seq": prom},
+            {"type": "CDS", "part_id": parts["ASAP7y"],
+             "part_name": "ASAP7y", "seq": want},
+        ]
+        c = architecture_candidates(conn, modules)
+        self.assertTrue(c["recipients"], "the variant holder is still a start")
+        self.assertEqual(c["n_donors"], 1, c["donors"])
+        self.assertEqual(c["donors"][0]["covers"], ["ASAP7y"])

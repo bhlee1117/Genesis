@@ -1071,16 +1071,30 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
 
     # --- the payload slot -------------------------------------------------
     existing = backbone_cassette(rotated)
+    # A recipient's recombinase cassette is only reused when this design
+    # asked for one.  Dropping a plain payload between somebody else's lox
+    # sites does not just leave them lying there: it makes the construct
+    # Cre-dependent, so nothing is expressed until Cre arrives.  That is a
+    # different experiment from the one that was specified.
+    wants_cassette = bool(spec_types & {"Cre-lox", "lox_site", "DIO"})
     if payload_seq:
-        if existing is not None and existing["end"] <= arc_end:
+        if (existing is not None and existing["end"] <= arc_end
+                and wants_cassette):
             edits.append({"start": existing["start"], "end": existing["end"],
                           "seq": payload_seq, "layout": payload_layout})
             warnings.append(
                 "the payload was placed inside the backbone's existing "
                 + " / ".join(dict.fromkeys(existing["flanks"])) + " cassette")
         else:
-            replace = set(PAYLOAD_TYPES) | (spec_types & {"polyA", "WPRE"}) \
-                | (spec_types & {"Cre-lox", "lox_site"} and {"lox_site"})
+            if existing is not None and not wants_cassette:
+                warnings.append(
+                    "the recipient carries a recombinase cassette and this "
+                    "design does not ask for one, so its lox sites were "
+                    "removed with the payload they enclosed")
+            # lox sites are replaced either way: supplied fresh when a
+            # cassette was asked for, taken out when it was not.
+            replace = set(PAYLOAD_TYPES) | {"lox_site"} \
+                | (spec_types & {"polyA", "WPRE"})
             cassette = [a for a in rotated
                         if a["feature_type"] in replace
                         and a["feature_type"] not in VECTOR_TYPES

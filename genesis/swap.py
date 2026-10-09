@@ -1006,11 +1006,41 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     recipients = recipients[:limit]
 
     # --- donors: cover what the best recipient does not have --------------
-    taken = recipients[0]["run"] if recipients else 0
+    # "Has it" and "has something like it" are different answers here. A
+    # recipient carrying ASAP4c is the right thing to start from when
+    # ASAP7y was asked for - that is the swap - but it does not supply
+    # ASAP7y, and treating the resemblance as coverage is how a build that
+    # needs a donor came back saying it needed none, and never asked.
+    chosen = recipients[0]["plasmid_id"] if recipients else None
+    chosen_seq = ""
+    if chosen is not None:
+        row = conn.execute("SELECT seq FROM plasmid WHERE id = ?",
+                           (chosen,)).fetchone()
+        chosen_seq = (row["seq"] or "").upper() if row else ""
+
+    def exactly_held(index: int, pid: int | None) -> bool:
+        """Whether the recipient really supplies this module.
+
+        Asked of the DNA, not of the catalogue. The same promoter is filed
+        under several part rows with different boundaries, so comparing
+        names says no when the bases say yes; and a part catalogued as
+        present because it resembles the request - ASAP4c for ASAP7y - is
+        exactly what a donor is needed for.
+        """
+        if pid is None or not chosen_seq:
+            return False
+        module = modules[index]
+        if canonical_feature_type(module.get("type", "")) == "Cre-lox":
+            return pid in holders[index]
+        seq = (module.get("seq") or "").upper()
+        if not seq:
+            return False
+        return seq in chosen_seq or revcomp(seq) in chosen_seq
+
     donors = []
-    cursor = taken
+    cursor = 0
     while cursor < n:
-        if not modules[cursor].get("seq"):
+        if not modules[cursor].get("seq") or exactly_held(cursor, chosen):
             cursor += 1
             continue
         options = [describe(pid, cursor) for pid in holders[cursor]]
@@ -1024,8 +1054,14 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
                         "have to be synthesised"})
             cursor += 1
             continue
-        best = max(o["run"] for o in options)
-        options = sorted((o for o in options if o["run"] == best),
+        # A run is only useful up to the next module the recipient already
+        # supplies; past that the donor would be replacing what is there.
+        reach = cursor
+        while reach < n and not exactly_held(reach, chosen):
+            reach += 1
+        best = min(max(o["run"] for o in options), reach - cursor)
+        best = max(best, 1)
+        options = sorted((o for o in options if o["run"] >= best),
                          key=lambda o: o["length"])[:limit]
         donors.append({
             "covers": [modules[i].get("part_name") or modules[i].get("type")
