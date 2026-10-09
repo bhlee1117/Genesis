@@ -3051,3 +3051,116 @@ class TestCloningSimulation(unittest.TestCase):
                         {"modules": [{"part_name": "WPRE", "seq": part}],
                          "construct": {"length": len(in_product)}})
         self.assertTrue(result.passed, result.problems)
+
+
+class TestArchitectureCandidates(unittest.TestCase):
+    """A request read as an ordered architecture, not a bag of parts."""
+
+    def setUp(self):
+        self.cfg = Config()
+        self.conn = connect(":memory:")
+        self.seqs = {}
+        self.parts = {}
+        for i, name in enumerate(["hSyn", "XXX", "P2A", "ZZZ"]):
+            s = rand_seq(300, 30 + i)
+            self.seqs[name] = s
+            self.parts[name] = self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                ("promoter" if name == "hSyn" else
+                 "p2A" if name == "P2A" else "CDS",
+                 name, s, name, len(s))).lastrowid
+        self.conn.commit()
+
+    def _plasmid(self, name, carries, vector=True):
+        body = "".join(self.seqs[c] for c in carries) + rand_seq(1200, 7)
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,1,'unverified')""",
+            (name, body, len(body), name)).lastrowid
+        at = 0
+        for c in carries:
+            self.conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                        strand) VALUES (?,?,?,?,1)""",
+                (self.parts[c], pid, at, at + len(self.seqs[c])))
+            at += len(self.seqs[c])
+        if vector:
+            for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+                self.conn.execute(
+                    """INSERT INTO annotation(plasmid_id, feature_type, name,
+                            start, end, strand) VALUES (?,?,?,0,30,1)""",
+                    (pid, ftype, nm))
+        self.conn.commit()
+        return pid
+
+    def _modules(self):
+        return [{"type": "promoter" if n == "hSyn" else
+                 "p2A" if n == "P2A" else "CDS",
+                 "part_id": self.parts[n], "part_name": n,
+                 "seq": self.seqs[n]}
+                for n in ("hSyn", "XXX", "P2A", "ZZZ")]
+
+    def test_the_longest_leading_run_wins(self):
+        from genesis.swap import architecture_candidates
+        self._plasmid("pAAV-hSyn", ["hSyn"])
+        best = self._plasmid("pAAV-hSyn-XXX", ["hSyn", "XXX"])
+        self._plasmid("pAAV-ZZZ", ["ZZZ"])
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["recipients"][0]["plasmid_id"], best)
+        self.assertEqual(c["recipients"][0]["run"], 2)
+
+    def test_a_plasmid_holding_only_a_later_part_is_not_a_recipient(self):
+        # It has nothing to start from: the leading run is empty.
+        from genesis.swap import architecture_candidates
+        self._plasmid("pAAV-ZZZ", ["ZZZ"])
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["recipients"], [])
+
+    def test_one_donor_when_the_remainder_is_in_one_plasmid(self):
+        from genesis.swap import architecture_candidates
+        self._plasmid("pAAV-hSyn-XXX", ["hSyn", "XXX"])
+        self._plasmid("donor-P2A-ZZZ", ["P2A", "ZZZ"], vector=False)
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["n_donors"], 1)
+        self.assertEqual(c["donors"][0]["covers"], ["P2A", "ZZZ"])
+
+    def test_two_donors_when_the_remainder_is_split(self):
+        """The case that has to be said out loud rather than dropped."""
+        from genesis.swap import architecture_candidates
+        self._plasmid("pAAV-hSyn", ["hSyn"])
+        self._plasmid("donor-XXX-P2A", ["XXX", "P2A"], vector=False)
+        self._plasmid("donor-ZZZ", ["ZZZ"], vector=False)
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["recipients"][0]["run"], 1)
+        self.assertEqual(c["n_donors"], 2)
+        self.assertEqual([d["covers"] for d in c["donors"]],
+                         [["XXX", "P2A"], ["ZZZ"]])
+
+    def test_a_part_nobody_has_is_reported_not_hidden(self):
+        from genesis.swap import architecture_candidates
+        self._plasmid("pAAV-hSyn-XXX", ["hSyn", "XXX"])
+        self._plasmid("donor-P2A", ["P2A"], vector=False)
+        c = architecture_candidates(self.conn, self._modules())
+        last = c["donors"][-1]
+        self.assertEqual(last["covers"], ["ZZZ"])
+        self.assertEqual(last["options"], [])
+        self.assertIn("synthesised", last["note"])
+
+    def test_a_relative_is_named_as_itself(self):
+        """A plasmid holding ASAP3 does not hold ASAP7y."""
+        from genesis.swap import architecture_candidates
+        other = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','XXX-relative',?,'rel',?)""",
+            (self.seqs["XXX"], len(self.seqs["XXX"]))).lastrowid
+        pid = self._plasmid("pAAV-hSyn-relative", ["hSyn"])
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,900,1200,1)""", (other, pid))
+        self.conn.commit()
+        c = architecture_candidates(self.conn, self._modules())
+        top = c["recipients"][0]
+        self.assertFalse(top["exact"])
+        self.assertTrue(any("as XXX-relative" in x for x in top["carries"]),
+                        top["carries"])

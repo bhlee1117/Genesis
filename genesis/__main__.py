@@ -5,6 +5,7 @@
     python3 -m genesis scan --force          re-read every file, not just changed ones
     python3 -m genesis reclassify             re-label what is already indexed
     python3 -m genesis infer-orfs             annotate unannotated payload CDSs
+    python3 -m genesis candidates spec.yaml   recipients and donors for a request
     python3 -m genesis stats                 what is in the inventory
     python3 -m genesis find <term>           search plasmids
     python3 -m genesis parts [--type CDS]    browse reusable parts
@@ -93,6 +94,39 @@ def cmd_infer_orfs(args, cfg: Config):
     print("looking for payload CDSs nobody annotated", file=sys.stderr)
     print(json.dumps(infer_all(conn, limit=args.limit, refresh=args.refresh,
                                progress=progress), indent=2))
+
+
+def cmd_candidates(args, cfg: Config):
+    from .construct import ConstructSpec
+    from .design import resolve
+    from .swap import architecture_candidates
+    conn = _conn(cfg, args.db)
+    spec = ConstructSpec.from_yaml(Path(args.spec).read_text())
+    if spec.vector is None:
+        spec.vector = cfg.default_vector
+    resolved = resolve(conn, spec)
+    modules = [{"type": r.feature_type, "part_id": r.part_id,
+                "part_name": r.part_name, "seq": r.seq}
+               for r in resolved if r.seq]
+    c = architecture_candidates(conn, modules, family=spec.vector or "")
+
+    print("requested: " + " - ".join(c["modules"]))
+    print("\nstart from (longest leading run of the architecture):")
+    for r in c["recipients"]:
+        print(f"  [{r['run']}/{len(c['modules'])}] {r['name'][:44]:46} "
+              f"{r['length']:>7,} bp  {r['owner'][:18]:20} "
+              f"{', '.join(r['carries'])}")
+    if not c["recipients"]:
+        print("  (nothing in the inventory carries the first module)")
+    n = c["n_donors"]
+    print(f"\nthen take the rest from {n} donor{'s' if n != 1 else ''}:")
+    for d in c["donors"]:
+        print(f"  {' - '.join(d['covers'])}:")
+        if d.get("note"):
+            print(f"      {d['note']}")
+        for o in d.get("options", [])[:5]:
+            print(f"      {o['name'][:44]:46} {o['length']:>7,} bp  "
+                  f"{o['owner'][:18]:20} {', '.join(o['carries'])}")
 
 
 def cmd_stats(args, cfg: Config):
@@ -344,6 +378,12 @@ def main(argv=None):
     s.add_argument("--refresh", action="store_true",
                    help="discard previously inferred CDSs and redo them")
     s.set_defaults(fn=cmd_infer_orfs)
+
+    s = sub.add_parser(
+        "candidates",
+        help="show which plasmids to start from and which to take parts from")
+    s.add_argument("spec", help="construct specification (YAML)")
+    s.set_defaults(fn=cmd_candidates)
 
     s = sub.add_parser("stats", help="summarise the inventory")
     s.set_defaults(fn=cmd_stats)

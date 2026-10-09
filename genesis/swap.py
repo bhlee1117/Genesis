@@ -841,3 +841,174 @@ def rank_recipients(conn: sqlite3.Connection, candidates: list,
             candidate))
     scored.sort(key=lambda item: item[0])
     return [c for _, c in scored[:limit]]
+
+
+# --------------------------------------------------------------------------
+# Reading a request as an architecture
+# --------------------------------------------------------------------------
+
+#: Features that make a plasmid something you can start from rather than a
+#: fragment you take a piece out of.
+_VECTOR_ESSENTIALS = {"origin", "resistance"}
+
+
+def _holders(conn: sqlite3.Connection, modules: list[dict]) -> list[dict]:
+    """For each module, every plasmid that carries it and under what name.
+
+    Asked by sequence rather than by catalogue id: the same protein lives
+    under several names with slightly different boundaries, and a
+    codon-optimised copy shares almost no DNA with the original.  That
+    breadth is what finds the candidates, and it is also why the name
+    matters - a plasmid holding ASAP3 answers "something ASAP-like is
+    here", not "ASAP7y is here", and saying the second would be a lie the
+    bench would discover.
+    """
+    out: list[dict] = []
+    for m in modules:
+        seq = m.get("seq") or ""
+        pid = m.get("part_id")
+        if not seq or not pid:
+            out.append({})
+            continue
+        ids = {pid}
+        ids.update(variant_part_ids(conn, seq, pid))
+        ids.update(same_protein_parts(conn, seq, pid,
+                                      m.get("type", "CDS")))
+        marks = ",".join("?" * len(ids))
+        found: dict[int, str] = {}
+        for r in conn.execute(
+                f"SELECT o.plasmid_id AS pid, p.name AS nm, p.id AS part "
+                f"FROM part_occurrence o JOIN part p ON p.id = o.part_id "
+                f"WHERE o.part_id IN ({marks})", tuple(ids)):
+            # An exact hit beats a relative, so it wins the label.
+            if r["pid"] not in found or r["part"] == pid:
+                found[r["pid"]] = r["nm"]
+        out.append(found)
+    return out
+
+
+def _label(module: dict, actual: str) -> str:
+    """What a plasmid offers for this module, named honestly."""
+    wanted = module.get("part_name") or module.get("type") or "?"
+    if not actual or actual == wanted:
+        return wanted
+    return f"{wanted} (as {actual})"
+
+
+def _run_from(start: int, covered: set, n: int) -> int:
+    """How many modules from `start` a plasmid carries without a gap."""
+    k = start
+    while k < n and k in covered:
+        k += 1
+    return k - start
+
+
+def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
+                            family: str = "", limit: int = 6) -> dict:
+    """Which plasmid to start from, and which to take the rest from.
+
+    "pAAV-hSyn-ASAP7y-P2A-iGluSnFR4f" is an ordered architecture, not a bag
+    of parts, and the useful question is how much of it already exists in
+    one tube.  The best thing to start from is whatever carries the longest
+    *leading* run of it, because everything before the break stays put and
+    only what follows has to be built.
+
+    Whatever is left is then covered by as few donors as possible, longest
+    run first: one donor if some plasmid holds the whole remainder, two if
+    the remainder only exists in pieces.  Reporting that honestly is the
+    point - a request needing YYY and P2A-ZZZ from different plasmids is a
+    two-donor build, and saying so beats quietly dropping one of them.
+    """
+    usable = [(i, m) for i, m in enumerate(modules)
+              if (m.get("seq") and m.get("part_id"))]
+    n = len(modules)
+    holders = _holders(conn, modules)
+
+    everywhere: set = set()
+    for h in holders:
+        everywhere |= set(h)
+    if not everywhere:
+        return {"recipients": [], "donors": [], "modules": [
+            m.get("part_name") or m.get("type") for m in modules]}
+
+    marks = ",".join("?" * len(everywhere))
+    info = {r["id"]: r for r in conn.execute(
+        f"SELECT id, name, owner, seq_length FROM plasmid "
+        f"WHERE id IN ({marks})", tuple(everywhere))}
+    types: dict[int, set] = {}
+    for r in conn.execute(
+            f"SELECT plasmid_id, feature_type FROM annotation "
+            f"WHERE plasmid_id IN ({marks})", tuple(everywhere)):
+        types.setdefault(r["plasmid_id"], set()).add(r["feature_type"])
+
+    covered = {pid: {i for i in range(n) if pid in holders[i]}
+               for pid in everywhere}
+
+    def describe(pid: int, run_start: int) -> dict:
+        got = covered[pid]
+        run = _run_from(run_start, got, n)
+        return {
+            "plasmid_id": pid,
+            "name": info[pid]["name"] if pid in info else str(pid),
+            "owner": (info[pid]["owner"] if pid in info else "") or "",
+            "length": info[pid]["seq_length"] if pid in info else 0,
+            "run": run,
+            "carries": [_label(modules[i], holders[i].get(pid, ""))
+                        for i in range(run_start, run_start + run)],
+            "exact": all(holders[i].get(pid, "") ==
+                         (modules[i].get("part_name") or "")
+                         for i in range(run_start, run_start + run)),
+            "also_has": sorted(
+                _label(modules[i], holders[i].get(pid, ""))
+                for i in got if not run_start <= i < run_start + run),
+        }
+
+    # --- recipients: the longest leading run, in something you can grow ---
+    recipients = []
+    for pid in everywhere:
+        if 0 not in covered[pid]:
+            continue
+        have = types.get(pid, set())
+        if not _VECTOR_ESSENTIALS <= have:
+            continue
+        if family == "AAV" and "AAV_ITR" not in have:
+            continue
+        recipients.append(describe(pid, 0))
+    recipients.sort(key=lambda c: (-c["run"], c["length"]))
+    recipients = recipients[:limit]
+
+    # --- donors: cover what the best recipient does not have --------------
+    taken = recipients[0]["run"] if recipients else 0
+    donors = []
+    cursor = taken
+    while cursor < n:
+        if not modules[cursor].get("seq"):
+            cursor += 1
+            continue
+        options = [describe(pid, cursor) for pid in holders[cursor]]
+        options = [o for o in options if o["run"] > 0]
+        if not options:
+            donors.append({
+                "covers": [modules[cursor].get("part_name")
+                           or modules[cursor].get("type")],
+                "options": [],
+                "note": "no plasmid in the inventory carries this; it would "
+                        "have to be synthesised"})
+            cursor += 1
+            continue
+        best = max(o["run"] for o in options)
+        options = sorted((o for o in options if o["run"] == best),
+                         key=lambda o: o["length"])[:limit]
+        donors.append({
+            "covers": [modules[i].get("part_name") or modules[i].get("type")
+                       for i in range(cursor, cursor + best)],
+            "options": options,
+        })
+        cursor += best
+
+    return {
+        "modules": [m.get("part_name") or m.get("type") for m in modules],
+        "recipients": recipients,
+        "donors": donors,
+        "n_donors": len([d for d in donors if d.get("options")]),
+    }

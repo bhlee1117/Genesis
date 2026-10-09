@@ -493,7 +493,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           242 tests, no lab share required
+tests/           248 tests, no lab share required
 ```
 
 ## Giving it to a labmate
@@ -519,6 +519,25 @@ skips the scan entirely, and everyone sees the same inventory. They do not
 need the DNA share mounted unless they want to re-scan it themselves.
 
 To refresh later, re-copy the database, or run `python3 -m genesis scan`.
+
+### Reading a request as an architecture
+
+```bash
+python3 -m genesis candidates spec.yaml
+```
+
+`pAAV-hSyn-XXX-P2A-ZZZ` is an ordered architecture, not a bag of parts, so
+the useful question is how much of it already exists in one tube. The
+plasmid to start from is whichever carries the longest *leading* run:
+everything before the break stays put and only what follows has to be
+built. Whatever is left is then covered by as few donors as possible,
+longest run first - one donor if some plasmid holds the whole remainder,
+two if it only exists in pieces, and that is said out loud rather than
+quietly dropped.
+
+Candidates are found by sequence, so a codon-optimised copy under another
+name still counts, and each is labelled with what it actually holds: a
+plasmid carrying ASAP3 is offered as "ASAP7y (as ASAP3)", never as ASAP7y.
 
 ### Cloning simulation
 

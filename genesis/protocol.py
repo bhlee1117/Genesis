@@ -755,6 +755,31 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
             out += [f"- {i['category']}: {i['message']}" for i in items]
             out.append("")
 
+    cand = p.get("candidates") or {}
+    if cand.get("recipients") or cand.get("donors"):
+        out += ["### Candidate parents", "",
+                "The request read as an ordered architecture: "
+                + " - ".join(cand.get("modules", [])) + ".", "",
+                "**Start from** (whichever already carries the longest "
+                "leading run):", "",
+                "| Plasmid | Size | Owner | Already has |",
+                "|---|---|---|---|"]
+        for r in cand["recipients"]:
+            out.append(f"| {r['name']} | {r['length']:,} bp | {r['owner']} | "
+                       f"{', '.join(r['carries'])} |")
+        out.append("")
+        n = cand.get("n_donors", 0)
+        out.append(f"**Then take the rest from {n} donor"
+                   f"{'s' if n != 1 else ''}:**")
+        out.append("")
+        for d in cand["donors"]:
+            out.append(f"- *{' - '.join(d['covers'])}*"
+                       + (f" - {d['note']}" if d.get("note") else ":"))
+            for o in d.get("options", [])[:4]:
+                out.append(f"    - {o['name']} ({o['length']:,} bp, "
+                           f"{o['owner']}) - has {', '.join(o['carries'])}")
+        out.append("")
+
     sim = route.get("simulation") or {}
     if sim.get("simulated"):
         out += ["### Cloning simulation", "",

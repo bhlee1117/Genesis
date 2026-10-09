@@ -17,7 +17,7 @@ from .planner import (group_contiguous, plan_hifi_route, plan_restriction_route,
                       plan_swap_hifi_route, plan_swap_hybrid_route,
                       plan_swap_restriction_route,
                       rank_routes, failure_history)
-from .swap import analyse_swap, build_scheme, rank_parents
+from .swap import analyse_swap, architecture_candidates, build_scheme, rank_parents
 from .vectors import classify_vector, describe, missing_elements
 from .vocab import canonical_feature_type
 from .verify import verify_plan
@@ -408,6 +408,10 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
             limit=6, require_types=required_architecture(spec),
             require_family=spec.vector)],
         "routes": [r.to_dict(cfg) for r in routes],
+        # Read as an ordered architecture: which plasmids already carry the
+        # longest leading run of it, and what the rest has to come from.
+        "candidates": architecture_candidates(
+            conn, logical_modules, family=spec.vector or ""),
     }
 
     # A name proposed from the resolved architecture, so the user does not
