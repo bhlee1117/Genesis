@@ -493,7 +493,7 @@ genesis/
   verify.py      independent read-back of the designed molecule
   server.py      internal web API
 web/             single-page UI (vanilla JS, no build step)
-tests/           235 tests, no lab share required
+tests/           242 tests, no lab share required
 ```
 
 ## Giving it to a labmate
@@ -519,6 +519,20 @@ skips the scan entirely, and everyone sees the same inventory. They do not
 need the DNA share mounted unless they want to re-scan it themselves.
 
 To refresh later, re-copy the database, or run `python3 -m genesis scan`.
+
+### Cloning simulation
+
+Every feasible route is now run on paper before it is offered: the primers
+are amplified off the templates they name, the products are joined on their
+shared ends, and the molecule that comes out is searched for each part the
+design asked for. A route whose steps lose a part is marked unusable.
+
+This exists because reading the designed molecule back cannot catch a
+design that verifies perfectly while the protocol under it builds something
+else. It found three real faults on its first run: overlaps written onto
+both sides of every junction, a fragment amplified the right way up when
+the construct needs it inverted, and overlaps taken from a catalogued part
+rather than from the amplicon the reaction actually yields.
 
 ### Keeping the inventory current
 

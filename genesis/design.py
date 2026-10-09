@@ -414,6 +414,29 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # have to invent one that matches how these plasmids are already named.
     from .protocol import suggest_name
     plan["construct"]["suggested_name"] = suggest_name(plan)
+
+    # Stage 11b: run the protocol on paper.  Verification reads the designed
+    # molecule back, which cannot catch a design that verifies perfectly
+    # while the steps underneath it build something else; this amplifies the
+    # primers as ordered off the templates as named and sees what comes out.
+    from .simulate import simulate_route
+    for route in plan["routes"]:
+        if not route.get("feasible"):
+            continue
+        try:
+            sim = simulate_route(conn, plan, route).to_dict()
+        except Exception as exc:                      # never fail a plan on this
+            route["simulation"] = {"simulated": False,
+                                   "summary": f"could not be simulated: {exc}"}
+            continue
+        route["simulation"] = sim
+        if sim.get("simulated") and not sim.get("passed"):
+            route["feasible"] = False
+            for problem in sim.get("problems", []):
+                route["warnings"].insert(0, f"simulation: {problem}")
+        else:
+            for w in sim.get("warnings", []):
+                route["warnings"].append(f"simulation: {w}")
     return plan
 
 

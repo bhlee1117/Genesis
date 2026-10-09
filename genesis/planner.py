@@ -94,6 +94,60 @@ class PlannedFragment:
     modules: list = field(default_factory=list)
     needs_synthesis: bool = False
     verified: str = "unverified"
+    #: Orientation this fragment occupies in the construct, which is not
+    #: the orientation it has in its donor.  A Cre-lox payload is stored
+    #: inverted, so a part read forward from its donor goes in backwards.
+    placed_strand: int = 1
+
+    @property
+    def amplified_strand(self) -> int:
+        """Which strand of the donor to amplify to get construct orientation."""
+        return self.strand * self.placed_strand
+
+    @property
+    def placed_seq(self) -> str:
+        """This fragment as the finished molecule reads it.
+
+        `seq` is the part the right way up.  An assembly overlap has to be
+        taken from the sequence the neighbouring amplicon actually ends
+        with, which for an inverted fragment is the other strand.
+        """
+        return self.seq if self.placed_strand == 1 else revcomp(self.seq)
+
+
+def _pair_with_layout(placed: list, items: list[dict]) -> list[tuple]:
+    """Match each module to its own entry in the finished layout.
+
+    Position is not enough.  The layout holds everything the molecule ends
+    up with - the lox sites a Cre-lox cassette adds, and the ITRs, origin
+    and resistance that come from the backbone - while the module list holds
+    only what was asked for, so the two run at different lengths and zipping
+    them walks out of step.  Every fragment after the first then inherits a
+    neighbour's orientation, which is how an inverted payload came to be
+    amplified the right way up and assembled into junctions that share
+    nothing.
+
+    Matching on identity instead, left to right, keeps a part that appears
+    twice - a WPRE in the payload and another in the backbone - paired with
+    the occurrence that is actually its own.
+    """
+    pairs: list[tuple] = []
+    cursor = 0
+    for rm in placed:
+        for j in range(cursor, len(items)):
+            it = items[j]
+            same = (it.get("part_id") is not None
+                    and it.get("part_id") == rm.part_id)
+            if same or (it.get("name") == rm.part_name
+                        and it.get("type") == rm.feature_type):
+                pairs.append((rm, it))
+                cursor = j + 1
+                break
+        else:
+            # Nothing in the layout claims this module.  Pairing it with a
+            # stranger would be worse than leaving it unplaced.
+            continue
+    return pairs
 
 
 def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstruct,
@@ -115,7 +169,7 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
     placed = [rm for rm in resolved if rm.seq]
     layout_items = [i for i in construct.layout if i["type"] != "backbone"]
 
-    for rm, item in zip(placed, layout_items):
+    for rm, item in _pair_with_layout(placed, layout_items):
         source = rm.sources[0] if rm.sources else None
         if source is None:
             fragments.append(PlannedFragment(
@@ -128,6 +182,7 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
             current is not None
             and current.source_plasmid_id == source["id"]
             and current.strand == source["strand"]
+            and current.placed_strand == item.get("strand", 1)
             and not current.needs_synthesis
             and (
                 (source["strand"] == 1 and source["start"] == current.end)
@@ -148,7 +203,8 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
                 rm.part_name, rm.seq, source["id"], source["name"],
                 source["start"], source["end"], source["strand"],
                 bool(source.get("seq_length")), [item],
-                verified=source.get("verified", "unverified"))
+                verified=source.get("verified", "unverified"),
+                placed_strand=item.get("strand", 1))
             fragments.append(current)
     return fragments
 
@@ -165,11 +221,34 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     steps: list[Step] = []
     primers: list[Primer] = []
 
+    # What each PCR will actually yield, which is not always the catalogued
+    # part: the recorded boundaries of an occurrence can run a few bases wide
+    # of the part sequence.  Overlaps have to be taken from the amplicon that
+    # will exist, or a junction is designed against bases the neighbouring
+    # tube does not contain.
+    realised: dict[int, tuple[str, int, int, str, bool]] = {}
+    for idx, f in enumerate(fragments):
+        if f.needs_synthesis or f.source_plasmid_id is None:
+            realised[idx] = ("", 0, 0, f.placed_seq, False)
+            continue
+        row = conn.execute(
+            "SELECT seq, circular FROM plasmid WHERE id = ?",
+            (f.source_plasmid_id,)).fetchone()
+        if row is None:
+            realised[idx] = ("", 0, 0, f.placed_seq, False)
+            continue
+        circ = bool(row["circular"])
+        tpl, st, en = _amplification_frame(
+            row["seq"], f.start, f.end, f.amplified_strand,
+            wanted=f.placed_seq, circular=circ)
+        realised[idx] = (tpl, st, en,
+                         slice_region(tpl, st, en, circular=circ), circ)
+
     pieces: list[tuple[str, str]] = []
     if backbone:
         pieces.append(("backbone", backbone["seq"]))
-    for f in fragments:
-        pieces.append((f.name, f.seq))
+    for idx, f in enumerate(fragments):
+        pieces.append((f.name, realised[idx][3]))
     if not pieces:
         route.feasible = False
         route.warnings.append("nothing to assemble")
@@ -185,7 +264,8 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         down = pieces[1][1] if n > 1 else bb_seq
         fwd, rev = design_gibson_pair(
             0, "backbone", bb_seq, 0, len(bb_seq), up, down, cfg,
-            circular_template=bool(backbone.get("circular")))
+            circular_template=bool(backbone.get("circular")),
+            carry_downstream=False)
         primers += [fwd, rev]
         if len(bb_seq) > cfg.max_pcr_length:
             route.warnings.append(
@@ -223,14 +303,17 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
 
         row = conn.execute("SELECT seq, circular, name, verified FROM plasmid WHERE id = ?",
                            (frag.source_plasmid_id,)).fetchone()
-        template_seq = row["seq"] if row else frag.seq
-        circ = bool(row["circular"]) if row else False
-        start = frag.start if frag.strand == 1 else frag.start
-        end = frag.end
+        tpl, start, end, _body, circ = realised[i]
+        if not tpl:
+            tpl, start, end = frag.seq, 0, len(frag.seq)
 
         fwd, rev = design_gibson_pair(
-            i, frag.name, template_seq, start, end, up, down, cfg,
-            circular_template=circ)
+            i, frag.name, tpl, start, end, up, down, cfg,
+            circular_template=circ, carry_downstream=False)
+        # Report where the part is in the donor, not where it is in the
+        # strand the primers were written against.
+        for pr in (fwd, rev):
+            pr.target_start, pr.target_end = frag.start, frag.end
         primers += [fwd, rev]
 
         if len(frag.seq) > cfg.max_pcr_length:
@@ -685,6 +768,39 @@ def failure_history(conn: sqlite3.Connection) -> dict:
 # Two parents, one junction pair, one assembly reaction.
 # --------------------------------------------------------------------------
 
+def _amplification_frame(template: str, start: int, end: int,
+                         strand: int, wanted: str = "",
+                         circular: bool = False) -> tuple[str, int, int]:
+    """Template and coordinates for amplifying a region in construct orientation.
+
+    A part sits on whichever strand of its donor it happens to sit on, but a
+    PCR product's top strand is whatever the template reads forward.  Amplify
+    a minus-strand part off the plus strand and it comes out backwards, so
+    its assembly overlaps get computed in one frame and attached in the
+    other: the junctions then share no sequence and the assembly will not
+    close.  Designing against the strand the construct uses keeps one frame
+    throughout.  The primers are the same molecules either way; only which
+    strand they are written against changes.
+
+    The recorded strand is not reliable - an occurrence can be stored plus
+    while the donor actually reads the part backwards - and believing it
+    inverts the fragment.  So when the sequence the construct needs is
+    known, take the orientation whose slice is actually equal to it and
+    treat the record as a fallback.
+    """
+    n = len(template)
+    flipped = (revcomp(template), n - end, n - start)
+    if wanted:
+        here = slice_region(template, start, end, circular=circular)
+        if here == wanted:
+            return template, start, end
+        if revcomp(here) == wanted:
+            return flipped
+    if strand != -1:
+        return template, start, end
+    return flipped
+
+
 def _insert_sequence(conn: sqlite3.Connection, analysis) -> str:
     if analysis.donor is None or analysis.insert is None:
         return ""
@@ -738,7 +854,7 @@ def plan_swap_hifi_route(conn: sqlite3.Connection, analysis, cfg: Config,
     # Inverse PCR across the recipient, skipping the region being removed.
     bb_f, bb_r = design_gibson_pair(
         0, "backbone", rec_seq, remove.end, remove.start, insert_seq,
-        insert_seq, cfg, circular_template=rec_circ)
+        insert_seq, cfg, circular_template=rec_circ, carry_downstream=False)
     primers += [bb_f, bb_r]
     steps.append(Step(
         0, "PCR",
@@ -750,10 +866,17 @@ def plan_swap_hifi_route(conn: sqlite3.Connection, analysis, cfg: Config,
         details={"length": len(backbone_seq), "template": rec["name"],
                  "gc": round(gc_fraction(backbone_seq), 3)}))
 
+    ins_tpl, ins_start, ins_end = _amplification_frame(
+        don["seq"], analysis.insert.start, analysis.insert.end,
+        analysis.insert.strand, wanted=insert_seq,
+        circular=bool(don["circular"]))
     ins_f, ins_r = design_gibson_pair(
-        1, analysis.insert.label or "insert", don["seq"],
-        analysis.insert.start, analysis.insert.end, backbone_seq, backbone_seq,
-        cfg, circular_template=bool(don["circular"]))
+        1, analysis.insert.label or "insert", ins_tpl,
+        ins_start, ins_end, backbone_seq, backbone_seq,
+        cfg, circular_template=bool(don["circular"]), carry_downstream=False)
+    for pr in (ins_f, ins_r):
+        pr.target_start, pr.target_end = (analysis.insert.start,
+                                          analysis.insert.end)
     primers += [ins_f, ins_r]
     steps.append(Step(
         0, "PCR",

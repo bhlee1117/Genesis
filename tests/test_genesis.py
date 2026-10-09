@@ -2974,3 +2974,80 @@ class TestInferredORFs(unittest.TestCase):
         from genesis.orfs import payload_span
         self.assertIsNone(payload_span(
             [{"feature_type": "promoter", "name": "hSyn", "start": 0, "end": 400}]))
+
+
+class TestCloningSimulation(unittest.TestCase):
+    """Replaying the protocol, rather than trusting its bookkeeping."""
+
+    def test_pcr_product_carries_the_tails(self):
+        from genesis.simulate import pcr
+        from genesis.seqtools import revcomp
+        t = rand_seq(3000, 5)
+        fwd_anneal, rev_anneal = t[500:520], revcomp(t[1200:1220])
+        product, why = pcr(t, "aaaacccc".upper(), fwd_anneal,
+                           "ggggtttt".upper(), rev_anneal, circular=True)
+        self.assertIsNotNone(product, why)
+        self.assertEqual(product, "AAAACCCC" + t[500:1220] + revcomp("GGGGTTTT"))
+
+    def test_pcr_works_against_either_strand(self):
+        # Which strand we call the template is bookkeeping, not chemistry.
+        from genesis.simulate import pcr
+        from genesis.seqtools import revcomp
+        t = rand_seq(2000, 9)
+        a, _ = pcr(t, "", t[300:320], "", revcomp(t[900:920]), circular=True)
+        b, _ = pcr(revcomp(t), "", t[300:320], "", revcomp(t[900:920]),
+                   circular=True)
+        self.assertEqual(a, b)
+
+    def test_a_primer_that_does_not_bind_is_reported(self):
+        from genesis.simulate import pcr
+        from genesis.seqtools import revcomp
+        t = rand_seq(1000, 11)
+        product, why = pcr(t, "", "GGGGGGGGGGGGGGGGGGGG", "",
+                           revcomp(t[500:520]), circular=False)
+        self.assertIsNone(product)
+        self.assertIn("forward primer", why)
+
+    def test_fragments_assemble_on_shared_ends(self):
+        from genesis.simulate import assemble_by_homology, SimulatedProduct
+        a_body, b_body = rand_seq(400, 2), rand_seq(300, 3)
+        join1, join2 = a_body[-20:], b_body[-20:]
+        a = SimulatedProduct("a", join2 + a_body)
+        b = SimulatedProduct("b", join1 + b_body)
+        product, notes = assemble_by_homology([a, b])
+        self.assertIsNotNone(product, notes)
+        # Each overlap is counted once in the circle.
+        self.assertEqual(len(product), len(a_body) + len(b_body))
+
+    def test_fragments_that_share_nothing_do_not_assemble(self):
+        from genesis.simulate import assemble_by_homology, SimulatedProduct
+        product, notes = assemble_by_homology([
+            SimulatedProduct("a", rand_seq(400, 4)),
+            SimulatedProduct("b", rand_seq(300, 5))])
+        self.assertIsNone(product)
+        self.assertTrue(any("not chain" in n for n in notes), notes)
+
+    def test_a_missing_part_fails_the_simulation(self):
+        """The bug this exists for: steps that build the wrong molecule."""
+        from genesis.simulate import _check_contents, SimulationResult
+        present, absent = rand_seq(300, 6), rand_seq(300, 7)
+        result = SimulationResult()
+        plan = {"modules": [{"part_name": "kept", "seq": present},
+                            {"part_name": "ASAP7y", "seq": absent}],
+                "construct": {"length": len(present)}}
+        _check_contents(result, present, plan)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("ASAP7y" in p for p in result.problems),
+                        result.problems)
+
+    def test_an_element_kept_from_the_recipient_still_counts(self):
+        # A swap reuses the recipient's own WPRE, which is the same element
+        # as the catalogued part without being byte-identical to it.
+        from genesis.simulate import _check_contents, SimulationResult
+        part = rand_seq(600, 8)
+        in_product = part[12:-9]          # same element, other boundaries
+        result = SimulationResult()
+        _check_contents(result, in_product,
+                        {"modules": [{"part_name": "WPRE", "seq": part}],
+                         "construct": {"length": len(in_product)}})
+        self.assertTrue(result.passed, result.problems)

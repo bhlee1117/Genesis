@@ -179,18 +179,28 @@ def validate_primer(primer: Primer, template: str, cfg: Config,
 def design_gibson_pair(fragment_index: int, fragment_name: str,
                        template: str, start: int, end: int,
                        upstream_seq: str, downstream_seq: str,
-                       cfg: Config, circular_template: bool = False) -> tuple[Primer, Primer]:
+                       cfg: Config, circular_template: bool = False,
+                       carry_downstream: bool = True) -> tuple[Primer, Primer]:
     """Design the primer pair that amplifies one fragment with HiFi overlaps.
 
     The forward primer carries the 3' end of the *upstream* fragment as a
-    tail; the reverse primer carries the reverse complement of the 5' start
-    of the *downstream* fragment.
+    tail.  `carry_downstream` adds the mirror image to the reverse primer.
+
+    A junction needs its homology written once.  When every fragment in the
+    assembly is amplified, the next fragment's forward primer already
+    carries this one's end, and adding it here too means each amplicon
+    finishes with its neighbour's start instead of its own: the two ends
+    that are supposed to anneal then share nothing, and the assembly does
+    not close.  Pass False in that case.  Keep it True when the neighbour is
+    not amplified - a digested vector cannot be given a tail, so the insert
+    has to carry both of its junctions.
     """
     f_anneal = pick_anneal(template, start, "F", cfg, circular_template)
     r_anneal = pick_anneal(template, end, "R", cfg, circular_template)
 
     f_tail = pick_overlap(upstream_seq, cfg, from_end=True)
-    r_tail = revcomp(pick_overlap(downstream_seq, cfg, from_end=False))
+    r_tail = (revcomp(pick_overlap(downstream_seq, cfg, from_end=False))
+              if carry_downstream else "")
 
     fwd = Primer(
         name=f"{fragment_name}-F", sequence=f_tail + f_anneal, anneal=f_anneal,

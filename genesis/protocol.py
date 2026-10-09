@@ -755,6 +755,25 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
             out += [f"- {i['category']}: {i['message']}" for i in items]
             out.append("")
 
+    sim = route.get("simulation") or {}
+    if sim.get("simulated"):
+        out += ["### Cloning simulation", "",
+                "The primers below were amplified off the named templates and "
+                "the products assembled, to check the steps build this "
+                "construct rather than merely describe it.", "",
+                f"- **Result:** {sim.get('summary', '')}", ""]
+        if sim.get("modules"):
+            out += ["| Part | Length | In the product |", "|---|---|---|"]
+            for m in sim["modules"]:
+                mark = "yes" if m["present"] else "**NO**"
+                out.append(f"| {m['name']} | {m['bp']:,} bp | {mark} "
+                           f"({m['coverage']*100:.0f}%) |")
+            out.append("")
+        for w in sim.get("warnings", []):
+            out += [f"- {w}", ""]
+        for pr in sim.get("problems", []):
+            out += [f"- **{pr}**", ""]
+
     if route["warnings"]:
         out += ["### Route warnings", ""]
         out += [f"- {w}" for w in route["warnings"]]
