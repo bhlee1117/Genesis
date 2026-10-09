@@ -2805,6 +2805,8 @@ function renderCandidates(plan) {
               generatePlan();
             }
           }),
+          /* keeps a donor row on the same columns as a recipient row */
+          h('span', { class: 'cand-score' }, ''),
           h('span', { class: 'cand-name' }, o.name,
             h('span', {
               class: 'pill ' + (o.exact ? 'pill-ok' : 'pill-soft'),
