@@ -238,17 +238,27 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         "part_name": r.part_name, "seq": r.seq,
     } for r in resolved if r.seq]
 
+    # The architecture the candidate search reasons about keeps the
+    # recombinase cassette in place: "hSyn - DIO - ASAP7y" is a different
+    # request from "hSyn - ASAP7y", and a recipient that already has the
+    # cassette is the one to start from.
+    architecture = [{
+        "type": r.feature_type, "part_id": r.part_id,
+        "part_name": ("Cre-lox" if canonical_feature_type(r.feature_type)
+                      == "Cre-lox" else r.part_name),
+        "seq": r.seq,
+    } for r in resolved
+        if r.seq or canonical_feature_type(r.feature_type) == "Cre-lox"]
+
     # Read the request as an ordered architecture first, because what to
     # start from follows from it.
-    candidates = architecture_candidates(
-        conn, logical_modules, family=spec.vector or "")
     wants_cassette = any(
         canonical_feature_type(m["type"] if isinstance(m, dict) else m.type)
         == "Cre-lox" for m in spec.modules)
-    ranked = sorted(
-        candidates.get("recipients", []),
-        key=lambda c: (-c["run"], c["has_cassette"] != wants_cassette,
-                       c["length"]))
+    candidates = architecture_candidates(
+        conn, architecture, family=spec.vector or "",
+        prefer_cassette=wants_cassette)
+    ranked = candidates.get("recipients", [])
     backbone = _load_backbone(
         conn, spec, cfg,
         preferred_id=ranked[0]["plasmid_id"] if ranked else None)
@@ -485,8 +495,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         "routes": [r.to_dict(cfg) for r in routes],
         # Read as an ordered architecture: which plasmids already carry the
         # longest leading run of it, and what the rest has to come from.
-        "candidates": architecture_candidates(
-            conn, logical_modules, family=spec.vector or ""),
+        "candidates": candidates,
     }
 
     # A name proposed from the resolved architecture, so the user does not

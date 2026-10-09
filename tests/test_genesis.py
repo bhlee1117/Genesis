@@ -3147,6 +3147,30 @@ class TestArchitectureCandidates(unittest.TestCase):
         self.assertEqual(last["options"], [])
         self.assertIn("synthesised", last["note"])
 
+    def test_a_cassette_is_part_of_the_architecture(self):
+        """pAAV-hSyn-DIO-XX is a different request from pAAV-hSyn-XX."""
+        from genesis.swap import architecture_candidates
+        plain = self._plasmid("pAAV-hSyn-XXX", ["hSyn", "XXX"])
+        dio = self._plasmid("pAAV-hSyn-DIO-XXX", ["hSyn", "XXX"])
+        for nm in ("lox2272", "loxP", "lox2272", "loxP"):
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,'lox_site',?,0,34,1)""",
+                (dio, nm))
+        self.conn.commit()
+        mods = self._modules()
+        with_lox = [mods[0], {"type": "Cre-lox", "part_id": None,
+                              "part_name": "Cre-lox", "seq": ""}] + mods[1:]
+
+        # Without a cassette asked for, the plain vector leads.
+        plainc = architecture_candidates(self.conn, mods)
+        self.assertEqual(plainc["recipients"][0]["plasmid_id"], plain)
+        # With one, the vector that already has it does.
+        dioc = architecture_candidates(self.conn, with_lox)
+        self.assertIn("Cre-lox", dioc["modules"])
+        self.assertEqual(dioc["recipients"][0]["plasmid_id"], dio)
+        self.assertEqual(dioc["recipients"][0]["run"], 3)
+
     def test_a_cassette_in_the_vector_is_reported(self):
         """So a plain payload is not dropped between someone else's lox sites."""
         from genesis.swap import architecture_candidates

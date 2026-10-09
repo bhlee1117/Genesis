@@ -56,6 +56,10 @@ class SimulationResult:
     warnings: list = field(default_factory=list)
     modules: list = field(default_factory=list)
     summary: str = ""
+    #: Whether the simulated product is the designed molecule, not merely
+    #: the same size as it.
+    identical: bool = False
+    summary_suffix: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +70,7 @@ class SimulationResult:
             "steps": self.steps, "problems": self.problems,
             "warnings": self.warnings,
             "modules": self.modules, "summary": self.summary,
+            "identical": self.identical,
         }
 
 
@@ -355,6 +360,23 @@ def _check_contents(result: SimulationResult, product: str, plan: dict,
     # failure as a missing part: a swap keeps the recipient's own copies of
     # elements the design resolved from elsewhere, so the molecule is right
     # without being identical to the idealised one the plan prints.
+    # Same length is weak evidence; the same molecule is the claim.  A
+    # rotation-invariant checksum settles it for a circular product, where
+    # the two can start at different bases and still be identical.
+    designed = (plan.get("construct") or {}).get("sequence") or ""
+    if designed and product:
+        from .importer import seq_checksum
+        circular = bool((plan.get("construct") or {}).get("circular", True))
+        same = (seq_checksum(product, circular)
+                == seq_checksum(designed, circular))
+        result.identical = same
+        if same:
+            result.summary_suffix = " - identical to the designed sequence"
+        elif len(designed) == len(product):
+            result.warnings.append(
+                "the product is the same length as the designed construct "
+                "but not the same sequence; compare them before building")
+
     stated = (plan.get("construct") or {}).get("length")
     if stated and stated != len(product):
         result.warnings.append(
@@ -367,4 +389,5 @@ def _check_contents(result: SimulationResult, product: str, plan: dict,
     result.summary = (
         f"{len(product):,} bp product, {present}/{len(result.modules)} "
         f"requested parts present"
-        + ("" if result.passed else " - the steps do not build this design"))
+        + (result.summary_suffix if result.passed
+           else " - the steps do not build this design"))

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from .config import Config
 from .seqtools import revcomp, slice_region
+from .vocab import canonical_feature_type
 
 #: Module types that define the identity of a construct. Structural elements
 #: (origin, resistance, ITRs) are carried by the recipient and never swapped.
@@ -867,6 +868,22 @@ def _holders(conn: sqlite3.Connection, modules: list[dict]) -> list[dict]:
     for m in modules:
         seq = m.get("seq") or ""
         pid = m.get("part_id")
+        if canonical_feature_type(m.get("type", "")) == "Cre-lox":
+            # A recombinase cassette is a position in the architecture, not
+            # a part: it is four lox sites of two kinds around the payload.
+            # Leaving it out made pAAV-hSyn-DIO-XX and pAAV-hSyn-XX the same
+            # request, so a plasmid that already has the cassette scored no
+            # better than one that would need it built.
+            holders: dict[int, str] = {}
+            for r in conn.execute(
+                    """SELECT plasmid_id AS pid, COUNT(*) AS n,
+                              COUNT(DISTINCT lower(name)) AS kinds
+                         FROM annotation WHERE feature_type = 'lox_site'
+                        GROUP BY plasmid_id"""):
+                if r["n"] >= 4 and r["kinds"] >= 2:
+                    holders[r["pid"]] = "Cre-lox cassette"
+            out.append(holders)
+            continue
         if not seq or not pid:
             out.append({})
             continue
@@ -904,7 +921,8 @@ def _run_from(start: int, covered: set, n: int) -> int:
 
 
 def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
-                            family: str = "", limit: int = 6) -> dict:
+                            family: str = "", limit: int = 6,
+                            prefer_cassette: bool | None = None) -> dict:
     """Which plasmid to start from, and which to take the rest from.
 
     "pAAV-hSyn-ASAP7y-P2A-iGluSnFR4f" is an ordered architecture, not a bag
@@ -919,8 +937,6 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     point - a request needing YYY and P2A-ZZZ from different plasmids is a
     two-donor build, and saying so beats quietly dropping one of them.
     """
-    usable = [(i, m) for i, m in enumerate(modules)
-              if (m.get("seq") and m.get("part_id"))]
     n = len(modules)
     holders = _holders(conn, modules)
 
@@ -978,7 +994,15 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         if family == "AAV" and "AAV_ITR" not in have:
             continue
         recipients.append(describe(pid, 0))
-    recipients.sort(key=lambda c: (-c["run"], c["length"]))
+    # Rank exactly the way the backbone is actually chosen, so the list and
+    # the choice cannot disagree.
+    if prefer_cassette is None:
+        prefer_cassette = any(
+            canonical_feature_type(m.get("type", "")) == "Cre-lox"
+            for m in modules)
+    recipients.sort(key=lambda c: (-c["run"],
+                                   c["has_cassette"] != prefer_cassette,
+                                   c["length"]))
     recipients = recipients[:limit]
 
     # --- donors: cover what the best recipient does not have --------------

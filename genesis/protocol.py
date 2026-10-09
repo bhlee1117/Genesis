@@ -575,6 +575,61 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
             doc.bullet(f"{issue['category']}: {issue['message']}", 8.8,
                        gray=0.45 if level == "info" else None)
 
+    cand = plan.get("candidates") or {}
+    if cand.get("recipients") or cand.get("donors"):
+        doc.heading("Candidate parents", 2)
+        doc.paragraph("The request read as an ordered architecture: "
+                 + " - ".join(cand.get("modules", []))
+                 + ". The plasmid to start from is whichever already carries "
+                   "the longest leading run of it; the rest is covered by as "
+                   "few donors as possible.", 8.6)
+        if cand.get("recipients"):
+            doc.heading("Start from", 3)
+            doc.table(["Plasmid", "Size", "Owner", "Already has"],
+                      [[r["name"], f"{r['length']:,} bp", r["owner"],
+                        ", ".join(r["carries"])]
+                       for r in cand["recipients"]],
+                      widths=[0.33, 0.11, 0.16, 0.40], size=8.0)
+        n = cand.get("n_donors", 0)
+        doc.heading(f"Then take the rest from {n} donor"
+                    f"{'s' if n != 1 else ''}", 3)
+        for d in cand.get("donors", []):
+            doc.bullet(" - ".join(d["covers"])
+                       + (f": {d['note']}" if d.get("note") else ""), 8.8)
+            for o in d.get("options", [])[:4]:
+                doc.bullet(f"    {o['name']} ({o['length']:,} bp, {o['owner']})"
+                           f" - has {', '.join(o['carries'])}", 8.2,
+                           gray=0.45)
+
+    sim = route.get("simulation") or {}
+    if sim.get("simulated"):
+        doc.heading("Cloning simulation", 2)
+        doc.paragraph("The primers below were amplified off the named templates "
+                 "and the products assembled, to check the steps build this "
+                 "construct rather than merely describe it.", 8.6)
+        doc.paragraph(f"Result: {sim.get('summary', '')}", 9.0)
+        if sim.get("modules"):
+            doc.table(["Part", "Length", "In the product"],
+                      [[m["name"], f"{m['bp']:,} bp",
+                        ("yes" if m["present"] else "NO")
+                        + f" ({m['coverage']*100:.0f}%)"]
+                       for m in sim["modules"]],
+                      widths=[0.46, 0.18, 0.36], size=8.2)
+        for w in sim.get("warnings", []):
+            doc.bullet(w, 8.6)
+        for pr in sim.get("problems", []):
+            doc.bullet(pr, 8.6)
+
+    ver = plan.get("verification") or {}
+    if ver:
+        doc.heading("Read-back", 2)
+        doc.paragraph("The assembled sequence re-annotated from scratch and "
+                 "compared with what was asked for, independently of the "
+                 "bookkeeping that built it.", 8.6)
+        doc.paragraph(ver.get("summary", ""), 9.0)
+        for pr in ver.get("problems", []):
+            doc.bullet(pr, 8.6)
+
     if route["warnings"]:
         doc.heading("Route warnings", 2)
         for w in route["warnings"]:
