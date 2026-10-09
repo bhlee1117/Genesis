@@ -51,6 +51,8 @@ class SimulationResult:
     product_bp: int = 0
     circular: bool = True
     products: list = field(default_factory=list)
+    #: Where each amplicon is cut from, and where it lands in the product.
+    sources: list = field(default_factory=list)
     steps: list = field(default_factory=list)
     problems: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
@@ -67,6 +69,7 @@ class SimulationResult:
             "product_bp": self.product_bp, "circular": self.circular,
             "products": [{"name": p.name, "bp": len(p.seq), "note": p.note}
                          for p in self.products],
+            "sources": self.sources,
             "steps": self.steps, "problems": self.problems,
             "warnings": self.warnings,
             "modules": self.modules, "summary": self.summary,
@@ -210,22 +213,34 @@ def _plasmid(conn: sqlite3.Connection, pid: int | None):
         (pid,)).fetchone()
 
 
+def _plasmid_features(conn: sqlite3.Connection, pid: int) -> list[dict]:
+    """The annotations worth drawing on a source plasmid."""
+    return [{"feature_type": r["feature_type"], "name": r["name"],
+             "start": r["start"], "end": r["end"], "strand": r["strand"]}
+            for r in conn.execute(
+                """SELECT feature_type, name, start, end, strand
+                     FROM annotation WHERE plasmid_id = ?
+                      AND feature_type NOT IN ('primer_binding_site', 'unknown')
+                    ORDER BY start""", (pid,))]
+
+
 def _templates(conn: sqlite3.Connection, plan: dict) -> dict:
     """Map every template name a primer can cite onto its real sequence."""
-    out: dict[str, tuple[str, bool, str]] = {}
+    out: dict[str, tuple] = {}
 
     swap = plan.get("swap") or {}
     for key, label in (("recipient", "backbone"), ("donor", "donor")):
         info = swap.get(key) or {}
         row = _plasmid(conn, info.get("id"))
         if row is not None:
-            out[label] = (row["seq"], bool(row["circular"]), row["name"])
+            out[label] = (row["seq"], bool(row["circular"]), row["name"],
+                          row["id"])
             out[row["name"]] = out[label]
 
     backbone = plan.get("backbone") or {}
     row = _plasmid(conn, backbone.get("id"))
     if row is not None:
-        entry = (row["seq"], bool(row["circular"]), row["name"])
+        entry = (row["seq"], bool(row["circular"]), row["name"], row["id"])
         out.setdefault("backbone", entry)
         out.setdefault(row["name"], entry)
         # The recipient is amplified as the arcs the construct keeps, so a
@@ -236,7 +251,7 @@ def _templates(conn: sqlite3.Connection, plan: dict) -> dict:
     for frag in plan.get("fragments") or []:
         row = _plasmid(conn, frag.get("source_plasmid_id"))
         if row is not None:
-            entry = (row["seq"], bool(row["circular"]), row["name"])
+            entry = (row["seq"], bool(row["circular"]), row["name"], row["id"])
             out[frag["name"]] = entry
             out.setdefault(row["name"], entry)
     return out
@@ -278,7 +293,7 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
                 f"plan, so the reaction cannot be checked")
             result.passed = False
             continue
-        seq, circular, real_name = entry
+        seq, circular, real_name, template_id = entry
         amplicon, why = pcr(seq, fwd.get("tail", ""), fwd.get("anneal", ""),
                             rev.get("tail", ""), rev.get("anneal", ""),
                             circular)
@@ -290,6 +305,14 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
                                          f"{len(amplicon)} bp off {real_name}"))
         result.steps.append({"operation": "PCR", "product": name,
                              "template": real_name, "bp": len(amplicon)})
+        result.sources.append({
+            "name": name, "template": real_name, "template_id": template_id,
+            "template_length": len(seq), "template_circular": circular,
+            "from_start": fwd.get("target_start"),
+            "from_end": fwd.get("target_end"),
+            "bp": len(amplicon),
+            "features": _plasmid_features(conn, template_id),
+        })
 
     # Fragments that are ordered rather than amplified still go in the tube.
     amplified = {p.name for p in products}
@@ -321,6 +344,25 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
         return result
 
     result.product_bp = len(product)
+
+    # Where each amplicon ended up, so the assembly can be drawn rather than
+    # only tabulated.
+    doubled = (product + product).upper()
+    for src, made in zip(result.sources, products):
+        body = made.seq.upper()
+        if len(body) < 60:
+            anchor, offset = body, 0
+        else:
+            offset = len(body) // 2 - 30
+            anchor = body[offset:offset + 60]
+        at = doubled.find(anchor)
+        if at < 0:
+            at = doubled.find(revcomp(anchor))
+            src["flipped"] = True
+        if at >= 0:
+            src["at_start"] = (at - offset) % len(product)
+            src["at_end"] = (src["at_start"] + len(body)) % len(product)
+
     _check_contents(result, product, plan, conn)
     return result
 

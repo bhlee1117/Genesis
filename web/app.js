@@ -627,7 +627,10 @@ function buildMapSvg(width, span, list, opts) {
 
     var rect = svg('rect', {
       x: bx, y: by, width: bw, height: FEAT_H, rx: 2,
-      fill: colorFor(type), class: 'feat' + (reverse ? ' feat-rev' : '')
+      /* An item may carry its own colour: the simulation colours a stretch
+         by which reaction produced it, not by what kind of feature it is. */
+      fill: f.colour || colorFor(type),
+      class: 'feat' + (reverse ? ' feat-rev' : '')
     });
     rect.appendChild(svg('title', null,
       (f.name || '(unnamed)') + '\n' + type + '\n' +
@@ -2426,6 +2429,10 @@ function renderPlan() {
   /* --- the designed molecule itself -------------------------------- */
   out.appendChild(renderConstruct(c));
 
+  /* --- what the protocol actually makes ---------------------------- */
+  var simCard = renderSimulation(selectedRoute(), plan);
+  if (simCard) out.appendChild(simCard);
+
   /* --- read-back verification -------------------------------------- */
   if (plan.verification) out.appendChild(renderVerification(plan.verification));
 
@@ -2685,6 +2692,130 @@ function renderConstruct(c) {
  * for. Note that `problems` can be non-empty on a pass: a part that occurs
  * more than once is reported but is not by itself a failure.
  */
+/* ------------------------------------------------------------------ */
+/* Plan: the protocol run on paper                                     */
+/* ------------------------------------------------------------------ */
+
+/** A colour per fragment, so the same piece is the same colour everywhere. */
+function fragmentHue(i) {
+  return 'hsl(' + ((i * 67) % 360) + ' 62% 46%)';
+}
+
+/**
+ * The simulation, drawn rather than only tabulated.
+ *
+ * Each source plasmid is shown as the ring it is, with the stretch that
+ * gets amplified marked on it, and the construct is shown with the same
+ * colours, so "this piece comes from there and lands here" is one glance
+ * rather than three cross-references.
+ */
+function renderSimulation(route, plan) {
+  var sim = route && route.simulation;
+  if (!sim || !sim.simulated) return null;
+
+  var ok = sim.passed;
+  var card = h('div', { class: 'card sim-card' },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'Cloning simulation'),
+      h('span', { class: 'pill ' + (ok ? 'pill-ok' : 'pill-bad') },
+        ok ? (sim.identical ? 'builds the designed sequence'
+                            : 'all parts present') : 'does not build it')));
+
+  card.appendChild(h('p', { class: 'muted small' },
+    'The primers below were amplified off the named templates and the ' +
+    'products joined on their shared ends. What follows is the molecule ' +
+    'those steps make, not the one the design describes.'));
+  card.appendChild(h('p', null, h('strong', null, sim.summary || '')));
+
+  (sim.problems || []).forEach(function (p) {
+    card.appendChild(h('p', { class: 'issue issue-error' }, p));
+  });
+  (sim.warnings || []).forEach(function (w) {
+    card.appendChild(h('p', { class: 'issue issue-warning' }, w));
+  });
+
+  if ((sim.modules || []).length) {
+    card.appendChild(h('h4', null, 'Requested parts, looked for in the product'));
+    card.appendChild(table([
+      { label: 'Part', key: 'name' },
+      { label: 'Length', numeric: true,
+        cell: function (m) { return bp(m.bp); } },
+      { label: 'In the product', cell: function (m) {
+          return h('span', { class: 'pill ' + (m.present ? 'pill-ok' : 'pill-bad') },
+                   m.present ? 'yes' : 'no'); } },
+      { label: 'Covered', numeric: true, cell: function (m) {
+          return Math.round((m.coverage || 0) * 100) + '%'; } }
+    ], sim.modules));
+  }
+
+  var sources = sim.sources || [];
+  if (!sources.length) return card;
+
+  /* --- the schematic ------------------------------------------------ */
+  card.appendChild(h('h4', null, 'Where each fragment is cut from'));
+  card.appendChild(h('p', { class: 'muted small' },
+    'The marked arc is what the primers amplify. Its colour is the same ' +
+    'on the assembled construct below.'));
+
+  var grid = h('div', { class: 'sim-grid' });
+  sources.forEach(function (src, i) {
+    var hue = fragmentHue(i);
+    var box = h('div', { class: 'sim-source' });
+    box.appendChild(h('div', { class: 'sim-source-head' },
+      h('span', { class: 'sim-swatch', style: 'background:' + hue }),
+      h('strong', null, src.name),
+      h('span', { class: 'muted small' }, bp(src.bp))));
+    box.appendChild(h('div', { class: 'muted small' },
+      'from ' + src.template +
+      (src.template_length ? ' (' + bp(src.template_length) + ')' : '')));
+    var hi = null;
+    if (typeof src.from_start === 'number' && typeof src.from_end === 'number') {
+      hi = { start: src.from_start, end: src.from_end,
+             label: src.name, length: src.bp };
+    }
+    box.appendChild(circularMap(src.template_length,
+      (src.features || []).map(function (f) {
+        return { type: f.feature_type, name: f.name, start: f.start,
+                 end: f.end, strand: f.strand };
+      }), { label: src.template, highlight: hi, highlightKind: 'take',
+            circular: src.template_circular !== false }));
+    grid.appendChild(box);
+  });
+  card.appendChild(grid);
+
+  /* --- and where they land ------------------------------------------ */
+  var placed = sources.filter(function (s) {
+    return typeof s.at_start === 'number';
+  });
+  if (placed.length && sim.product_bp) {
+    card.appendChild(h('h4', null, 'How they go together'));
+    card.appendChild(h('p', { class: 'muted small' },
+      'The simulated product, coloured by which reaction each stretch ' +
+      'came out of. An arc that wraps past the top crosses position 1.'));
+    card.appendChild(featureMap(sim.product_bp, placed.map(function (s, i) {
+      return { type: 'fragment', name: s.name, start: s.at_start,
+               end: s.at_end < s.at_start ? sim.product_bp : s.at_end,
+               strand: s.flipped ? -1 : 1,
+               colour: fragmentHue(sources.indexOf(s)) };
+    }), { label: 'assembled product', circular: true }));
+
+    card.appendChild(table([
+      { label: 'Fragment', cell: function (s) {
+          return h('span', null,
+            h('span', { class: 'sim-swatch',
+                        style: 'background:' + fragmentHue(sources.indexOf(s)) }),
+            ' ' + s.name); } },
+      { label: 'Cut from', cell: function (s) {
+          return s.template + '  ' + bp(s.from_start) + '-' + bp(s.from_end); } },
+      { label: 'Length', numeric: true, cell: function (s) { return bp(s.bp); } },
+      { label: 'Lands at', cell: function (s) {
+          return bp(s.at_start) + '-' + bp(s.at_end) +
+                 (s.flipped ? ' (reversed)' : ''); } }
+    ], placed));
+  }
+  return card;
+}
+
 function renderVerification(v) {
   var passed = !!v.passed;
   var problems = v.problems || [];

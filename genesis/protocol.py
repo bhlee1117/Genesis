@@ -620,6 +620,52 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         for pr in sim.get("problems", []):
             doc.bullet(pr, 8.6)
 
+        sources = sim.get("sources") or []
+        if sources:
+            doc.heading("Where each fragment is cut from", 3)
+            doc.paragraph(
+                "The marked region is what the primers amplify. Each one is "
+                "drawn on the plasmid it comes out of, in that plasmid's own "
+                "coordinates.", 8.6)
+            for src in sources:
+                hi = None
+                if (isinstance(src.get("from_start"), int)
+                        and isinstance(src.get("from_end"), int)):
+                    hi = {"start": src["from_start"], "end": src["from_end"],
+                          "label": src["name"], "length": src.get("bp")}
+                sub = (f"{src.get('template_length', 0):,} bp - take "
+                       f"{src.get('bp', 0):,} bp as {src['name']}")
+                plasmid_track(doc, src["template"], sub,
+                              src.get("template_length") or 0,
+                              src.get("features") or [], hi, "take")
+
+            placed = [x for x in sources if isinstance(x.get("at_start"), int)]
+            if placed and sim.get("product_bp"):
+                doc.heading("How they go together", 3)
+                doc.paragraph(
+                    "The simulated product, with each stretch named by the "
+                    "reaction it came out of.", 8.6)
+                blocks = []
+                for x in placed:
+                    end = x["at_end"]
+                    if end < x["at_start"]:
+                        end = sim["product_bp"]
+                    blocks.append({"feature_type": "CDS", "name": x["name"],
+                                   "start": x["at_start"], "end": end,
+                                   "strand": -1 if x.get("flipped") else 1})
+                plasmid_track(doc, "assembled product",
+                              f"{sim['product_bp']:,} bp",
+                              sim["product_bp"], blocks)
+                doc.table(["Fragment", "Cut from", "Length", "Lands at"],
+                          [[x["name"],
+                            f"{x['template']}  {x.get('from_start')}-"
+                            f"{x.get('from_end')}",
+                            f"{x.get('bp', 0):,} bp",
+                            f"{x['at_start']:,}-{x['at_end']:,}"
+                            + (" (reversed)" if x.get("flipped") else "")]
+                           for x in placed],
+                          widths=[0.20, 0.42, 0.14, 0.24], size=8.0)
+
     ver = plan.get("verification") or {}
     if ver:
         doc.heading("Read-back", 2)

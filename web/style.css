@@ -1284,3 +1284,30 @@ tr.row-bad td {
 }
 .circ-caption.hl-cut { color: var(--error-text); }
 .circ-caption.hl-take { color: var(--ok-text); }
+
+/* ---- cloning simulation ------------------------------------------- */
+.sim-card .sim-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px;
+  margin: 12px 0 4px;
+}
+.sim-source {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px 4px;
+  background: var(--panel);
+}
+.sim-source-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.sim-swatch {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  vertical-align: middle;
+}
