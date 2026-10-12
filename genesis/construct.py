@@ -560,7 +560,11 @@ def resolve_mode(value: str) -> RecombinaseMode:
     return RECOMBINASE_MODES[key]
 
 
-def backbone_cassette(annotations: list[dict]) -> dict | None:
+VECTOR_TYPES = {"AAV_ITR", "origin", "resistance"}
+
+
+def backbone_cassette(annotations: list[dict],
+                      total: int | None = None) -> dict | None:
     """Find an existing recombinase cassette in a recipient plasmid.
 
     A pAAV-hSyn-DIO backbone already carries its lox sites. Building a new
@@ -568,8 +572,13 @@ def backbone_cassette(annotations: list[dict]) -> dict | None:
     second cassette - four more lox sites would give Cre several ways to cut
     and none of them the intended one.
 
-    Returns the interior of the cassette: the span between the innermost
-    sites, which is where a new payload goes.
+    Four sites on a circle enclose two arcs, not one, and which of them is
+    the cassette is not decided by coordinates. Sorting the sites and taking
+    the middle returns the payload only when the payload does not cross
+    position 1 - and in a real pAAV it usually does, which made the answer
+    the whole vector backbone instead: the WPRE, the resistance and the
+    promoter, with the coding sequence outside it. The arc without the
+    plasmid's own origin and resistance in it is the cassette.
     """
     sites = sorted((a for a in annotations if a["feature_type"] == "lox_site"),
                    key=lambda a: a["start"])
@@ -578,14 +587,44 @@ def backbone_cassette(annotations: list[dict]) -> dict | None:
     names = {a["name"].lower() for a in sites}
     if len(names) < 2:
         return None          # a cassette needs two different site types
-    interior_start = sites[1]["end"]
-    interior_end = sites[-2]["start"]
-    if interior_end <= interior_start:
+
+    flanks = [sites[0]["name"], sites[1]["name"],
+              sites[-2]["name"], sites[-1]["name"]]
+    straight = {"start": sites[1]["end"], "end": sites[-2]["start"],
+                "wraps": False}
+    wrapped = {"start": sites[-1]["end"], "end": sites[0]["start"],
+               "wraps": True}
+
+    span = total or max((a["end"] for a in annotations), default=0)
+
+    def holds_the_vector(arc: dict) -> bool:
+        """Whether this arc carries what a vector needs to be a vector."""
+        for a in annotations:
+            if a["feature_type"] not in VECTOR_TYPES:
+                continue
+            if arc["wraps"]:
+                inside = a["start"] >= arc["start"] or a["end"] <= arc["end"]
+            else:
+                inside = (a["start"] >= arc["start"]
+                          and a["end"] <= arc["end"])
+            if inside:
+                return True
+        return False
+
+    def length(arc: dict) -> int:
+        if arc["wraps"]:
+            return (span - arc["start"]) + arc["end"]
+        return arc["end"] - arc["start"]
+
+    options = [a for a in (straight, wrapped) if length(a) > 0]
+    if not options:
         return None
-    return {"start": interior_start, "end": interior_end,
-            "sites": [a["name"] for a in sites],
-            "flanks": [sites[0]["name"], sites[1]["name"],
-                       sites[-2]["name"], sites[-1]["name"]]}
+    # The cassette is the arc that is not the vector. When neither looks
+    # like the vector - nothing annotated to tell them apart - the one that
+    # does not cross the origin is the safer reading.
+    payload = [a for a in options if not holds_the_vector(a)]
+    chosen = payload[0] if payload else options[0]
+    return {**chosen, "sites": [a["name"] for a in sites], "flanks": flanks}
 
 
 def expand_dio(resolved: list[ResolvedModule],
@@ -814,7 +853,6 @@ REGULATORY_TYPES = {"promoter", "enhancer"}
 #: Element types that belong to the vector itself and are never replaced:
 #: the ITRs that make an AAV packageable, and the origin and resistance that
 #: let the plasmid be grown at all.
-VECTOR_TYPES = {"AAV_ITR", "origin", "resistance"}
 
 
 def payload_arc(annotations: list[dict], length: int) -> tuple | None:

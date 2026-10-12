@@ -1043,27 +1043,40 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     # holds. A pAAV-hSyn-DIO-<something> is the thing to start from for a
     # pAAV-hSyn-DIO-<something else>, and the <something> is what gets
     # replaced, so it is worth naming.
-    lox_by_plasmid: dict[int, list] = {}
-    for r in conn.execute(
-            f"SELECT plasmid_id, feature_type, name, start, end, strand "
-            f"FROM annotation WHERE plasmid_id IN ({marks}) "
-            f"AND feature_type = 'lox_site' ORDER BY start", tuple(everywhere)):
-        lox_by_plasmid.setdefault(r["plasmid_id"], []).append(dict(r))
+    # Which arc of a circle the four sites enclose cannot be read off the
+    # lox sites alone - the payload usually crosses position 1 in a real
+    # pAAV, and the other arc is the vector - so the whole annotation set
+    # goes in.
+    with_lox = {r[0] for r in conn.execute(
+        f"SELECT DISTINCT plasmid_id FROM annotation "
+        f"WHERE plasmid_id IN ({marks}) AND feature_type = 'lox_site'",
+        tuple(everywhere))}
+    anns_by: dict[int, list] = {}
+    if with_lox:
+        lmarks = ",".join("?" * len(with_lox))
+        for r in conn.execute(
+                f"SELECT plasmid_id, feature_type, name, start, end, strand "
+                f"FROM annotation WHERE plasmid_id IN ({lmarks}) ORDER BY start",
+                tuple(with_lox)):
+            anns_by.setdefault(r["plasmid_id"], []).append(dict(r))
     cassettes: dict[int, dict] = {}
-    for pid, sites in lox_by_plasmid.items():
-        found = backbone_cassette(sites)
+    for pid, anns in anns_by.items():
+        found = backbone_cassette(
+            anns, info[pid]["seq_length"] if pid in info else None)
         if found:
             cassettes[pid] = found
+
+    def in_cassette(cas: dict, a: dict) -> bool:
+        if cas["wraps"]:
+            return a["start"] >= cas["start"] or a["end"] <= cas["end"]
+        return cas["start"] <= a["start"] and a["end"] <= cas["end"]
+
     inside: dict[int, list] = {}
-    if cassettes:
-        for r in conn.execute(
-                f"SELECT plasmid_id, name, start, end FROM annotation "
-                f"WHERE plasmid_id IN ({marks}) AND feature_type IN "
-                f"('CDS','p2A','tag','trafficking_motif') ORDER BY start",
-                tuple(everywhere)):
-            cas = cassettes.get(r["plasmid_id"])
-            if cas and cas["start"] <= r["start"] and r["end"] <= cas["end"]:
-                inside.setdefault(r["plasmid_id"], []).append(r["name"])
+    for pid, cas in cassettes.items():
+        for a in anns_by.get(pid, []):
+            if (a["feature_type"] in ("CDS", "p2A", "tag", "trafficking_motif")
+                    and in_cassette(cas, a)):
+                inside.setdefault(pid, []).append(a["name"])
 
     seq_cache: dict[int, str] = {}
 

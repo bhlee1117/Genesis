@@ -4274,3 +4274,92 @@ class TestPayloadOrientation(unittest.TestCase):
         cds, payload, notes = self._payload("reverse")
         self.assertEqual(payload.seq, revcomp(cds))
         self.assertFalse(any("against" in n for n in notes), notes)
+
+
+class TestCassetteAcrossTheOrigin(unittest.TestCase):
+    """Four sites on a circle enclose two arcs; only one is the cassette."""
+
+    def _plasmid(self):
+        """A real pAAV shape: the payload crosses position 1."""
+        payload = orf(200, 211)
+        lox = [rand_seq(34, 212), rand_seq(34, 213)]
+        wpre = rand_seq(500, 214)
+        prom = rand_seq(400, 215)
+        ori = rand_seq(300, 216)
+        amp = rand_seq(400, 217)
+        # second half of the payload, the two sites, the vector, the two
+        # sites again, then the first half - so the payload wraps.
+        tail = payload[300:]
+        head = payload[:300]
+        body = (tail + lox[0] + lox[1] + wpre + ori + amp + prom
+                + lox[0] + lox[1] + head)
+        at = len(tail)
+        anns = [
+            {"feature_type": "lox_site", "name": "lox2272",
+             "start": at, "end": at + 34, "strand": 1},
+            {"feature_type": "lox_site", "name": "loxP",
+             "start": at + 34, "end": at + 68, "strand": 1},
+        ]
+        pos = at + 68
+        for ftype, nm, sq in (("WPRE", "WPRE", wpre), ("origin", "ori", ori),
+                              ("resistance", "AmpR", amp),
+                              ("promoter", "hSyn", prom)):
+            anns.append({"feature_type": ftype, "name": nm, "start": pos,
+                         "end": pos + len(sq), "strand": 1})
+            pos += len(sq)
+        anns += [
+            {"feature_type": "lox_site", "name": "lox2272", "start": pos,
+             "end": pos + 34, "strand": 1},
+            {"feature_type": "lox_site", "name": "loxP", "start": pos + 34,
+             "end": pos + 68, "strand": 1},
+            {"feature_type": "CDS", "name": "payload-head",
+             "start": pos + 68, "end": pos + 68 + len(head), "strand": -1},
+            {"feature_type": "CDS", "name": "payload-tail",
+             "start": 0, "end": len(tail), "strand": -1},
+        ]
+        return body, anns
+
+    def test_the_cassette_is_the_arc_without_the_vector_in_it(self):
+        from genesis.construct import backbone_cassette
+        body, anns = self._plasmid()
+        cas = backbone_cassette(anns, len(body))
+        self.assertIsNotNone(cas)
+        self.assertTrue(cas["wraps"],
+                        "the payload crosses position 1, so the arc does too")
+
+        def within(a):
+            if cas["wraps"]:
+                return a["start"] >= cas["start"] or a["end"] <= cas["end"]
+            return cas["start"] <= a["start"] and a["end"] <= cas["end"]
+
+        held = {a["name"] for a in anns if within(a)}
+        self.assertIn("payload-head", held)
+        self.assertIn("payload-tail", held)
+        # and emphatically not the vector
+        for nm in ("ori", "AmpR", "hSyn", "WPRE"):
+            self.assertNotIn(nm, held, f"{nm} is the vector, not the payload")
+
+    def test_a_cassette_that_does_not_wrap_is_unchanged(self):
+        from genesis.construct import backbone_cassette
+        inner = orf(120, 218)
+        lox = [rand_seq(34, 219), rand_seq(34, 220)]
+        anns = [
+            {"feature_type": "lox_site", "name": "lox2272", "start": 100,
+             "end": 134, "strand": 1},
+            {"feature_type": "lox_site", "name": "loxP", "start": 134,
+             "end": 168, "strand": 1},
+            {"feature_type": "CDS", "name": "payload", "start": 168,
+             "end": 168 + len(inner), "strand": 1},
+            {"feature_type": "lox_site", "name": "lox2272",
+             "start": 168 + len(inner), "end": 202 + len(inner), "strand": 1},
+            {"feature_type": "lox_site", "name": "loxP",
+             "start": 202 + len(inner), "end": 236 + len(inner), "strand": 1},
+            {"feature_type": "origin", "name": "ori",
+             "start": 300 + len(inner), "end": 500 + len(inner), "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR",
+             "start": 500 + len(inner), "end": 800 + len(inner), "strand": 1},
+        ]
+        cas = backbone_cassette(anns, 1000 + len(inner))
+        self.assertFalse(cas["wraps"])
+        self.assertEqual(cas["start"], 168)
+        self.assertEqual(cas["end"], 168 + len(inner))
