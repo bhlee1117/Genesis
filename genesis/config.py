@@ -72,6 +72,12 @@ class Config:
     #: Backbone to reach for when an AAV is requested and none is named.
     #: Vector family assumed when a specification does not mention one.
     #: Set to "" to infer it from the backbone instead.
+    #: Free token from https://developers.addgene.org/. Only ever used to
+    #: search the catalogue for parts the lab has not got; nothing found
+    #: there is used as a donor or a PCR template. The environment
+    #: variable GENESIS_ADDGENE_TOKEN takes precedence.
+    addgene_token: str = ""
+
     default_vector: str = "AAV"
     default_aav_backbone: str = "PP072"
     default_lenti_backbone: str = ""

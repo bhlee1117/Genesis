@@ -190,15 +190,23 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
             current = None
             continue
 
+        # Which way along the template consecutive modules travel. It is
+        # not the source strand alone: a Cre-lox payload is placed
+        # inverted, so its modules run backwards through a donor that
+        # holds them the right way round, and testing only the source
+        # strand left P2A and EGFP - adjacent bases in one plasmid - as
+        # two reactions, one of them 66 bp long.
+        placed_strand = item.get("strand", 1)
+        forward = source["strand"] * placed_strand == 1
         can_extend = (
             current is not None
             and current.source_plasmid_id == source["id"]
             and current.strand == source["strand"]
-            and current.placed_strand == item.get("strand", 1)
+            and current.placed_strand == placed_strand
             and not current.needs_synthesis
             and (
-                (source["strand"] == 1 and source["start"] == current.end)
-                or (source["strand"] == -1 and source["end"] == current.start)
+                (forward and source["start"] == current.end)
+                or (not forward and source["end"] == current.start)
             )
             and (len(current.seq) + len(rm.seq)) <= cfg.max_pcr_length
         )
@@ -206,7 +214,7 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
             current.seq += rm.seq
             current.name += f"+{rm.part_name}"
             current.modules.append(item)
-            if source["strand"] == 1:
+            if forward:
                 current.end = source["end"]
             else:
                 current.start = source["start"]
@@ -1110,7 +1118,13 @@ def _amplification_frame(template: str, start: int, end: int,
     treat the record as a fallback.
     """
     n = len(template)
-    flipped = (revcomp(template), n - end, n - start)
+    # Mapping a region onto the other strand is a subtraction, and on a
+    # region that wraps the origin - end past the last base, which is how
+    # a wrapped occurrence is recorded - the plain subtraction lands
+    # before position zero and the slice comes back empty or short.
+    # Reduce the far end into the sequence first, then measure from it.
+    low = (n - end) % n if n else 0
+    flipped = (revcomp(template), low, low + (end - start))
     if wanted:
         here = slice_region(template, start, end, circular=circular)
         if here == wanted:

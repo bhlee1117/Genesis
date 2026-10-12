@@ -854,8 +854,112 @@ def rank_recipients(conn: sqlite3.Connection, candidates: list,
 _VECTOR_ESSENTIALS = {"origin", "resistance"}
 
 
+def _growable(pid: int, circular: dict, types: dict) -> bool:
+    """Whether this row is a plasmid somebody could actually take out of a freezer.
+
+    The share holds PCR products, gel extractions and ordered fragments
+    alongside real plasmids, and a part sitting in one of those is not a
+    part you can go and amplify next week. The test is not the topology
+    flag, which a 1.3 kb fragment can perfectly well claim: it is whether
+    the thing carries an origin and a resistance marker, because without
+    both there is nothing to grow.
+    """
+    return bool(circular.get(pid)) and _VECTOR_ESSENTIALS <= types.get(pid, set())
+
+
+#: How close in length two rows must be to be one part at two boundaries.
+#: P2A with and without its GSG linker is 57 bp against 66, the tightest
+#: real pair in the inventory.
+_SAME_PART_LENGTH = 0.8
+
+#: Types whose identity is the protein they encode rather than their bases.
+_CODING = {"CDS", "tag", "trafficking_motif", "p2A", "linker"}
+
+
+def _trimmed(protein: str) -> str:
+    """A protein without the start codon the annotation may or may not include."""
+    return protein[1:] if protein[:1] == "M" else protein
+
+
+def interchangeable(want: str, other: str, feature_type: str = "CDS") -> bool:
+    """Whether two catalogued parts are the same molecule, not merely alike.
+
+    The inventory holds the same gene several times over at different
+    boundaries: EGFP appears both with and without its ATG, P2A both with
+    and without the GSG linker in front of it. Those are one part, and
+    insisting on the catalogue row that happened to be resolved made PP078
+    - which carries P2A directly fused to EGFP - look like it carried
+    neither, so the plan went off to amplify the two separately from two
+    other plasmids.
+
+    This is deliberately stricter than `VARIANT_COVERAGE`. One sequence has
+    to sit inside the other, or the two have to encode the very same
+    protein. A different version of an indicator fails both tests, which is
+    the point: ASAP3 is not a substitute for ASAP7y, and the user asking
+    for one must not quietly be handed the other.
+    """
+    want, other = (want or "").upper(), (other or "").upper()
+    if not want or not other:
+        return False
+    if want == other:
+        return True
+    # A boundary difference is a few codons, not most of the gene. Without
+    # this the catalogue's stub rows - there is a 6 bp part named "ASAP1" -
+    # are contained in everything and make every plasmid an exact holder.
+    short, long_ = sorted((len(want), len(other)))
+    if short < _SAME_PART_LENGTH * long_:
+        return False
+    if want in other or other in want:
+        return True
+    rc = revcomp(other)
+    if want in rc or rc in want:
+        return True
+    if canonical_feature_type(feature_type) in _CODING:
+        a, b = _trimmed(protein_of(want)), _trimmed(protein_of(other))
+        if a and b and (a == b or a in b or b in a):
+            return True
+    return False
+
+
+_EQUIVALENT_CACHE: dict = {}
+
+
+def equivalent_part_ids(conn: sqlite3.Connection, part_id: int) -> list[int]:
+    """Every catalogued row that is the same part as this one.
+
+    The same gene is in the catalogue several times over at different
+    boundaries, and which row a request resolves to is an accident of
+    naming. Asking only for that row made PP078 - which carries P2A fused
+    straight to EGFP - invisible to a search for EGFP, because its copy is
+    filed as "GFP" and three bases shorter.
+    """
+    row = conn.execute(
+        "SELECT id, seq, seq_checksum, feature_type FROM part WHERE id = ?",
+        (part_id,)).fetchone()
+    if row is None or not row["seq"]:
+        return [part_id]
+    # Keyed on what the part is, not on its row number: an id means
+    # different things in different databases, and the tests open a new
+    # one per case.
+    key = (part_id, row["seq_checksum"])
+    if key in _EQUIVALENT_CACHE:
+        return _EQUIVALENT_CACHE[key]
+    seq, ftype = row["seq"], row["feature_type"]
+    ids = {part_id}
+    ids.update(variant_part_ids(conn, seq, part_id))
+    ids.update(same_protein_parts(conn, seq, part_id, ftype))
+    marks = ",".join("?" * len(ids))
+    same = [part_id]
+    for other in conn.execute(
+            f"SELECT id, seq FROM part WHERE id IN ({marks})", tuple(ids)):
+        if other["id"] != part_id and interchangeable(seq, other["seq"], ftype):
+            same.append(other["id"])
+    _EQUIVALENT_CACHE[key] = same
+    return same
+
+
 def _holders(conn: sqlite3.Connection,
-             modules: list[dict]) -> tuple[list[dict], list[set]]:
+             modules: list[dict]) -> tuple[list[dict], list[set], list[list]]:
     """For each module, every plasmid that carries it and under what name.
 
     Asked by sequence rather than by catalogue id: the same protein lives
@@ -868,6 +972,11 @@ def _holders(conn: sqlite3.Connection,
     """
     out: list[dict] = []
     exact: list[set] = []
+    # Every spelling of each module that is still the same part: the same
+    # gene catalogued at another boundary, or a codon-optimised copy. The
+    # arrangement search needs these, because it reads the plasmid's bases
+    # and PP078 writes EGFP in different codons from the row resolved here.
+    alts: list[list[str]] = []
     for m in modules:
         seq = m.get("seq") or ""
         pid = m.get("part_id")
@@ -887,16 +996,29 @@ def _holders(conn: sqlite3.Connection,
                     holders[r["pid"]] = "Cre-lox cassette"
             out.append(holders)
             exact.append(set(holders))
+            alts.append([])
             continue
         if not seq or not pid:
             out.append({})
             exact.append(set())
+            alts.append([seq.upper()] if seq else [])
             continue
         ids = {pid}
         ids.update(variant_part_ids(conn, seq, pid))
         ids.update(same_protein_parts(conn, seq, pid,
                                       m.get("type", "CDS")))
         marks = ",".join("?" * len(ids))
+        # Which of those rows are the same molecule under another boundary,
+        # as opposed to a relative of it. Decided once per module.
+        ftype = m.get("type", "CDS")
+        same = {pid}
+        spellings = [seq.upper()]
+        for r in conn.execute(
+                f"SELECT id, seq FROM part WHERE id IN ({marks})", tuple(ids)):
+            if r["id"] != pid and interchangeable(seq, r["seq"], ftype):
+                same.add(r["id"])
+                spellings.append((r["seq"] or "").upper())
+        alts.append(spellings)
         found: dict[int, str] = {}
         is_exact: set = set()
         for r in conn.execute(
@@ -904,13 +1026,13 @@ def _holders(conn: sqlite3.Connection,
                 f"FROM part_occurrence o JOIN part p ON p.id = o.part_id "
                 f"WHERE o.part_id IN ({marks})", tuple(ids)):
             # An exact hit beats a relative, so it wins the label.
-            if r["pid"] not in found or r["part"] == pid:
+            if r["pid"] not in found or r["part"] in same:
                 found[r["pid"]] = r["nm"]
-            if r["part"] == pid:
+            if r["part"] in same:
                 is_exact.add(r["pid"])
         out.append(found)
         exact.append(is_exact)
-    return out, exact
+    return out, exact, alts
 
 
 def _label(module: dict, actual: str) -> str:
@@ -941,7 +1063,25 @@ GAP_WITHIN_FRAME = 150
 GAP_AFTER_CASSETTE = 400
 
 
-def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str],
+def _first_at(text: str, spellings: list[str], start: int = 0,
+              window: int | None = None) -> tuple[int, int]:
+    """Where any spelling of one module occurs, and how long it is there.
+
+    Tried in order, so the sequence that was actually resolved wins when
+    both are present and the alternatives only matter when it is absent.
+    """
+    for spelling in spellings:
+        if not spelling:
+            continue
+        at = (text.find(spelling) if window is None else
+              text.find(spelling, start, start + window + len(spelling)))
+        if at >= 0:
+            return at, len(spelling)
+    return -1, 0
+
+
+def _ordered_exact_run(host: str, modules: list[dict],
+                       seqs: list[list[str]],
                        positional: set | None = None,
                        cassette: dict | None = None) -> int:
     """How many modules, from the first, this plasmid really carries in order.
@@ -957,10 +1097,10 @@ def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str],
     if not host or not seqs or not seqs[0]:
         return 0
     for strand_text in (host, revcomp(host)):
-        at = strand_text.find(seqs[0])
+        at, width = _first_at(strand_text, seqs[0])
         if at < 0:
             continue
-        run, cursor, slack = 1, at + len(seqs[0]), 0
+        run, cursor, slack = 1, at + width, 0
         for i in range(1, len(seqs)):
             if i in positional:
                 # A recombinase cassette has no sequence of its own in the
@@ -986,11 +1126,11 @@ def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str],
                    if modules[i - 1].get("type") in REGULATORY_TYPES
                    else GAP_WITHIN_FRAME) + slack
             slack = 0
-            nxt = strand_text.find(seqs[i], cursor, cursor + gap + len(seqs[i]))
+            nxt, width = _first_at(strand_text, seqs[i], cursor, gap)
             if nxt < 0:
                 break
             run += 1
-            cursor = nxt + len(seqs[i])
+            cursor = nxt + width
         return run
     return 0
 
@@ -1013,7 +1153,7 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     two-donor build, and saying so beats quietly dropping one of them.
     """
     n = len(modules)
-    holders, exact_holders = _holders(conn, modules)
+    holders, exact_holders, spellings = _holders(conn, modules)
 
     everywhere: set = set()
     for h in holders:
@@ -1026,18 +1166,24 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
 
     marks = ",".join("?" * len(everywhere))
     info = {r["id"]: r for r in conn.execute(
-        f"SELECT id, name, owner, seq_length FROM plasmid "
+        f"SELECT id, name, owner, seq_length, circular FROM plasmid "
         f"WHERE id IN ({marks})", tuple(everywhere))}
+    circular = {pid: row["circular"] for pid, row in info.items()}
     types: dict[int, set] = {}
     for r in conn.execute(
             f"SELECT plasmid_id, feature_type FROM annotation "
             f"WHERE plasmid_id IN ({marks})", tuple(everywhere)):
         types.setdefault(r["plasmid_id"], set()).add(r["feature_type"])
 
+    # Donors and recipients alike have to be real plasmids. Everything
+    # else stays in `holders`, so a part that exists only in fragments can
+    # still be reported as such rather than silently vanishing.
+    real = {pid for pid in everywhere if _growable(pid, circular, types)}
+
     covered = {pid: {i for i in range(n) if pid in holders[i]}
                for pid in everywhere}
 
-    seqs = [(m.get("seq") or "").upper() for m in modules]
+    seqs = spellings
 
     # Where each plasmid's recombinase cassette is, and what it currently
     # holds. A pAAV-hSyn-DIO-<something> is the thing to start from for a
@@ -1172,11 +1318,9 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     # to prevent. Those plasmids are kept, marked, and offered after.
     recipients, related = [], []
     for pid in everywhere:
-        if 0 not in covered[pid]:
+        if 0 not in covered[pid] or pid not in real:
             continue
         have = types.get(pid, set())
-        if not _VECTOR_ESSENTIALS <= have:
-            continue
         if family == "AAV" and "AAV_ITR" not in have:
             continue
         entry = describe(pid, 0)
@@ -1257,9 +1401,25 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         if not modules[cursor].get("seq") or exactly_held(cursor, chosen):
             cursor += 1
             continue
-        options_all = [describe(pid, cursor) for pid in holders[cursor]]
+        options_all = [describe(pid, cursor) for pid in holders[cursor]
+                       if pid in real]
         options_all = [o for o in options_all if o["run"] > 0]
         options = options_all
+        if not options:
+            # It exists, but only in something nobody can grow.
+            elsewhere = len(holders[cursor])
+            donors.append({
+                "covers": [modules[cursor].get("part_name")
+                           or modules[cursor].get("type")],
+                "options": [],
+                "note": (f"no plasmid carries this; it is in {elsewhere} "
+                         f"PCR product(s) or fragment(s) only, so it has to "
+                         f"be ordered or amplified from one of those"
+                         if elsewhere else
+                         "no plasmid in the inventory carries this; it would "
+                         "have to be synthesised")})
+            cursor += 1
+            continue
         if not options:
             donors.append({
                 "covers": [modules[cursor].get("part_name")
