@@ -35,10 +35,14 @@ misses.
 useful question is how much of it already exists in one tube.
 
 A recombinase cassette is a **position in the architecture**, not a part:
-four lox sites of two kinds. It has no sequence of its own, so it counts
-towards the run positionally — the plasmid either has a cassette or does
-not — and what follows it starts after the sites rather than straight
-after the promoter. Leaving it out made `pAAV-hSyn-DIO-XX` and
+four lox sites of two kinds. It has no sequence of its own, so it is
+matched structurally rather than by sequence — and what makes a vector the
+right one to start from is not that four lox sites exist somewhere in it,
+but that they sit **after this promoter, with something between them**.
+That something is exactly what the payload replaces, so the scan names it:
+`pAAV-hSyn-lox2272-loxP-[ASAP6b]-lox2272-loxP` tells you both that the
+vector fits and what you would be swapping out. The search for the payload
+then continues **from inside the cassette**. Leaving it out made `pAAV-hSyn-DIO-XX` and
 `pAAV-hSyn-XX` the same request, so a plasmid that already had the cassette
 scored no better than one that would need it built.
 

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 from .config import Config
 from .seqtools import revcomp, slice_region
-from .construct import REGULATORY_TYPES
+from .construct import REGULATORY_TYPES, backbone_cassette
 from .vocab import canonical_feature_type
 
 #: Module types that define the identity of a construct. Structural elements
@@ -942,7 +942,8 @@ GAP_AFTER_CASSETTE = 400
 
 
 def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str],
-                       positional: set | None = None) -> int:
+                       positional: set | None = None,
+                       cassette: dict | None = None) -> int:
     """How many modules, from the first, this plasmid really carries in order.
 
     Exactly, and in the right order, and close enough together to be one
@@ -963,10 +964,19 @@ def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str],
         for i in range(1, len(seqs)):
             if i in positional:
                 # A recombinase cassette has no sequence of its own in the
-                # specification - it is an arrangement, and the plasmid
-                # either has one or does not. It counts, and what follows it
-                # starts after the sites rather than straight after the
-                # promoter.
+                # specification - it is an arrangement. What makes a vector
+                # the right one to start from is not that four lox sites
+                # exist somewhere in it, but that they sit after this
+                # promoter with something between them: that something is
+                # exactly what the payload replaces. So where the cassette
+                # is known, the search continues from inside it.
+                if cassette and strand_text is host:
+                    if not (cursor <= cassette["start"]
+                            <= cursor + GAP_AFTER_REGULATORY):
+                        break
+                    run += 1
+                    cursor = cassette["start"]
+                    continue
                 run += 1
                 slack = GAP_AFTER_CASSETTE
                 continue
@@ -1028,6 +1038,33 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
                for pid in everywhere}
 
     seqs = [(m.get("seq") or "").upper() for m in modules]
+
+    # Where each plasmid's recombinase cassette is, and what it currently
+    # holds. A pAAV-hSyn-DIO-<something> is the thing to start from for a
+    # pAAV-hSyn-DIO-<something else>, and the <something> is what gets
+    # replaced, so it is worth naming.
+    lox_by_plasmid: dict[int, list] = {}
+    for r in conn.execute(
+            f"SELECT plasmid_id, feature_type, name, start, end, strand "
+            f"FROM annotation WHERE plasmid_id IN ({marks}) "
+            f"AND feature_type = 'lox_site' ORDER BY start", tuple(everywhere)):
+        lox_by_plasmid.setdefault(r["plasmid_id"], []).append(dict(r))
+    cassettes: dict[int, dict] = {}
+    for pid, sites in lox_by_plasmid.items():
+        found = backbone_cassette(sites)
+        if found:
+            cassettes[pid] = found
+    inside: dict[int, list] = {}
+    if cassettes:
+        for r in conn.execute(
+                f"SELECT plasmid_id, name, start, end FROM annotation "
+                f"WHERE plasmid_id IN ({marks}) AND feature_type IN "
+                f"('CDS','p2A','tag','trafficking_motif') ORDER BY start",
+                tuple(everywhere)):
+            cas = cassettes.get(r["plasmid_id"])
+            if cas and cas["start"] <= r["start"] and r["end"] <= cas["end"]:
+                inside.setdefault(r["plasmid_id"], []).append(r["name"])
+
     seq_cache: dict[int, str] = {}
 
     def host_seq(pid: int) -> str:
@@ -1134,7 +1171,11 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             host_seq(pid), modules, seqs,
             positional={i for i in range(n)
                         if canonical_feature_type(modules[i].get("type", ""))
-                        == "Cre-lox" and pid in holders[i]})
+                        == "Cre-lox" and pid in holders[i]},
+            cassette=cassettes.get(pid))
+        if pid in cassettes:
+            entry["cassette_holds"] = inside.get(pid, [])
+            entry["cassette_sites"] = cassettes[pid]["flanks"]
         entry["exact"] = entry["exact_run"] >= entry["run"] and entry["run"] > 0
         # Never start a plain design from a plasmid carrying a recombinase
         # cassette. Its lox sites outlive the payload swap when they sit

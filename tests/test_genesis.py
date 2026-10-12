@@ -4155,3 +4155,122 @@ class TestSourcePinIsHonoured(unittest.TestCase):
         plan = design(conn, spec, Config())
         notes = [w for m in plan["modules"] for w in (m.get("warnings") or [])]
         self.assertTrue(any("does not contain" in w for w in notes), notes)
+
+
+class TestCassetteIsAnArrangement(unittest.TestCase):
+    """A cassette counts when it sits after the promoter, holding something."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.prom = rand_seq(400, 191)
+        self.cds = orf(150, 192)
+        self.part_prom = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('promoter','PromA',?,'p',?)""",
+            (self.prom, len(self.prom))).lastrowid
+        self.part_cds = self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','CDS1',?,'c',?)""",
+            (self.cds, len(self.cds))).lastrowid
+
+    def _plasmid(self, name, lox_after_promoter):
+        inner = rand_seq(500, 193)
+        lox = [rand_seq(34, 194), rand_seq(34, 195)]
+        if lox_after_promoter:
+            body = (self.prom + lox[0] + lox[1] + inner + lox[0] + lox[1]
+                    + rand_seq(800, 196))
+            lox_at = len(self.prom)
+        else:
+            # The same four sites, but parked far away from the promoter.
+            body = (self.prom + rand_seq(2500, 197) + lox[0] + lox[1] + inner
+                    + lox[0] + lox[1] + rand_seq(800, 198))
+            lox_at = len(self.prom) + 2500
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,1,'ok')""",
+            (name, body, len(body), name)).lastrowid
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,0,?,1)""",
+            (self.part_prom, pid, len(self.prom)))
+        offs = [lox_at, lox_at + 34, lox_at + 68 + len(inner),
+                lox_at + 102 + len(inner)]
+        for off, nm in zip(offs, ("lox2272", "loxP", "lox2272", "loxP")):
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,'lox_site',?,?,?,1)""",
+                (pid, nm, off, off + 34))
+        for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,0,30,1)""",
+                (pid, ftype, nm))
+        self.conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name,
+                    start, end, strand) VALUES (?,'CDS','payload',?,?,1)""",
+            (pid, lox_at + 68, lox_at + 68 + len(inner)))
+        self.conn.commit()
+        return pid
+
+    def _modules(self):
+        return [
+            {"type": "promoter", "part_id": self.part_prom,
+             "part_name": "PromA", "seq": self.prom},
+            {"type": "Cre-lox", "part_id": None, "part_name": "Cre-lox",
+             "seq": ""},
+            {"type": "CDS", "part_id": self.part_cds, "part_name": "CDS1",
+             "seq": self.cds},
+        ]
+
+    def test_a_cassette_after_the_promoter_counts(self):
+        from genesis.swap import architecture_candidates
+        good = self._plasmid("pAAV-PromA-DIO-x", lox_after_promoter=True)
+        c = architecture_candidates(self.conn, self._modules())
+        top = c["recipients"][0]
+        self.assertEqual(top["plasmid_id"], good)
+        self.assertEqual(top["exact_run"], 2, top)
+        # and it says what is in there, because that is what gets replaced
+        self.assertEqual(top.get("cassette_holds"), ["payload"])
+
+    def test_sites_parked_far_from_the_promoter_do_not(self):
+        from genesis.swap import architecture_candidates
+        self._plasmid("lox-somewhere-else", lox_after_promoter=False)
+        c = architecture_candidates(self.conn, self._modules())
+        runs = [r["exact_run"] for r in c["recipients"] + c["related"]]
+        self.assertTrue(all(r <= 1 for r in runs), c["recipients"])
+
+
+class TestPayloadOrientation(unittest.TestCase):
+    """Cre-ON and Cre-OFF are the same four sites, facing differently."""
+
+    def _payload(self, orientation):
+        from genesis.construct import expand_dio, ResolvedModule, Module
+        cds = orf(100, 201)
+        mods = [
+            ResolvedModule(module=Module("Cre-lox", "DIO", mode="DIO",
+                                         payload_orientation=orientation),
+                           part_id=None, part_name="DIO", seq="",
+                           feature_type="Cre-lox", sources=[], warnings=[]),
+            ResolvedModule(module=Module("CDS", "X"), part_id=1,
+                           part_name="X", seq=cds, feature_type="CDS",
+                           sources=[], warnings=[]),
+        ]
+        out, notes = expand_dio(mods, sites_from_backbone=True)
+        payload = [m for m in out if m.feature_type == "CDS"][0]
+        return cds, payload, notes
+
+    def test_the_default_stores_it_inverted(self):
+        from genesis.seqtools import revcomp
+        cds, payload, _ = self._payload("")
+        self.assertEqual(payload.seq, revcomp(cds))
+
+    def test_asking_for_forward_gives_cre_off(self):
+        cds, payload, notes = self._payload("forward")
+        self.assertEqual(payload.seq, cds, "expressed until Cre removes it")
+        self.assertTrue(any("Cre-OFF" in n for n in notes), notes)
+
+    def test_asking_for_reverse_is_the_usual_and_says_nothing(self):
+        from genesis.seqtools import revcomp
+        cds, payload, notes = self._payload("reverse")
+        self.assertEqual(payload.seq, revcomp(cds))
+        self.assertFalse(any("against" in n for n in notes), notes)

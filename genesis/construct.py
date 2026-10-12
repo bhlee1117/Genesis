@@ -32,6 +32,11 @@ class Module:
     part_id: int | None = None      # pinned part, if the user chose one
     seq: str = ""                   # literal sequence, if supplied directly
     mode: str = ""                  # for Cre-lox: DIO, FLEX, FAS or DO
+    #: For Cre-lox only: which way the payload goes in, overriding whatever
+    #: the mode would do. "reverse" is stored inverted and switched ON by
+    #: Cre; "forward" is expressed from the start and switched OFF. Empty
+    #: means the mode decides, which is what most requests want.
+    payload_orientation: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -617,6 +622,24 @@ def expand_dio(resolved: list[ResolvedModule],
             i += 1
             continue
 
+        # Which way the payload goes in is the switch. Stored inverted, it
+        # is silent until Cre turns it round; stored forward, it is
+        # expressed until Cre takes it out. The mode names a usual answer
+        # and the request can override it, because the same four sites
+        # build either.
+        chosen = (getattr(rm.module, "payload_orientation", "") or "").lower()
+        if chosen in ("forward", "reverse"):
+            inverted = chosen == "reverse"
+            if inverted != mode.inverted:
+                notes.append(
+                    f"the payload was asked for {chosen}, against "
+                    f"{mode.label}'s usual; this cassette is therefore "
+                    + ("Cre-ON - silent until Cre arrives"
+                       if inverted else
+                       "Cre-OFF - expressed until Cre removes it"))
+        else:
+            inverted = mode.inverted
+
         payload = []
         j = i + 1
         while j < len(resolved) and resolved[j].feature_type in CASSETTE_PAYLOAD_TYPES:
@@ -645,14 +668,14 @@ def expand_dio(resolved: list[ResolvedModule],
 
         # An inverted payload comes back in reverse order, each module on the
         # opposite strand, because the whole block is flipped as one.
-        ordered = reversed(payload) if mode.inverted else payload
+        ordered = reversed(payload) if inverted else payload
         for rm_payload in ordered:
-            seq = revcomp(rm_payload.seq) if mode.inverted else rm_payload.seq
+            seq = revcomp(rm_payload.seq) if inverted else rm_payload.seq
             flipped = ResolvedModule(
                 rm_payload.module, rm_payload.part_id, rm_payload.part_name,
                 seq, rm_payload.feature_type, rm_payload.sources,
                 list(rm_payload.warnings))
-            if mode.inverted:
+            if inverted:
                 flipped.module = Module(
                     **{**rm_payload.module.to_dict(), "orientation": "reverse"})
             out.append(flipped)
@@ -663,7 +686,7 @@ def expand_dio(resolved: list[ResolvedModule],
             notes.append(
                 f"{mode.label} expanded to {mode.outer[0]} - {mode.inner[0]} "
                 f"- [" + " + ".join(p.part_name for p in payload) +
-                (" inverted" if mode.inverted else " forward") +
+                (" inverted" if inverted else " forward") +
                 f"] - {mode.outer[0]}' - {mode.inner[0]}'; {mode.description}")
             i = j
             continue
@@ -671,7 +694,7 @@ def expand_dio(resolved: list[ResolvedModule],
         notes.append(
             f"the backbone already carries a recombinase cassette, so the "
             f"payload (" + " + ".join(p.part_name for p in payload) +
-            (", inverted" if mode.inverted else ", forward") +
+            (", inverted" if inverted else ", forward") +
             ") goes inside the existing lox sites rather than bringing its "
             "own; adding a second set would give Cre several ways to cut and "
             "none of them the intended one")
@@ -681,7 +704,7 @@ def expand_dio(resolved: list[ResolvedModule],
         notes.append(
             f"{mode.label} expanded to {mode.outer[0]} - {mode.inner[0]} - [" +
             " + ".join(p.part_name for p in payload) +
-            (" inverted" if mode.inverted else " forward") +
+            (" inverted" if inverted else " forward") +
             f"] - {mode.outer[0]}' - {mode.inner[0]}'; {mode.description}")
         i = j
     return out, notes
