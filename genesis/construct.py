@@ -230,20 +230,36 @@ def part_sources(conn: sqlite3.Connection, part_id: int) -> list[dict]:
     amplify. Prefer circular, sequence-verified, annotated plasmids; among
     equals prefer the smaller one, which amplifies more cleanly.
     """
+    # Other rows for the same part. A plasmid holding EGFP under the name
+    # "GFP", or without its start codon, holds EGFP.
+    from .swap import equivalent_part_ids
+
+    ids = equivalent_part_ids(conn, part_id)
+    marks = ",".join("?" * len(ids))
     rows = conn.execute(
-        """SELECT pl.id, pl.name, pl.owner, pl.verified, pl.available_template,
-                  pl.circular, pl.seq_length, o.start, o.end, o.strand
+        f"""SELECT pl.id, pl.name, pl.owner, pl.verified, pl.available_template,
+                  pl.circular, pl.seq_length, o.start, o.end, o.strand,
+                  (o.part_id = ?) AS exact_part,
+                  (pl.circular = 1 AND
+                   (SELECT COUNT(DISTINCT a.feature_type) FROM annotation a
+                     WHERE a.plasmid_id = pl.id
+                       AND a.feature_type IN ('origin', 'resistance')) = 2)
+                  AS growable
            FROM part_occurrence o JOIN plasmid pl ON pl.id = o.plasmid_id
-           WHERE o.part_id = ? AND pl.available_template = 1
+           WHERE o.part_id IN ({marks}) AND pl.available_template = 1
            ORDER BY
-             pl.circular DESC,
+             growable DESC,
+             exact_part DESC,
              (pl.verified != 'unverified') DESC,
-             (SELECT COUNT(*) FROM annotation a
-              WHERE a.plasmid_id = pl.id
-                AND a.feature_type IN ('origin', 'resistance')) DESC,
              pl.seq_length ASC""",
-        (part_id,)).fetchall()
-    return [dict(r) for r in rows]
+        (part_id, *ids)).fetchall()
+    out = [dict(r) for r in rows]
+    # A fragment is a template of last resort, not a cheaper option: it
+    # orders behind every real plasmid, and survives in the list only so a
+    # part that exists nowhere else can still be reported rather than
+    # looking as though nobody has it.
+    real = [r for r in out if r["growable"]]
+    return real if real else out
 
 
 #: Module types that are translated as part of a fusion protein.

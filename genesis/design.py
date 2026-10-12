@@ -10,7 +10,7 @@ import json
 import sqlite3
 
 from .config import Config
-from .seqtools import revcomp
+from .seqtools import find_all, revcomp
 from .construct import (ConstructSpec, assemble,
                         assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
@@ -19,7 +19,8 @@ from .planner import (group_contiguous, plan_gblock_route,
                       plan_swap_hifi_route, plan_swap_hybrid_route,
                       plan_swap_restriction_route,
                       rank_routes, failure_history)
-from .swap import analyse_swap, architecture_candidates, build_scheme, rank_parents
+from .swap import (analyse_swap, architecture_candidates, build_scheme,
+                   protein_of, rank_parents)
 from .vectors import classify_vector, describe, missing_elements
 from .vocab import canonical_feature_type
 from .verify import verify_plan
@@ -273,11 +274,22 @@ def _locate_fusion(conn: sqlite3.Connection, piece: list):
     pair = (len(piece) == 3 and piece[1].feature_type == "p2A"
             and piece[0].seq and piece[2].seq)
 
+    # A plasmid can only hold the run whole if it holds every module of
+    # it, so those come first. Ranking only by the first module's sources
+    # pushed the plasmids that actually carry the fusion off the end of
+    # the list.
+    shared = set.intersection(*[{s["id"] for s in rm.sources}
+                                for rm in piece]) if piece else set()
+    order = ([s for rm in piece for s in rm.sources if s["id"] in shared]
+             + piece[0].sources[:40])
+
     seen: set = set()
-    for src in piece[0].sources[:40]:
+    for src in order:
         if src["id"] in seen:
             continue
         seen.add(src["id"])
+        if len(seen) > 60:
+            break
         row = conn.execute(
             "SELECT id, name, owner, verified, circular, seq_length, seq "
             "FROM plasmid WHERE id = ?", (src["id"],)).fetchone()
@@ -289,6 +301,25 @@ def _locate_fusion(conn: sqlite3.Connection, piece: list):
             at = text.find(joined)
             if at >= 0:
                 return dict(row), _places(piece, at, len(text), strand)
+
+            # The same run, spelled differently. Take this plasmid's own
+            # bases for each module, so what the primers amplify and what
+            # the construct claims to contain are the same DNA.
+            spans = _fused_in_frame(text, piece, translate)
+            if spans is not None:
+                for rm, (lo, hi) in zip(piece, spans):
+                    bases = text[lo:hi]
+                    if bases.upper() != (rm.seq or "").upper():
+                        rm.warnings.append(
+                            f"taken as the {len(bases)} bp {rm.part_name} "
+                            f"already in {row['name']}, which encodes the "
+                            f"same protein in different codons or without "
+                            f"its start codon, so the run comes out of one "
+                            f"reaction")
+                    rm.seq = bases if strand == 1 else revcomp(bases)
+                total = spans[-1][1] - spans[0][0]
+                return dict(row), _places(piece, spans[0][0], len(text),
+                                          strand, total)
             if not pair:
                 continue
             left, right = piece[0].seq.upper(), piece[2].seq.upper()
@@ -323,6 +354,44 @@ def _locate_fusion(conn: sqlite3.Connection, piece: list):
 MAX_2A = 120
 
 
+def _fused_in_frame(text: str, piece: list, translate) -> list | None:
+    """Find this run of modules end to end in one reading frame of `text`.
+
+    Asked at the protein level rather than on the bases, because the same
+    gene is in the inventory in more than one spelling: EGFP with and
+    without its ATG, and codon-optimised copies that share almost no DNA
+    with the row a request resolves to. PP078 carries P2A fused straight
+    to EGFP, and matching its bases against the resolved EGFP fails, which
+    is what sent the planner off to amplify a 66 bp P2A on its own.
+
+    The modules must be flush against each other, so the stretch of the
+    plasmid between the first and the last is exactly the construct asked
+    for and nothing is quietly left out of it.
+    """
+    wanted = []
+    for rm in piece:
+        protein = protein_of(rm.seq or "")
+        if len(protein) < 6:
+            return None
+        wanted.append(protein[1:] if protein[:1] == "M" else protein)
+
+    for frame in range(3):
+        protein = translate(text, frame=frame)
+        at = protein.find(wanted[0])
+        while at >= 0:
+            spans, cursor, ok = [(at, at + len(wanted[0]))], at + len(wanted[0]), True
+            for want in wanted[1:]:
+                if protein[cursor:cursor + len(want)] != want:
+                    ok = False
+                    break
+                spans.append((cursor, cursor + len(want)))
+                cursor += len(want)
+            if ok:
+                return [(frame + 3 * lo, frame + 3 * hi) for lo, hi in spans]
+            at = protein.find(wanted[0], at + 1)
+    return None
+
+
 def _is_2a(spacer: str, translate) -> bool:
     """Whether this stretch could be the 2A peptide joining two proteins."""
     if not 45 <= len(spacer) <= MAX_2A or len(spacer) % 3:
@@ -349,6 +418,28 @@ def _places(piece: list, at: int, text_length: int, strand: int,
                            "strand": -1})
         offset += len(rm.seq)
     return places
+
+
+def _locate_in(host: str, want: str, circular: bool) -> tuple[int, int]:
+    """Where `want` sits in `host`, on either strand, wrap included.
+
+    A plasmid is a circle and its sequence file has to start somewhere, so
+    a part can straddle the join between the last base and the first. A
+    plain substring search reads that file as a line and misses it, which
+    would have Genesis tell somebody the plasmid they named does not
+    contain the insert they can see in it.
+
+    The end is returned unreduced - past the end of the sequence when the
+    match wraps - which is the convention `slice_region` and the
+    occurrence table already use.
+    """
+    hits = find_all(host, want, circular=circular)
+    if hits:
+        return hits[0], 1
+    hits = find_all(host, revcomp(want), circular=circular)
+    if hits:
+        return hits[0], -1
+    return -1, 0
 
 
 def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
@@ -379,9 +470,8 @@ def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
         if rm.sources and rm.sources[0]["id"] == backbone["id"]:
             continue
         wanted = rm.seq.upper()
-        at, strand = host.find(wanted), 1
-        if at < 0:
-            at, strand = host.find(revcomp(wanted)), -1
+        at, strand = _locate_in(host, wanted,
+                                bool(backbone.get("circular", 1)))
         if at < 0:
             continue
         rm.sources = [{
@@ -513,9 +603,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
             continue
         host = row["seq"].upper()
         want = rm.seq.upper()
-        at, strand = host.find(want), 1
-        if at < 0:
-            at, strand = host.find(revcomp(want)), -1
+        at, strand = _locate_in(host, want, bool(row["circular"]))
         if at < 0:
             rm.warnings.append(
                 f"{row['name']} does not contain {rm.part_name}, so it was "
