@@ -42,14 +42,24 @@ scored no better than one that would need it built.
 ### 3. Rank the candidate recipients
 same
 
-The plasmid to start from is whichever carries the longest **leading run**
-of the architecture: everything before the break stays put and only what
-follows has to be built.
+The architecture is tried **whole first and then shortened from the
+right**: `pAAV-PromA-CDS1-P2A-CDS2`, then `pAAV-PromA-CDS1-P2A`, then
+`pAAV-PromA-CDS1`, then `pAAV-PromA`. The first length anything matches is
+the answer, and `matched` on the result says which length that was.
 
-Ranked by **accuracy first**, then by how far the run reaches. A plasmid
-carrying ASAP4c when ASAP7y was asked for is the right thing to start from
-— that is the swap — but it supplies nothing, because the resemblance is
-the thing being replaced.
+**Only exact matches count towards the run**, and they have to be in order
+and close enough together to be one arrangement — a promoter may be a
+Kozak, a 5' UTR or a whole intron away from the coding sequence it drives
+(1500 bp), but inside the reading frame there is only ever a linker or a 2A
+between one module and the next (150 bp), and anything larger is a
+different gene.
+
+Nothing looser counts, because a coding sequence that *resembles* the one
+asked for is almost always an **earlier version of the same indicator** —
+ASAP4c where ASAP7y was asked for — and handing that to someone is the
+specific mistake this is here to prevent. Those plasmids are kept, marked,
+and listed separately as `related`; what a plasmid really has (`carries`)
+and what it only resembles (`resembles`) are never run together.
 
 Whether a plasmid has a part is asked of its **DNA**, not of the catalogue.
 The catalogue links parts through variants and protein matches, which is
@@ -65,10 +75,17 @@ Longest run first: one donor if some plasmid holds the whole remainder, two
 if it only exists in pieces. A build needing `YYY` and `P2A-ZZZ` from
 different plasmids is a two-donor build, and saying so beats dropping one.
 
-Donor options are ranked by carrying the part, then by covering more of the
-architecture, then by being a convenient size. Sorting by size alone put
-six ASAP relatives above the two plasmids that actually hold ASAP7y, and
-hid the one the plan then used.
+Donor options are ranked by **carrying the part**, then by covering more of
+the architecture, then by being a convenient size — in that order, and the
+order matters twice over. Sorting by size alone put six ASAP relatives
+above the two plasmids that actually hold ASAP7y. Taking the longest run
+first and only then preferring exact matches dropped the exact ones before
+they were ever compared: the two plasmids that really hold ASAP7y cover one
+module, a plasmid holding an ASAP relative plus a P2A covers two, and the
+relative won again.
+
+Relatives are still offered, after the exact ones and labelled with what
+they really carry — worth seeing, worth not reaching for by accident.
 
 > **The scan stops here.** Nothing has been designed, and it takes under a
 > second. The parents are worth settling before a protocol is written

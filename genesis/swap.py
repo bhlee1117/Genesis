@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from .config import Config
 from .seqtools import revcomp, slice_region
+from .construct import REGULATORY_TYPES
 from .vocab import canonical_feature_type
 
 #: Module types that define the identity of a construct. Structural elements
@@ -928,6 +929,47 @@ def _run_from(start: int, covered: set, n: int) -> int:
     return k - start
 
 
+#: How far apart two modules may sit and still read as one arrangement.
+#: A promoter is separated from the coding sequence it drives by a Kozak,
+#: a 5' UTR, sometimes a whole intron - EF-1a's is 940 bp. Inside the
+#: reading frame there is only ever a linker or a 2A between one module and
+#: the next, so anything larger there is a different gene, not a gap.
+GAP_AFTER_REGULATORY = 1500
+GAP_WITHIN_FRAME = 150
+
+
+def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str]) -> int:
+    """How many modules, from the first, this plasmid really carries in order.
+
+    Exactly, and in the right order, and close enough together to be one
+    arrangement rather than the same parts scattered around a plasmid.
+    Nothing looser counts: a promoter that resembles the one asked for is a
+    different promoter, and a coding sequence that resembles it is usually
+    an earlier version of the same indicator - which is the one thing a
+    person asking for ASAP7y does not want to be handed.
+    """
+    if not host or not seqs or not seqs[0]:
+        return 0
+    for strand_text in (host, revcomp(host)):
+        at = strand_text.find(seqs[0])
+        if at < 0:
+            continue
+        run, cursor = 1, at + len(seqs[0])
+        for i in range(1, len(seqs)):
+            if not seqs[i]:
+                break
+            gap = (GAP_AFTER_REGULATORY
+                   if modules[i - 1].get("type") in REGULATORY_TYPES
+                   else GAP_WITHIN_FRAME)
+            nxt = strand_text.find(seqs[i], cursor, cursor + gap + len(seqs[i]))
+            if nxt < 0:
+                break
+            run += 1
+            cursor = nxt + len(seqs[i])
+        return run
+    return 0
+
+
 def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
                             family: str = "", limit: int = 6,
                             prefer_cassette: bool | None = None) -> dict:
@@ -952,8 +994,10 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     for h in holders:
         everywhere |= set(h)
     if not everywhere:
-        return {"recipients": [], "donors": [], "modules": [
-            m.get("part_name") or m.get("type") for m in modules]}
+        return {"recipients": [], "related": [], "donors": [],
+                "matched": 0, "n_donors": 0,
+                "modules": [m.get("part_name") or m.get("type")
+                            for m in modules]}
 
     marks = ",".join("?" * len(everywhere))
     info = {r["id"]: r for r in conn.execute(
@@ -968,6 +1012,7 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     covered = {pid: {i for i in range(n) if pid in holders[i]}
                for pid in everywhere}
 
+    seqs = [(m.get("seq") or "").upper() for m in modules]
     seq_cache: dict[int, str] = {}
 
     def host_seq(pid: int) -> str:
@@ -995,6 +1040,12 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         host = host_seq(pid)
         return bool(host) and (want in host or revcomp(want) in host)
 
+    def _lead(pid: int, run_start: int, run: int) -> int:
+        k = 0
+        while k < run and really_has(pid, run_start + k):
+            k += 1
+        return k
+
     def describe(pid: int, run_start: int) -> dict:
         got = covered[pid]
         run = _run_from(run_start, got, n)
@@ -1004,8 +1055,15 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             "owner": (info[pid]["owner"] if pid in info else "") or "",
             "length": info[pid]["seq_length"] if pid in info else 0,
             "run": run,
-            "carries": [_label(modules[i], holders[i].get(pid, ""))
-                        for i in range(run_start, run_start + run)],
+            # What it really has, and separately what it only resembles.
+            # Running the two together is how a plasmid carrying ASAP4c
+            # came to be listed as carrying ASAP7y.
+            "carries": [modules[i].get("part_name") or modules[i].get("type")
+                        for i in range(run_start, run_start + run)
+                        if really_has(pid, i)],
+            "resembles": [_label(modules[i], holders[i].get(pid, ""))
+                          for i in range(run_start, run_start + run)
+                          if not really_has(pid, i)],
             # A Cre-lox cassette in the vector is only wanted when the
             # request asks for one; dropping a plain payload between someone
             # else's lox sites makes it Cre-dependent by accident.
@@ -1019,13 +1077,29 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             # much of it does not have to be built again.
             "exact_run": sum(1 for i in range(run_start, run_start + run)
                              if really_has(pid, i)),
+            # And how much of it is there *from the start*, unbroken. A
+            # donor is where a part is taken from, so what matters is
+            # whether it has this part - not whether it has something like
+            # it and then genuinely has the next one along.
+            "exact_lead": _lead(pid, run_start, run),
             "also_has": sorted(
                 _label(modules[i], holders[i].get(pid, ""))
                 for i in got if not run_start <= i < run_start + run),
         }
 
-    # --- recipients: the longest leading run, in something you can grow ---
-    recipients = []
+    # --- recipients: the longest leading run that is really there --------
+    # The architecture is tried whole first and then shortened from the
+    # right: pAAV-PromA-CDS1-P2A-CDS2, then pAAV-PromA-CDS1-P2A, then
+    # pAAV-PromA-CDS1, then pAAV-PromA. The first length anything matches
+    # is the answer, and everything shorter is a worse answer to the same
+    # question.
+    #
+    # Only exact matches count towards the run. A plasmid carrying
+    # something that resembles the coding sequence asked for is almost
+    # always an earlier version of the same indicator, and handing that to
+    # someone who asked for this one is the specific mistake this is here
+    # to prevent. Those plasmids are kept, marked, and offered after.
+    recipients, related = [], []
     for pid in everywhere:
         if 0 not in covered[pid]:
             continue
@@ -1034,21 +1108,25 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             continue
         if family == "AAV" and "AAV_ITR" not in have:
             continue
-        recipients.append(describe(pid, 0))
+        entry = describe(pid, 0)
+        entry["exact_run"] = _ordered_exact_run(host_seq(pid), modules, seqs)
+        entry["exact"] = entry["exact_run"] >= entry["run"] and entry["run"] > 0
+        (recipients if entry["exact_run"] > 0 else related).append(entry)
     # Rank exactly the way the backbone is actually chosen, so the list and
     # the choice cannot disagree.
     if prefer_cassette is None:
         prefer_cassette = any(
             canonical_feature_type(m.get("type", "")) == "Cre-lox"
             for m in modules)
-    # Accuracy first: a plasmid that really carries these modules saves
-    # building them, where one that merely resembles them saves nothing -
-    # the resemblance is the thing being swapped out.  Then how far the run
-    # reaches, then the cassette, then size.
-    recipients.sort(key=lambda c: (-c["exact_run"], -c["run"],
-                                   c["has_cassette"] != prefer_cassette,
-                                   c["length"]))
+    # How much of the architecture is really there decides the order; the
+    # loose run only breaks ties between plasmids that match equally well.
+    order = lambda c: (-c["exact_run"], -c["run"],
+                       c["has_cassette"] != prefer_cassette, c["length"])
+    recipients.sort(key=order)
+    related.sort(key=order)
+    best_run = recipients[0]["exact_run"] if recipients else 0
     recipients = recipients[:limit]
+    related = related[:limit]
 
     # --- donors: cover what the best recipient does not have --------------
     # "Has it" and "has something like it" are different answers here. A
@@ -1088,8 +1166,9 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         if not modules[cursor].get("seq") or exactly_held(cursor, chosen):
             cursor += 1
             continue
-        options = [describe(pid, cursor) for pid in holders[cursor]]
-        options = [o for o in options if o["run"] > 0]
+        options_all = [describe(pid, cursor) for pid in holders[cursor]]
+        options_all = [o for o in options_all if o["run"] > 0]
+        options = options_all
         if not options:
             donors.append({
                 "covers": [modules[cursor].get("part_name")
@@ -1104,16 +1183,32 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         reach = cursor
         while reach < n and not exactly_held(reach, chosen):
             reach += 1
-        best = min(max(o["run"] for o in options), reach - cursor)
-        best = max(best, 1)
-        # A donor is where the part is taken from, so carrying the part
-        # itself outranks carrying more of the architecture, and both
-        # outrank being a conveniently small plasmid.  Sorting by size
-        # alone put every ASAP relative above the two plasmids that
-        # actually hold ASAP7y, and hid the one the plan then used.
-        options = sorted((o for o in options if o["run"] >= best),
-                         key=lambda o: (-o["exact_run"], not o["exact"],
-                                        -o["run"], o["length"]))[:limit]
+        # Carrying the part beats carrying more of the architecture.
+        # Taking the longest run first and only then preferring exact
+        # matches drops the exact ones before they are ever compared: the
+        # two plasmids that really hold ASAP7y cover one module, a plasmid
+        # holding an ASAP relative plus a P2A covers two, and the relative
+        # won. A relative of a coding sequence is usually an earlier
+        # version of the same indicator, which is the one thing nobody
+        # asking for this one wants to be handed.
+        exact_first = [o for o in options if o["exact_lead"] > 0]
+        pool = exact_first or options
+        measure = ((lambda o: o["exact_lead"]) if exact_first
+                   else (lambda o: o["run"]))
+        best = max(1, min(max(measure(o) for o in pool), reach - cursor))
+
+        def by_size(group):
+            return sorted(group, key=lambda o: (-measure(o), o["length"]))
+
+        # Plasmids that really carry this, then ones that carry something
+        # like it over the same span. The second group is worth seeing and
+        # worth not reaching for by accident, so it comes after rather than
+        # disappearing.
+        options = by_size([o for o in pool if measure(o) >= best])
+        if exact_first:
+            options += by_size([o for o in options_all
+                                if o["exact_lead"] == 0 and o["run"] >= best])
+        options = options[:limit]
         donors.append({
             "covers": [modules[i].get("part_name") or modules[i].get("type")
                        for i in range(cursor, cursor + best)],
@@ -1124,6 +1219,12 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
     return {
         "modules": [m.get("part_name") or m.get("type") for m in modules],
         "recipients": recipients,
+        # How far down the architecture anything matched exactly: 4 means
+        # the whole of it already exists, 1 means only the promoter does.
+        "matched": best_run,
+        # Plasmids carrying something like these parts rather than these
+        # parts. Worth seeing, worth not starting from by accident.
+        "related": related,
         "donors": donors,
         "n_donors": len([d for d in donors if d.get("options")]),
     }

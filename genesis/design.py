@@ -723,6 +723,10 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
             "name": f.name, "length": len(f.seq), "source": f.source_name,
             "source_plasmid_id": f.source_plasmid_id,
             "needs_synthesis": f.needs_synthesis,
+            # A fragment nobody amplifies still goes in the tube, so the
+            # simulation needs its bases: without them it was handed an
+            # empty product and the assembly could not close.
+            "seq": f.placed_seq if f.needs_synthesis else "",
             "modules": [m["name"] for m in f.modules],
         } for f in fragments],
         "validation": validation,

@@ -281,6 +281,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         entry = {
             "kind": "fragment", "name": f.name, "seq": realised[idx][3],
             "at": f.modules[0]["start"] if f.modules else 0, "index": idx,
+            "synthetic": f.needs_synthesis,
         }
         # A module the recipient itself supplies is, as far as the bench is
         # concerned, part of the recipient: same template, same strand,
@@ -296,6 +297,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         ordered, absorbed = _merge_contiguous(ordered, bb_len)
     else:
         absorbed = set()
+    absorbed = set(absorbed)
 
     # A kept arc can be a handful of bases - the gap between a promoter and
     # the coding sequence after it - and there is no such thing as a 25 bp
@@ -306,8 +308,16 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     keep: list[dict] = []
     pending = ""
     for o in ordered:
-        if o["kind"] == "backbone" and len(o["seq"]) < cfg.min_pcr_length:
+        # Too short to be its own reaction, whichever side it came from.
+        # A Cre-lox cassette's sites are 34 bp: ordering four of those as
+        # separate synthetic fragments and assembling them is not how
+        # anyone builds a cassette, and they cannot carry an overlap on
+        # both sides while also being the lox site.
+        short = len(o["seq"]) < cfg.min_pcr_length
+        if short and (o["kind"] == "backbone" or o.get("synthetic")):
             pending += o["seq"]
+            if o["kind"] == "fragment":
+                absorbed.add(o["index"])
             continue
         if pending:
             carried[len(keep)] = pending

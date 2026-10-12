@@ -3201,10 +3201,13 @@ class TestArchitectureCandidates(unittest.TestCase):
                     strand) VALUES (?,?,900,1200,1)""", (other, pid))
         self.conn.commit()
         c = architecture_candidates(self.conn, self._modules())
-        top = c["recipients"][0]
-        self.assertFalse(top["exact"])
-        self.assertTrue(any("as XXX-relative" in x for x in top["carries"]),
-                        top["carries"])
+        everyone = c["recipients"] + c["related"]
+        top = everyone[0]
+        # What it really has and what it only resembles are kept apart, so
+        # a relative can never be read as the part itself.
+        self.assertNotIn("XXX", top["carries"])
+        self.assertTrue(any("as XXX-relative" in x for x in top["resembles"]),
+                        top)
 
 
 class TestBackboneArcs(unittest.TestCase):
@@ -3713,8 +3716,10 @@ class TestDonorAccuracy(unittest.TestCase):
         self.assertEqual(options[0]["plasmid_id"], real,
                          [o["name"] for o in options])
         self.assertTrue(options[0]["exact"])
-        # The relative is still offered, just not first.
-        self.assertFalse(options[-1]["exact"])
+        # The relative is still offered, just not first: worth seeing, and
+        # worth not reaching for by accident.
+        self.assertTrue(any(not o["exact"] for o in options),
+                        [o["name"] for o in options])
 
 
 class TestFusedSource(unittest.TestCase):
@@ -3806,3 +3811,103 @@ class TestFusedSource(unittest.TestCase):
                             ["A", "B"])
         mods = self._with_sources(self._modules(), pid)
         self.assertEqual(_prefer_fused_source(self.conn, mods), [])
+
+
+class TestShrinkingArchitecture(unittest.TestCase):
+    """The whole architecture first, then shorter, and exact only."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.prom = rand_seq(400, 141)
+        self.cds1 = orf(150, 142)
+        self.p2a = "GGA" * 22
+        self.cds2 = orf(120, 143)
+        self.parts = {}
+        for nm, sq, ft in (("PromA", self.prom, "promoter"),
+                           ("CDS1", self.cds1, "CDS"),
+                           ("P2A", self.p2a, "p2A"),
+                           ("CDS2", self.cds2, "CDS")):
+            self.parts[nm] = self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ft, nm, sq, nm, len(sq))).lastrowid
+
+    def _plasmid(self, name, body, carries):
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,1,'unverified')""",
+            (name, body, len(body), name)).lastrowid
+        for nm in carries:
+            sq = {"PromA": self.prom, "CDS1": self.cds1,
+                  "P2A": self.p2a, "CDS2": self.cds2}[nm]
+            at = body.find(sq)
+            if at < 0:
+                continue
+            self.conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,1)""",
+                (self.parts[nm], pid, at, at + len(sq)))
+        for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,0,30,1)""",
+                (pid, ftype, nm))
+        self.conn.commit()
+        return pid
+
+    def _modules(self):
+        return [
+            {"type": "promoter", "part_id": self.parts["PromA"],
+             "part_name": "PromA", "seq": self.prom},
+            {"type": "CDS", "part_id": self.parts["CDS1"],
+             "part_name": "CDS1", "seq": self.cds1},
+            {"type": "p2A", "part_id": self.parts["P2A"],
+             "part_name": "P2A", "seq": self.p2a},
+            {"type": "CDS", "part_id": self.parts["CDS2"],
+             "part_name": "CDS2", "seq": self.cds2},
+        ]
+
+    def test_the_whole_architecture_is_found_when_it_exists(self):
+        from genesis.swap import architecture_candidates
+        whole = self.prom + "GCCACC" + self.cds1 + self.p2a + self.cds2
+        self._plasmid("already-exists", whole + rand_seq(900, 144),
+                      ["PromA", "CDS1", "P2A", "CDS2"])
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["matched"], 4, c["recipients"])
+        self.assertEqual(c["n_donors"], 0)
+
+    def test_it_shortens_from_the_right(self):
+        from genesis.swap import architecture_candidates
+        # PromA-CDS1-P2A exists; CDS2 does not follow it.
+        part = self.prom + "GCCACC" + self.cds1 + self.p2a
+        self._plasmid("three-of-four", part + rand_seq(900, 145),
+                      ["PromA", "CDS1", "P2A"])
+        self._plasmid("donor-CDS2", self.cds2 + rand_seq(700, 146), ["CDS2"])
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["matched"], 3, c["recipients"])
+        self.assertEqual(c["n_donors"], 1)
+        self.assertEqual(c["donors"][0]["covers"], ["CDS2"])
+
+    def test_a_relative_does_not_lengthen_the_run(self):
+        """An older version of the indicator must not read as the new one."""
+        from genesis.swap import architecture_candidates
+        older = self.cds1[:300] + rand_seq(60, 147) + self.cds1[360:]
+        self.conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','CDS1-old',?,'old',?)""",
+            (older, len(older)))
+        old_id = self.conn.execute(
+            "SELECT id FROM part WHERE name='CDS1-old'").fetchone()[0]
+        body = self.prom + "GCCACC" + older + rand_seq(900, 148)
+        pid = self._plasmid("has-the-old-one", body, ["PromA"])
+        self.conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,?,?,1)""",
+            (old_id, pid, body.find(older), body.find(older) + len(older)))
+        self.conn.commit()
+        c = architecture_candidates(self.conn, self._modules())
+        # The promoter is really there; the coding sequence is not.
+        self.assertEqual(c["matched"], 1, c["recipients"])
+        top = c["recipients"][0]
+        self.assertEqual(top["carries"], ["PromA"])
+        self.assertTrue(any("CDS1" in x for x in top["resembles"]), top)
