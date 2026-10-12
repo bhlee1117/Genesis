@@ -487,6 +487,36 @@ def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
     return moved
 
 
+def _offer_to_order(candidates: dict, cfg) -> None:
+    """Say what could be ordered for a part no lab plasmid carries.
+
+    Only for the parts the scan has already given up on, and only when a
+    token is configured, so an ordinary scan does nothing over the network
+    and works offline exactly as before. What comes back is attached
+    beside the plan and never inside it: a plasmid on Addgene is weeks and
+    a purchase order from being a template, and letting it compete on cost
+    with something already in a freezer would make every estimate a lie.
+    """
+    from .addgene import token as addgene_token
+
+    absent = [d["covers"][0] for d in candidates.get("donors", [])
+              if not d.get("options") and d.get("covers")]
+    if not absent:
+        return
+    if not addgene_token(cfg):
+        # Worth saying once that this could be answered, without turning
+        # a missing optional token into a warning on every scan.
+        candidates["to_order_hint"] = (
+            "set GENESIS_ADDGENE_TOKEN to have Genesis look these up on "
+            "Addgene; free token at https://developers.addgene.org/")
+        return
+    try:
+        from .addgene import suggest_for_missing
+        candidates["to_order"] = suggest_for_missing(absent, cfg=cfg)
+    except Exception as exc:                      # never fail a scan on this
+        candidates["to_order_hint"] = f"Addgene could not be searched: {exc}"
+
+
 def scan_sources(conn: sqlite3.Connection, spec: ConstructSpec,
                  cfg: Config | None = None) -> dict:
     """Resolve the specification and say what it could be built from.
@@ -519,6 +549,8 @@ def scan_sources(conn: sqlite3.Connection, spec: ConstructSpec,
     backbone = _load_backbone(
         conn, spec, cfg,
         preferred_id=ranked[0]["plasmid_id"] if ranked else None)
+
+    _offer_to_order(candidates, cfg)
 
     return {
         "construct": {"name": spec.name},

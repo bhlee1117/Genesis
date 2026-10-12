@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import random
 import sys
+import os
+import urllib.parse
 import unittest
 from pathlib import Path
 
@@ -4770,3 +4772,106 @@ class TestWrappedRegionAmplifiesInEitherFrame(unittest.TestCase):
             wanted=revcomp(self._want()), circular=True)
         self.assertGreaterEqual(a, 0)
         self.assertEqual(b - a, self.end - self.start)
+
+
+class TestAddgeneIsSearchOnly(unittest.TestCase):
+    """Searching Addgene never puts an unordered plasmid into a protocol.
+
+    A catalogue number is weeks and a purchase order away from being a
+    tube in a freezer. Letting one compete on cost against something the
+    lab already has would make every route estimate a lie, so what comes
+    back is reported beside the plan and never inside it.
+    """
+
+    def setUp(self):
+        import genesis.addgene as ag
+        import tempfile
+        self.ag = ag
+        self._env = os.environ.pop("GENESIS_ADDGENE_TOKEN", None)
+        # The cache lives beside the database, so a test that did not say
+        # where that is would write into the real ~/.genesis and hand the
+        # next test an answer it never asked for.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config()
+        self.cfg.db_path = os.path.join(self._tmp.name, "genesis.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        if self._env is not None:
+            os.environ["GENESIS_ADDGENE_TOKEN"] = self._env
+        else:
+            os.environ.pop("GENESIS_ADDGENE_TOKEN", None)
+
+    def test_without_a_token_it_refuses_rather_than_scraping(self):
+        with self.assertRaises(self.ag.AddgeneUnavailable) as caught:
+            self.ag.search("ASAP7y", cfg=self.cfg)
+        self.assertIn("token", str(caught.exception))
+
+    def test_it_offers_a_browsable_url_instead(self):
+        url = self.ag.search_url("P2A-EGFP")
+        self.assertTrue(url.startswith("https://www.addgene.org/"))
+        self.assertIn("P2A-EGFP", urllib.parse.unquote(url))
+
+    def test_a_missing_part_reports_why_rather_than_an_empty_list(self):
+        out = self.ag.suggest_for_missing(["Nonesuch7z"], cfg=self.cfg)
+        self.assertEqual(out["Nonesuch7z"]["results"], [])
+        self.assertIn("token", out["Nonesuch7z"]["unavailable"])
+        self.assertTrue(out["Nonesuch7z"]["browse"])
+
+    def test_the_token_comes_from_the_environment_first(self):
+        cfg = self.cfg
+        cfg.addgene_token = "from-config"
+        self.assertEqual(self.ag.token(cfg), "from-config")
+        os.environ["GENESIS_ADDGENE_TOKEN"] = "from-env"
+        self.assertEqual(self.ag.token(cfg), "from-env")
+
+    def test_a_scan_without_a_token_does_not_touch_the_network(self):
+        """An offline lab must get exactly the scan it got before."""
+        def explode(*a, **k):
+            raise AssertionError("the network was touched")
+        original = self.ag._request
+        self.ag._request = explode
+        try:
+            from genesis.design import _offer_to_order
+            candidates = {"donors": [{"covers": ["Xa"], "options": []}]}
+            _offer_to_order(candidates, self.cfg)
+        finally:
+            self.ag._request = original
+        self.assertNotIn("to_order", candidates)
+        self.assertIn("developers.addgene.org", candidates["to_order_hint"])
+
+    def test_results_are_reported_beside_the_plan_not_as_donors(self):
+        from genesis.design import _offer_to_order
+        cfg = self.cfg
+        os.environ["GENESIS_ADDGENE_TOKEN"] = "pretend"
+        original = self.ag._request
+        self.ag._request = lambda path, params, key: {"results": [{
+            "id": 12345, "name": "pAAV-hSyn-Thing",
+            "url": "https://www.addgene.org/12345/",
+            "depositor": ["A Lab"], "inserts": [], "cloning": {},
+            "bacterial_resistance": "Ampicillin", "article": {}}]}
+        try:
+            donor = {"covers": ["Xb"], "options": []}
+            candidates = {"donors": [donor]}
+            _offer_to_order(candidates, cfg)
+        finally:
+            self.ag._request = original
+        # Reported...
+        self.assertEqual(
+            candidates["to_order"]["Xb"]["results"][0]["id"], 12345)
+        # ...and the donor is still empty, so no route can amplify from it.
+        self.assertEqual(donor["options"], [])
+
+    def test_a_search_failure_never_fails_the_scan(self):
+        from genesis.design import _offer_to_order
+        os.environ["GENESIS_ADDGENE_TOKEN"] = "pretend"
+        original = self.ag._request
+        self.ag._request = lambda *a, **k: (_ for _ in ()).throw(
+            self.ag.AddgeneUnavailable("Addgene is down"))
+        try:
+            candidates = {"donors": [{"covers": ["Xc"], "options": []}]}
+            _offer_to_order(candidates, self.cfg)
+        finally:
+            self.ag._request = original
+        self.assertEqual(candidates["to_order"]["Xc"]["results"], [])
+        self.assertIn("down", candidates["to_order"]["Xc"]["unavailable"])

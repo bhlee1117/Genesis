@@ -147,6 +147,44 @@ def cmd_stats(args, cfg: Config):
         print(f"  {r['feature_type']:20s} {r['n']}")
 
 
+def cmd_addgene(args, cfg: Config):
+    """Search Addgene for something the lab has not got.
+
+    Search only. Nothing printed here is ordered, and nothing printed here
+    is used as a donor or a PCR template: it is weeks and a purchase order
+    away from being in a freezer.
+    """
+    from .addgene import AddgeneUnavailable, search, search_url
+
+    query = " ".join(args.query)
+    try:
+        hits = search(query, limit=args.limit, cfg=cfg,
+                      use_cache=not args.no_cache)
+    except AddgeneUnavailable as exc:
+        print(f"Addgene could not be searched: {exc}")
+        print(f"browse it by hand: {search_url(query)}")
+        return 1
+    if not hits:
+        print(f"nothing on Addgene matches {query!r}")
+        print(f"browse it by hand: {search_url(query)}")
+        return 0
+    print(f"{len(hits)} plasmid(s) on Addgene for {query!r} - to order, not "
+          f"to clone from:\n")
+    for h in hits:
+        print(f"  #{h['id']}  {h['name'][:58]}")
+        if h["genes"]:
+            print(f"        inserts     {', '.join(h['genes'][:4])}")
+        if h["promoters"]:
+            print(f"        promoter    {', '.join(h['promoters'][:3])}")
+        if h["depositor"]:
+            print(f"        depositor   {h['depositor'][:54]}")
+        if h["resistance"]:
+            print(f"        resistance  {h['resistance'][:54]}")
+        print(f"        {h['url']}")
+        print()
+    return 0
+
+
 def cmd_find(args, cfg: Config):
     conn = _conn(cfg, args.db)
     term = f"%{args.term}%"
@@ -437,6 +475,13 @@ def main(argv=None):
     s.add_argument("--disable", action="store_true")
     s.add_argument("--enable", action="store_true")
     s.set_defaults(fn=cmd_role)
+
+    s = sub.add_parser(
+        "addgene", help="search Addgene for a part the lab has not got")
+    s.add_argument("query", nargs="+", help="part or plasmid name")
+    s.add_argument("--limit", type=int, default=8)
+    s.add_argument("--no-cache", action="store_true")
+    s.set_defaults(fn=cmd_addgene)
 
     s = sub.add_parser("serve", help="start the internal web interface")
     s.add_argument("--port", type=int)
