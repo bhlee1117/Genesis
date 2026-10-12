@@ -520,6 +520,12 @@ need the DNA share mounted unless they want to re-scan it themselves.
 
 To refresh later, re-copy the database, or run `python3 -m genesis scan`.
 
+### How the planning works
+
+[docs/ALGORITHM.md](docs/ALGORITHM.md) sets out the whole pipeline step by
+step — what each stage does, and why, since most of the reasons are faults
+that were found by building the thing and looking at what came out.
+
 ### Two steps, not one
 
 **Scan the source** resolves the modules and shows what the construct could
