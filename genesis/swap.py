@@ -936,9 +936,13 @@ def _run_from(start: int, covered: set, n: int) -> int:
 #: the next, so anything larger there is a different gene, not a gap.
 GAP_AFTER_REGULATORY = 1500
 GAP_WITHIN_FRAME = 150
+#: A cassette is two lox sites and the spacing around them, which the
+#: payload starts after.
+GAP_AFTER_CASSETTE = 400
 
 
-def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str]) -> int:
+def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str],
+                       positional: set | None = None) -> int:
     """How many modules, from the first, this plasmid really carries in order.
 
     Exactly, and in the right order, and close enough together to be one
@@ -948,19 +952,30 @@ def _ordered_exact_run(host: str, modules: list[dict], seqs: list[str]) -> int:
     an earlier version of the same indicator - which is the one thing a
     person asking for ASAP7y does not want to be handed.
     """
+    positional = positional or set()
     if not host or not seqs or not seqs[0]:
         return 0
     for strand_text in (host, revcomp(host)):
         at = strand_text.find(seqs[0])
         if at < 0:
             continue
-        run, cursor = 1, at + len(seqs[0])
+        run, cursor, slack = 1, at + len(seqs[0]), 0
         for i in range(1, len(seqs)):
+            if i in positional:
+                # A recombinase cassette has no sequence of its own in the
+                # specification - it is an arrangement, and the plasmid
+                # either has one or does not. It counts, and what follows it
+                # starts after the sites rather than straight after the
+                # promoter.
+                run += 1
+                slack = GAP_AFTER_CASSETTE
+                continue
             if not seqs[i]:
                 break
             gap = (GAP_AFTER_REGULATORY
                    if modules[i - 1].get("type") in REGULATORY_TYPES
-                   else GAP_WITHIN_FRAME)
+                   else GAP_WITHIN_FRAME) + slack
+            slack = 0
             nxt = strand_text.find(seqs[i], cursor, cursor + gap + len(seqs[i]))
             if nxt < 0:
                 break
@@ -1109,9 +1124,25 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         if family == "AAV" and "AAV_ITR" not in have:
             continue
         entry = describe(pid, 0)
-        entry["exact_run"] = _ordered_exact_run(host_seq(pid), modules, seqs)
+        entry["exact_run"] = _ordered_exact_run(
+            host_seq(pid), modules, seqs,
+            positional={i for i in range(n)
+                        if canonical_feature_type(modules[i].get("type", ""))
+                        == "Cre-lox" and pid in holders[i]})
         entry["exact"] = entry["exact_run"] >= entry["run"] and entry["run"] > 0
-        (recipients if entry["exact_run"] > 0 else related).append(entry)
+        # Never start a plain design from a plasmid carrying a recombinase
+        # cassette. Its lox sites outlive the payload swap when they sit
+        # outside the region being replaced, and a construct that is silent
+        # until Cre arrives is not the one that was asked for. It stays
+        # listed, so it can still be chosen deliberately.
+        if prefer_cassette is False and entry["has_cassette"]:
+            entry["why_not"] = ("carries a recombinase cassette this design "
+                                "does not ask for")
+            related.append(entry)
+        elif entry["exact_run"] > 0:
+            recipients.append(entry)
+        else:
+            related.append(entry)
     # Rank exactly the way the backbone is actually chosen, so the list and
     # the choice cannot disagree.
     if prefer_cassette is None:

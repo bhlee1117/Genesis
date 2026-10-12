@@ -1242,7 +1242,9 @@ class TestDIO(unittest.TestCase):
         # members come back in the order the ribosome reads them
         self.assertEqual([m["name"] for m in runs[0]["members"]],
                          ["geneA", "P2A", "geneB"])
-        errors = [i.message for i in validate_construct(construct)
+        # This design did ask for a cassette, so its lox sites belong.
+        errors = [i.message for i in
+                  validate_construct(construct, wants_cassette=True)
                   if i.level == "error"]
         self.assertEqual(errors, [], errors)
 
@@ -3911,3 +3913,66 @@ class TestShrinkingArchitecture(unittest.TestCase):
         top = c["recipients"][0]
         self.assertEqual(top["carries"], ["PromA"])
         self.assertTrue(any("CDS1" in x for x in top["resembles"]), top)
+
+
+class TestNoStrayCassette(unittest.TestCase):
+    """A design that did not ask for Cre-lox must never carry a lox site.
+
+    Not a tidiness rule. Cre turns up in the animal, not in the plasmid, so
+    a payload left between somebody else's lox sites is silent until it
+    does, and an inverted one stays inverted. Whichever recipient it came
+    from and whichever path put it there, it cannot ship.
+    """
+
+    def _construct(self, lox_outside_the_payload):
+        from genesis.construct import (assemble_into_backbone, ResolvedModule,
+                                       Module, AssembledConstruct)
+        prom = rand_seq(300, 151)
+        lox_a, lox_b = rand_seq(34, 152), rand_seq(34, 153)
+        old = rand_seq(600, 154)
+        tail = rand_seq(800, 155)
+        if lox_outside_the_payload:
+            # The sites sit past the region a payload swap replaces.
+            seq = prom + old + tail + lox_a + lox_b
+            at = len(prom) + len(old) + len(tail)
+        else:
+            seq = prom + lox_a + lox_b + old + tail
+            at = len(prom)
+        anns = [
+            {"feature_type": "promoter", "name": "p", "start": 0,
+             "end": len(prom), "strand": 1},
+            {"feature_type": "lox_site", "name": "lox2272", "start": at,
+             "end": at + 34, "strand": 1},
+            {"feature_type": "lox_site", "name": "loxP", "start": at + 34,
+             "end": at + 68, "strand": 1},
+            {"feature_type": "CDS", "name": "old",
+             "start": seq.find(old), "end": seq.find(old) + 600, "strand": 1},
+            {"feature_type": "origin", "name": "ori",
+             "start": len(seq) - 300, "end": len(seq) - 150, "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR",
+             "start": len(seq) - 150, "end": len(seq), "strand": 1},
+        ]
+        rm = ResolvedModule(module=Module("CDS", "new"), part_id=1,
+                            part_name="new", seq=rand_seq(300, 156),
+                            feature_type="CDS", sources=[], warnings=[])
+        return assemble_into_backbone([rm], seq, anns, {"CDS"})
+
+    def test_a_stray_lox_site_is_an_error(self):
+        from genesis.validate import validate_construct
+        con = self._construct(lox_outside_the_payload=True)
+        issues = validate_construct(con, wants_cassette=False, check_aav=False)
+        errors = [i for i in issues if i.level == "error"]
+        self.assertTrue(any("lox site" in i.message for i in errors),
+                        [i.message for i in issues])
+
+    def test_a_cre_lox_design_is_not_flagged(self):
+        from genesis.validate import validate_construct
+        con = self._construct(lox_outside_the_payload=True)
+        issues = validate_construct(con, wants_cassette=True, check_aav=False)
+        self.assertFalse(any("lox site" in i.message for i in issues
+                             if i.level == "error"))
+
+    def test_a_cassette_inside_the_payload_is_removed(self):
+        con = self._construct(lox_outside_the_payload=False)
+        self.assertEqual([i["name"] for i in con.layout
+                          if i["type"] == "lox_site"], [])

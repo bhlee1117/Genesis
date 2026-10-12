@@ -35,7 +35,10 @@ misses.
 useful question is how much of it already exists in one tube.
 
 A recombinase cassette is a **position in the architecture**, not a part:
-four lox sites of two kinds. Leaving it out made `pAAV-hSyn-DIO-XX` and
+four lox sites of two kinds. It has no sequence of its own, so it counts
+towards the run positionally — the plasmid either has a cassette or does
+not — and what follows it starts after the sites rather than straight
+after the promoter. Leaving it out made `pAAV-hSyn-DIO-XX` and
 `pAAV-hSyn-XX` the same request, so a plasmid that already had the cassette
 scored no better than one that would need it built.
 
@@ -166,6 +169,14 @@ Four decisions live here:
 - **Two slots, not one.** The payload replaces the recipient's coding
   sequence; the promoter is separate and replaced only when the
   specification names one, or asking for CAG gives you hSyn as well.
+- **A lox site never appears in a design that did not ask for one.** Not a
+  tidiness rule: Cre turns up in the animal, not in the plasmid, so a
+  payload left between somebody else's lox sites is silent until it does,
+  and an inverted one stays inverted. Three things enforce it — a
+  cassette-bearing plasmid is never chosen automatically for a plain
+  design, the sites inside the replaced region go with it, and any that
+  survive anyway are a **validation error**, whichever recipient was
+  pinned and whichever path put them there.
 - **A cassette is only reused when one was asked for.** Dropping a plain
   payload between somebody else's lox sites makes the construct
   Cre-dependent, so nothing is expressed until Cre arrives — a different

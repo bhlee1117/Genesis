@@ -168,7 +168,8 @@ def lox_sites_from_layout(seq: str) -> list[LoxSite]:
 def validate_construct(construct: AssembledConstruct,
                        expected_order: list[str] | None = None,
                        stocked_enzymes: list[str] | None = None,
-                       check_aav: bool = True) -> list[Issue]:
+                       check_aav: bool = True,
+                       wants_cassette: bool = False) -> list[Issue]:
     issues: list[Issue] = []
     seq = construct.seq
     if not seq:
@@ -176,6 +177,23 @@ def validate_construct(construct: AssembledConstruct,
 
     for w in construct.warnings:
         issues.append(Issue("warning", "dna", w))
+
+    # A recombinase site in a construct that never asked for one is not a
+    # tidiness problem. Cre turns up in the animal, not in the plasmid: a
+    # payload left sitting between somebody else's lox sites is silent
+    # until it does, and an inverted one stays inverted. Whichever recipient
+    # it came from and whichever path put it there, this cannot ship.
+    if not wants_cassette:
+        stray = [i["name"] for i in construct.layout
+                 if i["type"] == "lox_site"]
+        if stray:
+            issues.append(Issue(
+                "error", "dna",
+                f"this design does not ask for a recombinase cassette, but "
+                f"the construct carries {len(stray)} lox site(s) "
+                f"({', '.join(dict.fromkeys(stray))}) - it would be "
+                f"Cre-dependent, which is a different experiment; start "
+                f"from a recipient without a cassette"))
 
     # A required module that resolved to nothing means the assembled molecule
     # is not the construct that was specified. For something like a DIO

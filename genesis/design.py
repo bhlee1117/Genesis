@@ -579,7 +579,8 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     expected = [rm.feature_type for rm in resolved if rm.seq] or None
     placed_types = [i["type"] for i in construct.layout
                     if not i.get("from_backbone")]
-    issues = validate_construct(construct, expected_order=expected,
+    issues = validate_construct(construct, wants_cassette=wants_cassette,
+                                expected_order=expected,
                                 stocked_enzymes=list(cfg.stocked_enzymes))
 
     if spec.vector and backbone is None:
