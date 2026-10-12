@@ -492,12 +492,43 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # saying "that tube" has a reason the inventory cannot see.
     for rm in resolved:
         wanted = spec.source_plasmid_ids.get(rm.part_id or -1)
-        if wanted and rm.sources:
-            chosen = [x for x in rm.sources if x["id"] == wanted]
-            if chosen:
-                rm.sources = chosen + [x for x in rm.sources
-                                       if x["id"] != wanted]
-                rm.pinned_source = True
+        if not wanted or not rm.seq:
+            continue
+        chosen = [x for x in rm.sources if x["id"] == wanted]
+        if chosen:
+            rm.sources = chosen + [x for x in rm.sources if x["id"] != wanted]
+            rm.pinned_source = True
+            continue
+        # The catalogue does not link every plasmid to every part it
+        # contains - a sequence can be in there without an occurrence row -
+        # and a choice that is silently ignored is worse than one that is
+        # refused. Ask the DNA before giving up.
+        row = conn.execute(
+            "SELECT id, name, owner, verified, available_template, circular, "
+            "seq_length, seq FROM plasmid WHERE id = ?", (wanted,)).fetchone()
+        if row is None or not row["seq"]:
+            rm.warnings.append(
+                f"the plasmid chosen to take {rm.part_name} from is not in "
+                f"the inventory; the usual source was used instead")
+            continue
+        host = row["seq"].upper()
+        want = rm.seq.upper()
+        at, strand = host.find(want), 1
+        if at < 0:
+            at, strand = host.find(revcomp(want)), -1
+        if at < 0:
+            rm.warnings.append(
+                f"{row['name']} does not contain {rm.part_name}, so it was "
+                f"taken from its usual source instead")
+            continue
+        rm.sources = [{
+            "id": row["id"], "name": row["name"], "owner": row["owner"] or "",
+            "verified": row["verified"],
+            "available_template": row["available_template"],
+            "circular": row["circular"], "seq_length": row["seq_length"],
+            "start": at, "end": at + len(want), "strand": strand,
+        }] + [x for x in rm.sources if x["id"] != wanted]
+        rm.pinned_source = True
 
     fused_notes = _prefer_fused_source(conn, resolved)
 

@@ -74,8 +74,11 @@ another part row's name.
 ### 4. Cover the rest with as few donors as possible
 same
 
-Longest run first: one donor if some plasmid holds the whole remainder, two
-if it only exists in pieces. A build needing `YYY` and `P2A-ZZZ` from
+Longest run first, where "longest" means **end to end in that plasmid**,
+not merely both present somewhere in it: two parts 960 bp apart are still
+two amplifications, and counting them as one donor promises a saving
+nobody gets. One donor if some plasmid holds the whole remainder
+contiguously, two if it only exists in pieces. A build needing `YYY` and `P2A-ZZZ` from
 different plasmids is a two-donor build, and saying so beats dropping one.
 
 Donor options are ranked by **carrying the part**, then by covering more of
@@ -103,6 +106,12 @@ they really carry — worth seeing, worth not reaching for by accident.
 
 Naming the plasmid a part comes from outranks every ranking above.
 Somebody saying "that tube" has a reason the inventory cannot see.
+
+The catalogue does not link every plasmid to every part it contains - a
+sequence can be in there with no occurrence row - so a choice that is not
+catalogued is checked against the DNA before being given up on, and a
+plasmid that genuinely does not have the part is **refused out loud**. A
+choice silently ignored is worse than one refused.
 
 ### 6. Take a 2A fusion from a plasmid that already carries it whole
 `design._prefer_fused_source`

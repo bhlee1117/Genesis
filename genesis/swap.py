@@ -1097,6 +1097,12 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
             # whether it has this part - not whether it has something like
             # it and then genuinely has the next one along.
             "exact_lead": _lead(pid, run_start, run),
+            # How many it carries end to end, which is what decides how
+            # many reactions this donor saves. Holding two of them 960 bp
+            # apart is still two amplifications, so counting that as one
+            # donor promised a saving nobody gets.
+            "adjacent_run": _ordered_exact_run(
+                host_seq(pid), modules[run_start:], seqs[run_start:]),
             "also_has": sorted(
                 _label(modules[i], holders[i].get(pid, ""))
                 for i in got if not run_start <= i < run_start + run),
@@ -1222,9 +1228,9 @@ def architecture_candidates(conn: sqlite3.Connection, modules: list[dict],
         # won. A relative of a coding sequence is usually an earlier
         # version of the same indicator, which is the one thing nobody
         # asking for this one wants to be handed.
-        exact_first = [o for o in options if o["exact_lead"] > 0]
+        exact_first = [o for o in options if o["adjacent_run"] > 0]
         pool = exact_first or options
-        measure = ((lambda o: o["exact_lead"]) if exact_first
+        measure = ((lambda o: o["adjacent_run"]) if exact_first
                    else (lambda o: o["run"]))
         best = max(1, min(max(measure(o) for o in pool), reach - cursor))
 

@@ -4040,3 +4040,118 @@ class TestGeneBlockRoute(unittest.TestCase):
         cfg = Config()
         self.assertLess(score_route(cheap, cfg).cost,
                         score_route(dear, cfg).cost)
+
+
+class TestDonorCountMeansReactions(unittest.TestCase):
+    """"One donor" has to mean one amplification."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.a, self.b = orf(120, 171), orf(90, 172)
+        self.parts = {}
+        for nm, sq in (("A", self.a), ("B", self.b)):
+            self.parts[nm] = self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (nm, sq, nm, len(sq))).lastrowid
+
+    def _plasmid(self, name, body):
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,1,'unverified')""",
+            (name, body, len(body), name)).lastrowid
+        for nm, sq in (("A", self.a), ("B", self.b)):
+            at = body.find(sq)
+            if at >= 0:
+                self.conn.execute(
+                    """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                            end, strand) VALUES (?,?,?,?,1)""",
+                    (self.parts[nm], pid, at, at + len(sq)))
+        self.conn.commit()
+        return pid
+
+    def _modules(self):
+        return [{"type": "CDS", "part_id": self.parts["A"], "part_name": "A",
+                 "seq": self.a},
+                {"type": "CDS", "part_id": self.parts["B"], "part_name": "B",
+                 "seq": self.b}]
+
+    def test_two_parts_far_apart_are_two_donors(self):
+        from genesis.swap import architecture_candidates
+        # Both in one plasmid, but a kilobase apart: still two reactions.
+        self._plasmid("holds-both-far", self.a + rand_seq(960, 173) + self.b
+                      + rand_seq(400, 174))
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["n_donors"], 2, c["donors"])
+        self.assertEqual([d["covers"] for d in c["donors"]], [["A"], ["B"]])
+
+    def test_two_parts_next_to_each_other_are_one(self):
+        from genesis.swap import architecture_candidates
+        self._plasmid("holds-both-adjacent", self.a + self.b
+                      + rand_seq(400, 175))
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["n_donors"], 1, c["donors"])
+        self.assertEqual(c["donors"][0]["covers"], ["A", "B"])
+
+
+class TestSourcePinIsHonoured(unittest.TestCase):
+    """An explicit choice is used, or refused out loud - never ignored."""
+
+    def test_a_plasmid_with_the_sequence_but_no_occurrence_still_works(self):
+        from genesis.design import design
+        conn = connect(":memory:")
+        cds = orf(150, 181)
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','X',?,'x',?)""",
+            (cds, len(cds))).lastrowid
+        # The usual source, catalogued.
+        usual = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES ('usual','t',?,?,'u',1,'ok')""",
+            (cds + rand_seq(900, 182), 150 + 900)).lastrowid
+        conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,0,?,1)""", (part, usual, len(cds)))
+        # Another plasmid holds the same bases, uncatalogued.
+        other_body = rand_seq(300, 183) + cds + rand_seq(600, 184)
+        other = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES ('mine','t',?,?,'m',1,'ok')""",
+            (other_body, len(other_body))).lastrowid
+        conn.commit()
+
+        spec = ConstructSpec.from_dict(
+            {"name": "p", "modules": [{"type": "CDS", "part_id": part}],
+             "source_plasmid_ids": {part: other}})
+        plan = design(conn, spec, Config())
+        sources = [s["name"] for m in plan["modules"]
+                   for s in (m.get("sources") or [])][:1]
+        self.assertEqual(sources, ["mine"], plan["modules"])
+
+    def test_a_plasmid_without_the_part_is_refused_not_ignored(self):
+        from genesis.design import design
+        conn = connect(":memory:")
+        cds = orf(150, 185)
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','X',?,'x',?)""",
+            (cds, len(cds))).lastrowid
+        usual = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES ('usual','t',?,?,'u',1,'ok')""",
+            (cds + rand_seq(900, 186), 1050)).lastrowid
+        conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,0,?,1)""", (part, usual, len(cds)))
+        elsewhere = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES ('wrong','t',?,?,'w',1,'ok')""",
+            (rand_seq(800, 187), 800)).lastrowid
+        conn.commit()
+        spec = ConstructSpec.from_dict(
+            {"name": "p", "modules": [{"type": "CDS", "part_id": part}],
+             "source_plasmid_ids": {part: elsewhere}})
+        plan = design(conn, spec, Config())
+        notes = [w for m in plan["modules"] for w in (m.get("warnings") or [])]
+        self.assertTrue(any("does not contain" in w for w in notes), notes)
