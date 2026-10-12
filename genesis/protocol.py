@@ -575,6 +575,22 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
             doc.bullet(f"{issue['category']}: {issue['message']}", 8.8,
                        gray=0.45 if level == "info" else None)
 
+    for st in (route["steps"] or []):
+        d = st.get("details") or {}
+        if st.get("operation") != "SYNTHESIS" or not d.get("sequence"):
+            continue
+        doc.heading("Fragment to order", 2)
+        doc.paragraph(
+            f"{d['length']:,} bp, with {d.get('homology_arm', 0)} bp of "
+            f"homology to the vector at each end. Send this as written; the "
+            f"arms are part of it.", 8.8)
+        ordered_seq = d["sequence"]
+        for i in range(0, len(ordered_seq), 60):
+            chunk = ordered_seq[i:i + 60].lower()
+            doc.mono(f"{i + 1:>7}  " + " ".join(
+                chunk[j:j + 10] for j in range(0, len(chunk), 10)), 7.4,
+                indent=4)
+
     cand = plan.get("candidates") or {}
     if cand.get("recipients") or cand.get("donors"):
         doc.heading("Candidate parents", 2)
@@ -855,6 +871,21 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
             out.append("")
             out += [f"- {i['category']}: {i['message']}" for i in items]
             out.append("")
+
+    ordered = [st for st in route["steps"]
+               if st["operation"] == "SYNTHESIS"
+               and (st.get("details") or {}).get("sequence")]
+    for st in ordered:
+        d = st["details"]
+        out += ["### Fragment to order", "",
+                f"{d['length']:,} bp, with {d.get('homology_arm', 0)} bp of "
+                f"homology to the vector at each end. Send this as written; "
+                f"the arms are part of it.", "", "```"]
+        seq = d["sequence"]
+        for i in range(0, len(seq), 60):
+            out.append(f"{i + 1:>7}  " + " ".join(
+                seq[j:j + 10] for j in range(i, min(i + 60, len(seq)), 10)))
+        out += ["```", ""]
 
     cand = plan.get("candidates") or {}
     if cand.get("recipients") or cand.get("donors"):

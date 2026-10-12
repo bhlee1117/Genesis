@@ -253,8 +253,24 @@ orientation.
 ### 14. Offer the routes
 `swap.analyse_swap`, `planner.plan_*_route`
 
-Five: three two-parent swaps (PCR / digest+PCR / restriction) and two
-build-from-parts routes (HiFi, restriction).
+Six: three two-parent swaps (PCR / digest+PCR / restriction), two
+build-from-parts routes (HiFi, restriction), and one that buys the insert
+instead of building it.
+
+**Ordering the insert** (`plan_gblock_route`) keeps the longest arc of the
+recipient and orders everything else as one fragment with homology arms at
+both ends: one vector PCR, one thing to order, one assembly. A Cre-lox
+cassette on a recipient that has none is the case it exists for — four 34
+bp lox sites are too short to amplify and too short to carry an overlap on
+both sides while also being the lox site, so building them means joining
+five pieces to make a stretch somebody will sell as one.
+
+Synthesis is costed by the base, because a 2.7 kb fragment is not the same
+purchase as a 200 bp one; costing them alike made buying look cheaper than
+any number of PCRs. So the PCR route still wins on cost and on time — a
+gBlock is real money and about a week of waiting — and past
+`synthesis_beats_pcr_at` reactions the plan says so out loud and prints the
+sequence to send, rather than quietly reranking.
 
 A single swap puts one piece in one place. Asked for more it used to supply
 the first and note the rest, returning a plan whose architecture listed

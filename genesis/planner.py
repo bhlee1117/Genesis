@@ -537,6 +537,115 @@ def _screening_enzyme(construct: AssembledConstruct, cfg: Config) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# Route 1b: order the insert, amplify the vector  (Stage 8)
+# --------------------------------------------------------------------------
+
+def plan_gblock_route(conn: sqlite3.Connection, construct: AssembledConstruct,
+                      backbone: dict | None, cfg: Config,
+                      kit: str = "HI_FI_ASSEMBLY") -> Route:
+    """Order everything that is not the recipient as one synthetic fragment.
+
+    Some things are cheaper to buy than to build. A Cre-lox cassette on a
+    recipient that has none is the clearest case: its four lox sites are 34
+    bp each, too short to amplify and too short to carry an assembly
+    overlap on both sides while also being the lox site, so the PCR route
+    ends up ordering them as separate oligos and joining five pieces to
+    make a stretch somebody will sell as one.
+
+    This takes the whole non-recipient region instead - cassette, payload
+    and all - and orders it. One vector PCR, one fragment, one assembly.
+    """
+    route = Route(id="gblock", strategy="gblock",
+                  title="Order the insert, amplify the vector")
+    if not backbone or not construct.backbone_segments:
+        route.feasible = False
+        route.warnings.append(
+            "there is no recipient to keep, so there is nothing to order "
+            "the rest of: this construct is built from parts")
+        return route
+
+    # Keep the longest arc of the recipient and buy everything else, which
+    # leaves exactly one junction at each end.
+    keep = max(construct.backbone_segments, key=lambda s: len(s["seq"]))
+    kept = keep["seq"]
+    start = (keep["construct_start"] + len(kept)) % construct.length
+    insert_len = construct.length - len(kept)
+    if insert_len <= 0:
+        route.feasible = False
+        route.warnings.append("the recipient already is this construct")
+        return route
+
+    insert = slice_region(construct.seq, start, keep["construct_start"],
+                          circular=True)
+    arm = cfg.overlap_length
+    ordered_seq = (slice_region(construct.seq, start - arm, start,
+                                circular=True)
+                   + insert
+                   + slice_region(construct.seq, keep["construct_start"],
+                                  keep["construct_start"] + arm,
+                                  circular=True))
+
+    if len(ordered_seq) > cfg.max_synthetic_fragment:
+        route.warnings.append(
+            f"the fragment to order is {len(ordered_seq):,} bp, past the "
+            f"{cfg.max_synthetic_fragment:,} bp a gBlock runs to; an eBlock "
+            f"reaches further, or order it in two overlapping pieces")
+
+    steps: list[Step] = []
+    primers: list[Primer] = []
+
+    # The ordered fragment already carries homology to the vector at both
+    # ends, so the vector primers carry none: a tail here would put the
+    # start of the arc in twice and leave neither junction able to anneal.
+    bb_f, bb_r = design_gibson_pair(
+        0, "backbone", backbone["seq"], keep["source_start"],
+        keep["source_end"], "", "", cfg,
+        circular_template=bool(backbone.get("circular")),
+        carry_downstream=False, unique_in=construct.seq)
+    primers += [bb_f, bb_r]
+    _check_unique(bb_f, construct.seq, route)
+
+    steps.append(Step(
+        0, "SYNTHESIS",
+        f"Order the insert as a synthetic fragment: {len(ordered_seq):,} bp, "
+        f"carrying {arm} bp of homology to the vector at each end",
+        output="synthetic insert",
+        details={"length": len(ordered_seq), "sequence": ordered_seq,
+                 "homology_arm": arm}))
+    steps.append(Step(
+        0, "PCR",
+        f"Amplify the {len(kept):,} bp vector arc "
+        f"({keep['source_start']:,}-{keep['source_end']:,}) from "
+        f"{backbone['name']} with primers {bb_f.name} / {bb_r.name}",
+        inputs=[backbone["name"], f"{bb_f.name}+{bb_r.name}"],
+        output="linearised vector",
+        details={"length": len(kept), "template": backbone["name"]}))
+    steps.append(Step(
+        0, "DPNI_DIGEST",
+        f"Digest the PCR with DpnI to remove the {backbone['name']} template",
+        inputs=["vector PCR"], output="template-free vector"))
+    steps.append(Step(
+        0, "DNA_CLEANUP", "Column purify the vector PCR",
+        output="clean vector"))
+    steps.append(Step(
+        0, kit,
+        f"Assemble the vector with the ordered insert using "
+        f"{cfg.preferred_assembly_kit} ({arm} bp overlaps)",
+        inputs=["linearised vector", "synthetic insert"],
+        output="assembled plasmid"))
+    _append_finishing_steps(steps, cfg, construct)
+
+    route.steps = renumber(steps)
+    route.primers = primers
+    route.junctions = analyse_junctions(construct.layout, construct.seq,
+                                        "gblock", cfg)
+    route.warnings.append(
+        f"one fragment to order and one reaction to run, against "
+        f"{len(construct.backbone_segments)} arc(s) of recipient kept")
+    return route
+
+
+# --------------------------------------------------------------------------
 # Route 2: restriction digest + ligation  (Stage 7)
 # --------------------------------------------------------------------------
 
@@ -804,7 +913,19 @@ def score_route(route: Route, cfg: Config, history: dict | None = None) -> Route
     add("primers", len(route.primers), "primer")
     add("digests", counts.get("RE_DIGEST", 0), "restriction_digest")
     add("gel extractions", counts.get("GEL_EXTRACTION", 0), "gel_extraction")
+    # Synthesis is sold by the base, and that is the whole trade here: a
+    # 2.7 kb fragment is not the same purchase as a 200 bp one, and costing
+    # them alike made ordering the insert look cheaper than any number of
+    # PCRs.
     add("synthesis", counts.get("SYNTHESIS", 0), "synthesis")
+    ordered_kb = sum(s.details.get("length", 0) for s in route.steps
+                     if s.operation == "SYNTHESIS") / 1000
+    if ordered_kb:
+        # A configuration saved before this weight existed still has to
+        # cost ordered DNA, or buying looks free to anyone who has run
+        # Genesis before today.
+        breakdown["synthesised DNA"] = round(
+            ordered_kb * w.get("synthesis_per_kb", 90.0), 2)
 
     long_kb = sum(max(s.details.get("length", 0) - 2000, 0) / 1000
                   for s in route.steps if s.operation == "PCR")

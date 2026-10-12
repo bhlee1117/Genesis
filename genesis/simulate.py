@@ -224,23 +224,34 @@ def _plasmid_features(conn: sqlite3.Connection, pid: int) -> list[dict]:
                     ORDER BY start""", (pid,))]
 
 
-def _templates(conn: sqlite3.Connection, plan: dict) -> dict:
-    """Map every template name a primer can cite onto its real sequence."""
+def _templates(conn: sqlite3.Connection, plan: dict,
+               route: dict | None = None) -> dict:
+    """Map every template name a primer can cite onto its real sequence.
+
+    "backbone" means different plasmids in different routes: the recipient
+    being edited in a swap, and the chosen vector everywhere else. Reading
+    it the same way for both simulated one route's primers against the
+    other's template.
+    """
     out: dict[str, tuple] = {}
+    swap_route = bool(route and str(route.get("id", "")).startswith("swap"))
 
     swap = plan.get("swap") or {}
     for key, label in (("recipient", "backbone"), ("donor", "donor")):
         info = swap.get(key) or {}
         row = _plasmid(conn, info.get("id"))
         if row is not None:
-            out[label] = (row["seq"], bool(row["circular"]), row["name"],
-                          row["id"])
-            out[row["name"]] = out[label]
+            entry = (row["seq"], bool(row["circular"]), row["name"], row["id"])
+            if label != "backbone" or swap_route:
+                out[label] = entry
+            out[row["name"]] = entry
 
     backbone = plan.get("backbone") or {}
     row = _plasmid(conn, backbone.get("id"))
     if row is not None:
         entry = (row["seq"], bool(row["circular"]), row["name"], row["id"])
+        if not swap_route:
+            out["backbone"] = entry
         out.setdefault("backbone", entry)
         out.setdefault(row["name"], entry)
         # The recipient is amplified as the arcs the construct keeps, so a
@@ -276,7 +287,7 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
     result = SimulationResult()
     operations = [s.get("operation") for s in route.get("steps") or []]
 
-    templates = _templates(conn, plan)
+    templates = _templates(conn, plan, route)
     pairs = _primer_pairs(route)
 
     if not pairs and "PCR" in operations:
@@ -315,11 +326,35 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
         })
 
     # Fragments that are ordered rather than amplified still go in the tube.
+    # Only the fragments this route actually orders. The module grouping
+    # belongs to the all-PCR route; a route that orders the whole insert
+    # instead must not also be handed the pieces it replaced.
+    ordered_here = {str(step.get("output") or "")
+                    for step in route.get("steps") or []
+                    if step.get("operation") == "SYNTHESIS"}
     amplified = {p.name for p in products}
     for frag in plan.get("fragments") or []:
-        if frag.get("needs_synthesis") and frag["name"] not in amplified:
+        if not frag.get("needs_synthesis") or frag["name"] in amplified:
+            continue
+        if f"{frag['name']} gBlock" not in ordered_here:
+            continue
+        products.append(SimulatedProduct(
+            frag["name"], frag.get("seq", ""), "synthesised"))
+
+    # A route may order a fragment of its own rather than one the module
+    # grouping produced - the gene-block route orders the whole insert -
+    # and that is just as much a thing in the tube.
+    for step in route.get("steps") or []:
+        if step.get("operation") != "SYNTHESIS":
+            continue
+        ordered = (step.get("details") or {}).get("sequence")
+        if ordered and not any(p.seq == ordered for p in products):
             products.append(SimulatedProduct(
-                frag["name"], frag.get("seq", ""), "synthesised"))
+                step.get("output") or "ordered fragment", ordered,
+                f"{len(ordered)} bp ordered"))
+            result.steps.append({"operation": "SYNTHESIS",
+                                 "product": step.get("output") or "insert",
+                                 "bp": len(ordered)})
 
     if not products:
         result.simulated = False

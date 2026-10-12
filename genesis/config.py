@@ -51,6 +51,12 @@ class Config:
     protect_itrs: bool = True             # never PCR across or cut inside ITRs
     max_pcr_length: int = 8000
     min_pcr_length: int = 100
+    #: Longest stretch worth ordering as one synthetic fragment. A gBlock
+    #: tops out around here; an eBlock goes further but costs more.
+    max_synthetic_fragment: int = 3000
+    #: Amplifying this many fragments is the point at which ordering the
+    #: insert outright is usually the better trade.
+    synthesis_beats_pcr_at: int = 3
     allow_unverified_templates: bool = False
     gel_extraction_routine: bool = True
 
@@ -104,6 +110,9 @@ class Config:
         "restriction_digest": 3.0,
         "gel_extraction": 4.0,
         "synthesis": 40.0,
+        # Per kb of ordered DNA, on top of the per-fragment fee. Roughly
+        # what a gBlock costs relative to a reaction somebody runs.
+        "synthesis_per_kb": 90.0,
         "long_pcr_per_kb": 1.0,
         "difficult_junction": 5.0,
         "unverified_template": 8.0,

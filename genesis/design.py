@@ -14,7 +14,8 @@ from .seqtools import revcomp
 from .construct import (ConstructSpec, assemble,
                         assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
-from .planner import (group_contiguous, plan_hifi_route, plan_restriction_route,
+from .planner import (group_contiguous, plan_gblock_route,
+                      plan_hifi_route, plan_restriction_route,
                       plan_swap_hifi_route, plan_swap_hybrid_route,
                       plan_swap_restriction_route,
                       rank_routes, failure_history)
@@ -661,6 +662,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     fragments = group_contiguous(resolved, construct, cfg)
     routes = [
         plan_hifi_route(conn, construct, fragments, backbone, cfg),
+        plan_gblock_route(conn, construct, backbone, cfg),
         plan_restriction_route(conn, construct, fragments, backbone, cfg),
     ]
     if analysis is not None:
@@ -772,6 +774,26 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         else:
             for w in sim.get("warnings", []):
                 route["warnings"].append(f"simulation: {w}")
+
+    # Past a few reactions, ordering the insert stops being the expensive
+    # option and starts being the quick one. Cost says otherwise - a gBlock
+    # is real money and a week of waiting - so this is said rather than
+    # ranked, and the choice left where it belongs.
+    gblock = next((r for r in plan["routes"]
+                   if r["id"] == "gblock" and r.get("feasible")), None)
+    if gblock:
+        ordered = next((st for st in gblock["steps"]
+                        if st["operation"] == "SYNTHESIS"), None)
+        size = (ordered or {}).get("details", {}).get("length", 0)
+        for route in plan["routes"]:
+            if (route["id"] != "gblock" and route.get("feasible")
+                    and route["n_pcr"] >= cfg.synthesis_beats_pcr_at):
+                route["warnings"].append(
+                    f"this takes {route['n_pcr']} PCRs and "
+                    f"{len(route['junctions'])} junctions to get right; the "
+                    f"same construct is one {size:,} bp fragment to order "
+                    f"plus one vector PCR - see \"Order the insert, amplify "
+                    f"the vector\" for the sequence to send")
 
     # Ranking happened before any of this, so a route the simulation has
     # just ruled out would otherwise keep the position it was ranked into -

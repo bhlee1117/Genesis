@@ -642,7 +642,8 @@ class TestEndToEnd(unittest.TestCase):
         # swap strategies appear as well whenever a parent pair exists.
         self.assertTrue({"hifi", "restriction"} <= strategies, strategies)
         self.assertLessEqual(strategies - {"hifi", "restriction"},
-                             {"swap_hifi", "swap_restriction", "swap_hybrid"})
+                             {"swap_hifi", "swap_restriction", "swap_hybrid",
+                          "gblock"})
 
         # Every step must carry a real operation code (the Stage 6 requirement).
         from genesis.operations import OPERATIONS
@@ -3976,3 +3977,66 @@ class TestNoStrayCassette(unittest.TestCase):
         con = self._construct(lox_outside_the_payload=False)
         self.assertEqual([i["name"] for i in con.layout
                           if i["type"] == "lox_site"], [])
+
+
+class TestGeneBlockRoute(unittest.TestCase):
+    """Buying the insert, when building it costs more reactions than it saves."""
+
+    def _construct(self):
+        from genesis.construct import (assemble_into_backbone, ResolvedModule,
+                                       Module)
+        prom = rand_seq(300, 161)
+        old = rand_seq(600, 162)
+        tail = rand_seq(1200, 163)
+        seq = prom + old + tail
+        anns = [
+            {"feature_type": "promoter", "name": "p", "start": 0,
+             "end": 300, "strand": 1},
+            {"feature_type": "CDS", "name": "old", "start": 300,
+             "end": 900, "strand": 1},
+            {"feature_type": "origin", "name": "ori", "start": 1000,
+             "end": 1400, "strand": 1},
+            {"feature_type": "resistance", "name": "AmpR", "start": 1400,
+             "end": 1800, "strand": 1},
+        ]
+        rm = ResolvedModule(module=Module("CDS", "new"), part_id=1,
+                            part_name="new", seq=orf(120, 164),
+                            feature_type="CDS", sources=[], warnings=[])
+        return seq, assemble_into_backbone([rm], seq, anns, {"CDS"})
+
+    def test_it_orders_everything_the_recipient_does_not_supply(self):
+        from genesis.planner import plan_gblock_route
+        seq, con = self._construct()
+        backbone = {"id": 1, "name": "pTest", "seq": seq, "circular": 1,
+                    "seq_length": len(seq)}
+        route = plan_gblock_route(None, con, backbone, Config())
+        self.assertTrue(route.feasible, route.warnings)
+        synth = [s for s in route.steps if s.operation == "SYNTHESIS"]
+        self.assertEqual(len(synth), 1, "one fragment to order, not several")
+        pcr = [s for s in route.steps if s.operation == "PCR"]
+        self.assertEqual(len(pcr), 1, "one vector amplification")
+        ordered = synth[0].details["sequence"]
+        # It carries homology to the vector at both ends.
+        arm = synth[0].details["homology_arm"]
+        self.assertIn(ordered[:arm], con.seq + con.seq)
+        self.assertIn(ordered[-arm:], con.seq + con.seq)
+
+    def test_without_a_recipient_there_is_nothing_to_order_around(self):
+        from genesis.planner import plan_gblock_route
+        _seq, con = self._construct()
+        route = plan_gblock_route(None, con, None, Config())
+        self.assertFalse(route.feasible)
+
+    def test_ordered_dna_is_costed_by_the_base(self):
+        """A 2.7 kb fragment is not the same purchase as a 200 bp one."""
+        from genesis.planner import Route, score_route
+        from genesis.operations import Step
+        cheap = Route(id="a", strategy="gblock", title="t",
+                      steps=[Step(1, "SYNTHESIS", "small",
+                                  details={"length": 200})])
+        dear = Route(id="b", strategy="gblock", title="t",
+                     steps=[Step(1, "SYNTHESIS", "big",
+                                 details={"length": 2700})])
+        cfg = Config()
+        self.assertLess(score_route(cheap, cfg).cost,
+                        score_route(dear, cfg).cost)
