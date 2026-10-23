@@ -398,12 +398,117 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
             src["at_start"] = (at - offset) % len(product)
             src["at_end"] = (src["at_start"] + len(body)) % len(product)
 
-    _check_contents(result, product, plan, conn)
+    _check_contents(result, product, plan, conn, templates)
     return result
 
 
+#: Feature types whose presence defines what a construct *is*, as opposed
+#: to what carries it. A recipient legitimately supplies the vector parts -
+#: WPRE, polyA, ITRs, origin, resistance - without any of them being named
+#: in the request, so only these are leftovers worth failing over.
+LEFTOVER_TYPES = {"CDS"}
+
+#: Below this a match is not worth reporting: a 12 bp Factor Xa site turns
+#: up everywhere and says nothing about whether the payload was replaced.
+LEFTOVER_MIN_BP = 150
+
+
+def _check_leftovers(result: "SimulationResult", product: str, plan: dict,
+                     conn: sqlite3.Connection | None = None,
+                     templates: dict | None = None) -> None:
+    """Fail when the product still carries what it was meant to replace.
+
+    Checking that every requested part is present says nothing about what
+    else came along. A swap that removes too little leaves the old payload
+    in the plasmid, and every presence check still passes: the promoter is
+    there, the new coding sequence is there, and so is the indicator the
+    whole point was to get rid of.
+
+    That is not a cosmetic difference. It produced a plan whose steps
+    build pAAV-CAG-<new CDS>-Voltron2-Ace2N-HaloTag and reported it as
+    "2 of 2 requested parts present", with the 1,601 bp of leftover
+    payload explained away as the design "being built differently".
+    """
+    if conn is None or not product:
+        return
+    # Ask of every plasmid this route actually amplifies from, not of
+    # whichever one the plan calls the backbone: a swap edits the
+    # recipient while the generic planner names a different vector, and
+    # checking the wrong one of the two finds nothing.
+    parents: dict[int, str] = {}
+    for entry in (templates or {}).values():
+        try:
+            _seq, _circ, pname, ppid = entry
+        except (TypeError, ValueError):
+            continue
+        if ppid:
+            parents[ppid] = pname
+    for key in ("backbone",):
+        info = (plan.get(key) or {})
+        if info.get("id"):
+            parents.setdefault(info["id"], info.get("name") or "")
+    swap_recipient = ((plan.get("swap") or {}).get("recipient") or {})
+    if swap_recipient.get("id"):
+        parents.setdefault(swap_recipient["id"],
+                           swap_recipient.get("name") or "")
+    if not parents:
+        return
+    doubled = (product + product).upper()
+
+    # What the construct says it is made of. A recipient's own copy of a
+    # part that was asked for is not a leftover.
+    wanted = []
+    for m in plan.get("modules") or []:
+        seq = (m.get("seq") or "").upper()
+        if not seq and m.get("part_id"):
+            got = conn.execute("SELECT seq FROM part WHERE id = ?",
+                               (m["part_id"],)).fetchone()
+            seq = (got["seq"] or "").upper() if got else ""
+        if seq:
+            wanted.append(seq)
+
+    marks = ",".join("?" * len(LEFTOVER_TYPES))
+    left: list[str] = []
+    blame = ""
+    for ppid, pname in parents.items():
+        prow = conn.execute("SELECT seq FROM plasmid WHERE id = ?",
+                            (ppid,)).fetchone()
+        if prow is None or not prow["seq"]:
+            continue
+        host = prow["seq"].upper()
+        for a in conn.execute(
+                f"""SELECT name, start, end FROM annotation
+                    WHERE plasmid_id = ? AND feature_type IN ({marks})
+                      AND (end - start) >= ?
+                    ORDER BY (end - start) DESC""",
+                (ppid, *sorted(LEFTOVER_TYPES), LEFTOVER_MIN_BP)):
+            seg = host[a["start"]:a["end"]]
+            if len(seg) < LEFTOVER_MIN_BP:
+                continue
+            if sequence_coverage(seg, doubled) < PRESENT_COVERAGE:
+                continue                  # removed, as intended
+            if any(sequence_coverage(seg, w) >= PRESENT_COVERAGE
+                   for w in wanted):
+                continue                  # it is one of the parts asked for
+            name = a["name"] or "an unnamed coding sequence"
+            if name not in left:
+                left.append(name)
+                blame = blame or pname
+
+    if not left:
+        return
+    result.passed = False
+    listed = ", ".join(left[:4]) + (", ..." if len(left) > 4 else "")
+    result.problems.append(
+        f"the product still carries {listed} from {blame or 'the recipient'}, "
+        f"which this design does not ask for: the region removed was too "
+        f"small, so the new coding sequence goes in beside the old payload "
+        f"instead of replacing it")
+
+
 def _check_contents(result: SimulationResult, product: str, plan: dict,
-                    conn: sqlite3.Connection | None = None) -> None:
+                    conn: sqlite3.Connection | None = None,
+                    templates: dict | None = None) -> None:
     """Confirm every requested part is in the molecule the steps produce."""
     doubled = (product + product).upper()
     missing = []
@@ -454,13 +559,13 @@ def _check_contents(result: SimulationResult, product: str, plan: dict,
                 "the product is the same length as the designed construct "
                 "but not the same sequence; compare them before building")
 
+    _check_leftovers(result, product, plan, conn, templates)
+
     stated = (plan.get("construct") or {}).get("length")
     if stated and stated != len(product):
         result.warnings.append(
             f"the plan prints a {stated:,} bp construct while its steps "
-            f"produce {len(product):,} bp; the parts are all there, so this "
-            f"is the two being built differently rather than anything "
-            f"missing")
+            f"produce {len(product):,} bp")
 
     present = sum(1 for m in result.modules if m["present"])
     result.summary = (

@@ -134,6 +134,15 @@ def _load_backbone(conn: sqlite3.Connection, spec: ConstructSpec,
         # An explicit id is the user's choice; honour it as given.
         row = conn.execute("SELECT * FROM plasmid WHERE id = ?",
                            (spec.backbone_plasmid_id,)).fetchone()
+    elif spec.recipient_plasmid_id:
+        # Choosing a recipient is choosing what to start from, and the
+        # plasmid being edited is the vector the construct ends up in.
+        # Letting the two differ gave one document two molecules: a swap
+        # that edited the chosen plasmid, printed beside an idealised
+        # construct assembled into a different backbone, with two
+        # different sizes for the same product.
+        row = conn.execute("SELECT * FROM plasmid WHERE id = ?",
+                           (spec.recipient_plasmid_id,)).fetchone()
     elif spec.backbone:
         # Name search: a vector must be big enough to be one, and a circular,
         # verified plasmid carrying an origin beats a bare fragment.

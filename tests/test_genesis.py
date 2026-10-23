@@ -4875,3 +4875,205 @@ class TestAddgeneIsSearchOnly(unittest.TestCase):
             self.ag._request = original
         self.assertEqual(candidates["to_order"]["Xc"]["results"], [])
         self.assertIn("down", candidates["to_order"]["Xc"]["unavailable"])
+
+
+class TestASwapMustReplaceThePayload(unittest.TestCase):
+    """Removing too little leaves the old indicator in the plasmid.
+
+    A request for CAG - ASAP7y against a pAAV-CAG-Voltron2 recipient cut
+    16 bp out of it - the Kozak between the promoter and the coding
+    sequence - and put ASAP7y in there, leaving Voltron-2, Ace2N and
+    HaloTag sitting between the new gene and the WPRE. Every presence
+    check passed, because every part that was asked for really was in the
+    product, and the plasmid was ruined anyway.
+    """
+
+    def _recipient(self, conn, prom, payload):
+        body = (rand_seq(140, 401) + prom + rand_seq(16, 402) + payload
+                + rand_seq(600, 403))
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('recipient','t',?,?,'r',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at_p = body.find(prom)
+        at_x = body.find(payload)
+        rows = [("promoter", "CAG", at_p, at_p + len(prom)),
+                ("unknown", "Kozak sequence", at_p + len(prom),
+                 at_p + len(prom) + 16),
+                ("CDS", "Voltron-2", at_x, at_x + len(payload)),
+                ("WPRE", "WPRE", at_x + len(payload),
+                 at_x + len(payload) + 300),
+                ("origin", "ori", len(body) - 200, len(body) - 100),
+                ("resistance", "AmpR", len(body) - 100, len(body))]
+        for ftype, nm, a, b in rows:
+            conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,?,?,1)""",
+                (pid, ftype, nm, a, b))
+        conn.commit()
+        return pid, body
+
+    def test_the_whole_payload_is_removed_not_the_gap_before_it(self):
+        from genesis.swap import _payload_end, _annotations
+        conn = connect(":memory:")
+        prom, payload = rand_seq(400, 404), orf(900, 405)
+        pid, body = self._recipient(conn, prom, payload)
+        annots = _annotations(conn, pid)
+        start = body.find(prom) + len(prom)
+        end = _payload_end(annots, start, len(body))
+        # It must reach past the Kozak and take the whole coding sequence.
+        self.assertEqual(end, body.find(payload) + len(payload),
+                         f"stopped at {end}, payload ends at "
+                         f"{body.find(payload) + len(payload)}")
+        conn.close()
+
+    def test_it_stops_at_the_wpre_rather_than_eating_the_vector(self):
+        from genesis.swap import _payload_end, _annotations
+        conn = connect(":memory:")
+        prom, payload = rand_seq(400, 406), orf(900, 407)
+        pid, body = self._recipient(conn, prom, payload)
+        annots = _annotations(conn, pid)
+        start = body.find(prom) + len(prom)
+        end = _payload_end(annots, start, len(body))
+        wpre_start = body.find(payload) + len(payload)
+        self.assertLessEqual(end, wpre_start)
+        conn.close()
+
+    def test_furniture_alone_is_not_a_payload(self):
+        """A Kozak with no coding sequence after it is nothing to replace."""
+        from genesis.swap import _payload_end
+        annots = [{"feature_type": "unknown", "name": "Kozak sequence",
+                   "start": 100, "end": 116, "strand": 1},
+                  {"feature_type": "WPRE", "name": "WPRE",
+                   "start": 130, "end": 700, "strand": 1}]
+        self.assertEqual(_payload_end(annots, 100, 5000), 100)
+
+
+class TestTheProductMustNotCarryWhatWasNotAskedFor(unittest.TestCase):
+    """Presence checks alone cannot see what came along for the ride."""
+
+    def test_a_leftover_coding_sequence_fails_the_simulation(self):
+        from genesis.simulate import _check_leftovers, SimulationResult
+        conn = connect(":memory:")
+        old, new = orf(900, 411), orf(600, 412)
+        body = rand_seq(100, 413) + old + rand_seq(100, 414)
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('parent','t',?,?,'p',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at = body.find(old)
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand) VALUES (?,'CDS','Voltron-2',?,?,1)""",
+            (pid, at, at + len(old)))
+        conn.commit()
+
+        # A product that kept the old payload as well as taking the new one.
+        product = body + new
+        result = SimulationResult()
+        plan = {"backbone": {"id": pid, "name": "parent"},
+                "modules": [{"part_name": "ASAP7y", "seq": new}]}
+        _check_leftovers(result, product, plan, conn)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Voltron-2" in p for p in result.problems),
+                        result.problems)
+        conn.close()
+
+    def test_a_clean_replacement_passes(self):
+        from genesis.simulate import _check_leftovers, SimulationResult
+        conn = connect(":memory:")
+        old, new = orf(900, 415), orf(600, 416)
+        body = rand_seq(100, 417) + old + rand_seq(100, 418)
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('parent','t',?,?,'p',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at = body.find(old)
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand) VALUES (?,'CDS','Voltron-2',?,?,1)""",
+            (pid, at, at + len(old)))
+        conn.commit()
+        product = body.replace(old, new)       # the payload really replaced
+        result = SimulationResult()
+        plan = {"backbone": {"id": pid, "name": "parent"},
+                "modules": [{"part_name": "ASAP7y", "seq": new}]}
+        _check_leftovers(result, product, plan, conn)
+        self.assertTrue(result.passed, result.problems)
+        conn.close()
+
+    def test_a_part_that_was_asked_for_is_not_a_leftover(self):
+        from genesis.simulate import _check_leftovers, SimulationResult
+        conn = connect(":memory:")
+        keep = orf(900, 419)
+        body = rand_seq(100, 420) + keep + rand_seq(100, 421)
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('parent','t',?,?,'p',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at = body.find(keep)
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand) VALUES (?,'CDS','ASAP7y',?,?,1)""",
+            (pid, at, at + len(keep)))
+        conn.commit()
+        result = SimulationResult()
+        plan = {"backbone": {"id": pid, "name": "parent"},
+                "modules": [{"part_name": "ASAP7y", "seq": keep}]}
+        _check_leftovers(result, body, plan, conn)
+        self.assertTrue(result.passed, result.problems)
+        conn.close()
+
+
+class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
+    """Smallness decides between donors that hold the same thing."""
+
+    def test_a_relative_never_outranks_the_real_part(self):
+        from genesis.swap import find_donors
+        conn = connect(":memory:")
+        want = orf(1200, 431)
+        relative = want[:500] + orf(90, 432) + want[590:]
+        parts = {}
+        for nm, sq in (("ASAP7y", want), ("ASAP3", relative)):
+            parts[nm] = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (nm, sq, nm, len(sq))).lastrowid
+
+        def plasmid(name, body, part):
+            pid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified, available_template)
+                   VALUES (?,'t',?,?,?,1,'unverified',1)""",
+                (name, body, len(body), name)).lastrowid
+            at = body.find(part[1])
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,1)""",
+                (parts[part[0]], pid, at, at + len(part[1])))
+            for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+                conn.execute(
+                    """INSERT INTO annotation(plasmid_id, feature_type, name,
+                            start, end, strand) VALUES (?,?,?,0,30,1)""",
+                    (pid, ftype, nm))
+            conn.commit()
+            return pid
+
+        # The relative sits in a smaller plasmid, which used to win.
+        small = plasmid("small-ASAP3", relative + rand_seq(600, 433),
+                        ("ASAP3", relative))
+        right = plasmid("bigger-ASAP7y", want + rand_seq(3000, 434),
+                        ("ASAP7y", want))
+        donors = find_donors(conn, [parts["ASAP7y"], parts["ASAP3"]],
+                             exact_ids={parts["ASAP7y"]})
+        self.assertEqual(donors[0].plasmid_id, right,
+                         [d.name for d in donors])
+        self.assertTrue(any("has the part itself" in r
+                            for r in donors[0].reasons), donors[0].reasons)
+        self.assertEqual(donors[1].plasmid_id, small)
+        self.assertTrue(any("not the part" in r for r in donors[1].reasons))
+        conn.close()

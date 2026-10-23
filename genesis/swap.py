@@ -219,7 +219,8 @@ def _annotations(conn: sqlite3.Connection, plasmid_id: int) -> list[dict]:
 
 def find_donors(conn: sqlite3.Connection, part_ids: list[int],
                 require_family: str = "", exclude_id: int | None = None,
-                limit: int = 8) -> list[ParentMatch]:
+                limit: int = 8,
+                exact_ids: set | None = None) -> list[ParentMatch]:
     """Plasmids worth amplifying a part out of.
 
     Deliberately not ranked the way a recipient is. A recipient is scored on
@@ -231,6 +232,7 @@ def find_donors(conn: sqlite3.Connection, part_ids: list[int],
     """
     if not part_ids:
         return []
+    exact_ids = set(exact_ids or ())
     placeholders = ",".join("?" * len(part_ids))
     rows = conn.execute(
         f"""SELECT DISTINCT pl.id, pl.name, pl.owner, pl.seq_length,
@@ -259,9 +261,16 @@ def find_donors(conn: sqlite3.Connection, part_ids: list[int],
                 (r["id"],))]
             family_miss = 0 if classify_vector(
                 ann, r["name"])["family"] == require_family else 1
+        holds_exact = bool(exact_ids) and bool({
+            row["part_id"] for row in conn.execute(
+                "SELECT DISTINCT part_id FROM part_occurrence "
+                "WHERE plasmid_id = ?", (r["id"],))} & exact_ids)
         match = ParentMatch(r["id"], r["name"], r["owner"], r["seq_length"],
                             bool(r["circular"]), r["verified"])
         match.reasons = []
+        if exact_ids:
+            match.reasons.append("has the part itself" if holds_exact
+                                 else "has a related sequence, not the part")
         if require_family and not family_miss:
             match.reasons.append(f"same vector family ({require_family})")
         elif require_family:
@@ -270,7 +279,8 @@ def find_donors(conn: sqlite3.Connection, part_ids: list[int],
             match.reasons.append("sequence verified")
         match.reasons.append(f"{r['seq_length']:,} bp")
         scored.append((
-            (family_miss, 0 if r["verified"] != "unverified" else 1,
+            (0 if holds_exact or not exact_ids else 1,
+             family_miss, 0 if r["verified"] != "unverified" else 1,
              r["seq_length"]), match))
     scored.sort(key=lambda item: item[0])
     return [match for _, match in scored[:limit]]
@@ -369,6 +379,72 @@ def _occurrence(conn: sqlite3.Connection, plasmid_id: int, part_id: int,
 # --------------------------------------------------------------------------
 # Working out what to cut and what to insert
 # --------------------------------------------------------------------------
+
+#: What a payload is made of. Replacing the coding sequence in a plasmid
+#: means replacing the whole fusion that sits there - the indicator, its
+#: trafficking motifs, its tags and the linkers between them - and not
+#: just the first annotated feature of it.
+PAYLOAD_TYPES = {"CDS", "tag", "trafficking_motif", "linker", "p2A", "IRES"}
+
+#: Annotations of one payload do not quite abut; bridge gaps this small.
+PAYLOAD_GAP = 60
+
+#: A payload carries unnamed furniture - a Kozak, a signal peptide, a
+#: leader - that the importer could not type. Those belong to whatever
+#: they sit inside, so they extend the run without being able to start
+#: one; without that, a cut stopped at the Kozak and left the indicator.
+BRIDGE_TYPES = {"unknown", "misc_feature"}
+
+#: What the payload is definitely not, and must never be cut into. The
+#: run stops dead at the first of these, whatever the gap arithmetic says.
+BARRIER_TYPES = {"WPRE", "polyA", "AAV_ITR", "origin", "resistance",
+                 "promoter", "enhancer", "intron", "lox_site"}
+
+
+def _payload_end(annots: list, start: int, limit: int,
+                 keep_spans: list | None = None) -> int:
+    """How far the payload beginning at `start` runs.
+
+    Taking only the next annotated feature was how a request for
+    CAG - ASAP7y came to cut 16 bp out of a plasmid and leave Voltron-2,
+    Ace2N and HaloTag sitting between the new coding sequence and the
+    WPRE. The product kept every part the design asked for, so every
+    presence check passed, and the plasmid was ruined anyway.
+
+    So the run is walked: every payload feature that starts at or just
+    after the cursor extends it, and the first thing that is not payload -
+    a WPRE, a polyA, an ITR - stops it. A span the construct keeps stops
+    it too, because cutting into that would remove something asked for.
+    """
+    keep_spans = keep_spans or []
+    barrier = min([a["start"] for a in annots
+                   if a["feature_type"] in BARRIER_TYPES
+                   and a["start"] >= start] or [limit])
+    end = start
+    saw_payload = False
+    moved = True
+    while moved:
+        moved = False
+        for a in annots:
+            kind = a["feature_type"]
+            if kind not in PAYLOAD_TYPES and kind not in BRIDGE_TYPES:
+                continue
+            if a["start"] > end + PAYLOAD_GAP or a["end"] <= end:
+                continue
+            if a["end"] > min(limit, barrier):
+                continue
+            if any(a["start"] < k_end and a["end"] > k_start
+                   for k_start, k_end in keep_spans):
+                continue
+            end = a["end"]
+            moved = True
+            if kind in PAYLOAD_TYPES:
+                saw_payload = True
+    # Furniture on its own is not a payload. Without something of
+    # substance in the run there is nothing here to replace, and cutting
+    # out a Kozak and calling it a swap is how this went wrong before.
+    return end if saw_payload else start
+
 
 def _as_parent(conn: sqlite3.Connection, plasmid_id: int,
                part_ids: list[int]) -> ParentMatch | None:
@@ -531,12 +607,21 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
     if left_occ and right_occ and left_occ["end"] <= right_occ["start"]:
         start, end = left_occ["end"], right_occ["start"]
     elif left_occ:
-        # No conserved part downstream: replace everything up to the next
-        # annotated feature after the anchor.
+        # No conserved part downstream, so the end of the region has to be
+        # read off the plasmid: everything from the anchor to the end of
+        # the payload sitting there, which is what the new part replaces.
         start = left_occ["end"]
-        following = [a for a in annots if a["start"] >= start]
-        end = following[0]["end"] if following else min(start + 1500,
-                                                        recipient.length)
+        keep_spans = []
+        for m in kept:
+            occ = _occurrence(conn, recipient.plasmid_id, m["part_id"],
+                              m.get("seq", ""))
+            if occ:
+                keep_spans.append((occ["start"], occ["end"]))
+        end = _payload_end(annots, start, recipient.length, keep_spans)
+        if end <= start:
+            following = [a for a in annots if a["start"] >= start]
+            end = following[0]["end"] if following else min(
+                start + 1500, recipient.length)
     else:
         end = right_occ["start"]
         preceding = [a for a in annots if a["end"] <= end]
@@ -589,8 +674,14 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
         + same_protein_parts(conn, new_module.get("seq") or "",
                              new_module["part_id"],
                              new_module.get("type", "CDS"))))
+    # Which of those rows are the part rather than a relative of it. A
+    # donor that merely holds something similar is still offered, because
+    # sometimes it is all there is, but it never outranks the real thing.
+    exact_ids = set(equivalent_part_ids(conn, new_module["part_id"])) \
+        if new_module.get("part_id") else set()
     donors = find_donors(conn, donor_parts, require_family,
-                         exclude_id=recipient.plasmid_id)
+                         exclude_id=recipient.plasmid_id,
+                         exact_ids=exact_ids)
     if pin_donor_id is not None:
         donors = ([d for d in donors if d.plasmid_id == pin_donor_id] or
                   [_as_parent(conn, pin_donor_id, [new_module["part_id"]])]) + \

@@ -363,6 +363,65 @@ def build_protocol(plan: dict, cfg: Config | None = None,
 # PDF rendering
 # --------------------------------------------------------------------------
 
+def _anneal_site(pr: dict) -> str:
+    """Where a primer sits on its template, as a position and a strand.
+
+    A primer sequence on its own does not say where it lands, and the one
+    question somebody checks by hand before ordering is whether it sits
+    inside the region being cut out.
+    """
+    start, end = pr.get("target_start"), pr.get("target_end")
+    anneal = len(pr.get("anneal") or "")
+    if start is None or end is None or start == end or not anneal:
+        return "-"
+    if pr.get("direction") == "F":
+        lo, hi, arrow = start, start + anneal, "->"
+    else:
+        lo, hi, arrow = end - anneal, end, "<-"
+    return f"{lo:,}-{hi:,} {arrow}"
+
+
+def _primer_marks(route: dict, template_name: str) -> list[dict]:
+    """Where this route's primers anneal on one named template.
+
+    Drawn on the parent, not on the product, because that is the plasmid
+    somebody is holding when they want to know whether a primer sits
+    inside the region they are cutting out.
+    """
+    # Which fragment names are amplified off this plasmid. A primer only
+    # belongs on the map of the plasmid it anneals to; drawing every pair
+    # on every parent says the backbone primers bind the donor, which
+    # would send somebody to the wrong tube.
+    mine = set()
+    for st in route.get("steps") or []:
+        if st.get("operation") != "PCR":
+            continue
+        if (st.get("details") or {}).get("template") != template_name:
+            continue
+        for item in st.get("inputs") or []:
+            if "+" in item:
+                f, _, r = item.partition("+")
+                mine.update((f.strip(), r.strip()))
+
+    marks = []
+    for pr in route.get("primers") or []:
+        if mine and pr.get("name") not in mine:
+            continue
+        start, end = pr.get("target_start"), pr.get("target_end")
+        if start is None or end is None or start == end:
+            continue
+        anneal = len(pr.get("anneal") or "")
+        if not anneal:
+            continue
+        if pr.get("direction") == "F":
+            lo, hi, strand = start, start + anneal, 1
+        else:
+            lo, hi, strand = end - anneal, end, -1
+        marks.append({"name": pr.get("name", ""), "start": lo, "end": hi,
+                      "strand": strand})
+    return marks
+
+
 def protocol_pdf(plan: dict, cfg: Config | None = None,
                  route_id: str | None = None) -> bytes:
     cfg = cfg or Config()
@@ -444,6 +503,22 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         else:
             plasmid_track(doc, name, f"{construct['length']:,} bp",
                           construct["length"], feats, codon_marks=marks)
+        # The map above is the architecture as specified. A swap edits a
+        # real plasmid and keeps whatever spacing that plasmid has around
+        # the region it replaces, so its product is a slightly different
+        # molecule - and printing both sizes with no word about it is how
+        # this document came to state two lengths for one construct.
+        sim_bp = (route.get("simulation") or {}).get("product_bp")
+        if sim_bp and sim_bp != construct["length"]:
+            doc.paragraph(
+                f"The route below does not build this molecule exactly: its "
+                f"steps produce {sim_bp:,} bp, not {construct['length']:,} bp. "
+                f"The difference is the spacing the recipient already has "
+                f"around the region being replaced, which an edit keeps and "
+                f"an assembly from parts does not. The simulation further "
+                f"down is run on what the steps actually produce.",
+                8.4, gray=0.3)
+
         problems = [m for m in marks
                     if m["kind"] in ("premature_stop", "missing_start",
                                      "missing_stop")]
@@ -469,7 +544,8 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
             circular_map(doc, "RECIPIENT  " + rec["name"],
                          f"{rec['length']:,} bp, {rec['owner']}",
                          rec["length"], rec["features"],
-                         highlight=rec.get("highlight"), highlight_kind="cut")
+                         highlight=rec.get("highlight"), highlight_kind="cut",
+                         primer_marks=_primer_marks(route, rec["name"]))
         else:
             plasmid_track(
                 doc, "RECIPIENT  " + rec["name"],
@@ -483,7 +559,8 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                              f"{don['length']:,} bp, {don['owner']}",
                              don["length"], don["features"],
                              highlight=don.get("highlight"),
-                             highlight_kind="take")
+                             highlight_kind="take",
+                             primer_marks=_primer_marks(route, don["name"]))
             else:
                 plasmid_track(
                     doc, "DONOR  " + don["name"],
@@ -533,10 +610,16 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             rows.append([pr["name"], pr["direction"], f"{pr['length']}",
-                         tm_s, f"{pr['gc']:.0%}", seq])
-        doc.table(["Name", "Dir", "nt", "Tm C", "GC", "Sequence (5' to 3')"],
-                  rows, widths=[0.17, 0.05, 0.05, 0.07, 0.06, 0.60],
-                  size=7.8, mono_cols={5})
+                         tm_s, f"{pr['gc']:.0%}", _anneal_site(pr), seq])
+        doc.table(["Name", "Dir", "nt", "Tm C", "GC", "Anneals at",
+                   "Sequence (5' to 3')"],
+                  rows, widths=[0.15, 0.04, 0.04, 0.06, 0.05, 0.14, 0.52],
+                  size=7.8, mono_cols={6})
+        doc.paragraph(
+            "\"Anneals at\" is the position on the template named in the "
+            "step that uses it, in that plasmid's own coordinates; the "
+            "parent maps above draw the same sites in purple.",
+            8.2, gray=0.45)
 
     # --- 4. the protocol -----------------------------------------------
     doc.heading("Protocol", 2)
@@ -832,14 +915,16 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
 
     if p["primers"]:
         out += ["## Primers to order", "",
-                "| Name | Dir | nt | Tm (C) | GC | Sequence (5'->3') |",
-                "|---|---|---|---|---|---|"]
+                "| Name | Dir | nt | Tm (C) | GC | Anneals at | "
+                "Sequence (5'->3') |",
+                "|---|---|---|---|---|---|---|"]
         for pr in p["primers"]:
             seq = (pr["tail"].lower() + pr["anneal"].upper()) if pr["tail"] \
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             out.append(f"| {pr['name']} | {pr['direction']} | {pr['length']} | "
-                       f"{tm_s} | {pr['gc']:.0%} | `{seq}` |")
+                       f"{tm_s} | {pr['gc']:.0%} | {_anneal_site(pr)} | "
+                       f"`{seq}` |")
         out += ["", "Lower case is the overlap or adapter tail; upper case binds "
                 "the template. Tm is for the template-binding region only.", ""]
 
