@@ -1088,7 +1088,15 @@ def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
     """
     if not extra:
         return
-    fwd.tail = fwd.tail + extra
+    # The arc is template that sits UPSTREAM of this fragment, so it must
+    # come before the bases the annealing site stepped over - which are the
+    # first bases of the fragment itself. Appending it to the whole tail put
+    # the two the wrong way round and built a different molecule: every one
+    # of the six routes in a 28-construct sweep that used a carried arc on a
+    # shifted primer produced a product that was not the designed sequence.
+    shifted = fwd.shift_tail or ""
+    head = fwd.tail[:len(fwd.tail) - len(shifted)] if shifted else fwd.tail
+    fwd.tail = head + extra + shifted
     fwd.sequence = fwd.tail + fwd.anneal
     if len(fwd.sequence) > 100:
         route.warnings.append(

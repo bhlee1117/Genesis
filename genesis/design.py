@@ -11,7 +11,7 @@ import sqlite3
 
 from .config import Config
 from .seqtools import find_all, revcomp, slice_region
-from .construct import (ConstructSpec, assemble,
+from .construct import (VECTOR_TYPES, ConstructSpec, assemble,
                         assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
 from .planner import (group_contiguous, plan_gblock_route,
@@ -914,6 +914,30 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                                 expected_order=expected,
                                 stocked_enzymes=list(cfg.stocked_enzymes))
 
+    # Every architectural element that was asked for has to be in the
+    # molecule. A Cre-lox module whose payload scan ended early was dropped
+    # with a note nobody surfaced, and the result was a pAAV-CAG-DIO-ASAP7y
+    # byte-identical to pAAV-CAG-ASAP7y: constitutive, no lox sites, no
+    # error, and named for a cassette it did not contain.
+    placed_set = set(placed_types)
+    for m in spec.modules:
+        want = canonical_feature_type(m["type"] if isinstance(m, dict)
+                                      else m.type)
+        if want == "Cre-lox":
+            if not any(t == "lox_site" for t in placed_set):
+                issues.append(Issue(
+                    "error", "architecture",
+                    "you asked for a Cre-lox cassette but the finished "
+                    "construct has no lox sites, so it would express "
+                    "constitutively rather than only in Cre-positive cells; "
+                    "this is not the construct the name describes"))
+        elif want and want not in placed_set and want not in VECTOR_TYPES:
+            issues.append(Issue(
+                "error", "architecture",
+                f"you asked for a {want} but the finished construct does not "
+                f"contain one, so the molecule does not match the "
+                f"architecture it is named for"))
+
     if spec.vector and backbone is None:
         issues.append(Issue(
             "error", "packaging",
@@ -1130,7 +1154,24 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # just ruled out would otherwise keep the position it was ranked into -
     # and lead the list while being unusable. Feasible ones first; the
     # sort is stable, so the ranking survives within each group.
-    plan["routes"].sort(key=lambda r: not r.get("feasible"))
+    def _rank(r):
+        """Feasible first, then proven, then cheap.
+
+        A route that could not be simulated is not evidence of anything,
+        and it used to sort level with one whose product was checked
+        against the design. That let an unverified route take the top of
+        the page - and the top of the page is what gets built.
+        """
+        sim = r.get("simulation") or {}
+        simulated = bool(sim.get("simulated"))
+        return (
+            not r.get("feasible"),                       # usable routes first
+            not (simulated and sim.get("identical")),    # proven identical
+            not simulated,                               # at least checked
+            r.get("cost", 1e9),
+        )
+
+    plan["routes"].sort(key=_rank)
     return plan
 
 

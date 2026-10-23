@@ -26,6 +26,13 @@ class Primer:
     target_start: int = 0
     target_end: int = 0
     warnings: list = field(default_factory=list)
+    #: The part of `tail` that is template the annealing site stepped over,
+    #: sitting at its 3' end. Anything spliced into the tail later has to go
+    #: in FRONT of these, or the amplicon reads them out of order. Declared
+    #: last on purpose: other call sites build a Primer positionally, and
+    #: inserting a field mid-list silently shifted "F" into this one and
+    #: every argument after it.
+    shift_tail: str = ""
 
     @property
     def length(self) -> int:
@@ -317,11 +324,13 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
 
     fwd = Primer(
         name=f"{fragment_name}-F", sequence=f_tail + f_anneal, anneal=f_anneal,
-        tail=f_tail, direction="F", template=fragment_name,
+        tail=f_tail, shift_tail=f_tail[f_overlap:], direction="F",
+        template=fragment_name,
         target_start=start, target_end=end)
     rev = Primer(
         name=f"{fragment_name}-R", sequence=r_tail + r_anneal, anneal=r_anneal,
-        tail=r_tail, direction="R", template=fragment_name,
+        tail=r_tail, shift_tail=r_tail[r_overlap:], direction="R",
+        template=fragment_name,
         target_start=start, target_end=end)
 
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)

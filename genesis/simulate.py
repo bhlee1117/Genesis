@@ -588,6 +588,13 @@ def _check_leftovers(result: "SimulationResult", product: str, plan: dict,
         return
     doubled = (product + product).upper()
 
+    # Anything the design itself contains is wanted, whatever the parent
+    # happens to call it. A recipient annotated "CheRiff_eGFP" spans two
+    # parts that a CheRiff-P2A-EGFP design asks for separately, and testing
+    # only module by module reported that annotation as old payload left
+    # behind - failing a route whose product was the designed molecule.
+    designed = ((plan.get("construct") or {}).get("sequence") or "").upper()
+
     # What the construct says it is made of. A recipient's own copy of a
     # part that was asked for is not a leftover.
     wanted = []
@@ -620,6 +627,8 @@ def _check_leftovers(result: "SimulationResult", product: str, plan: dict,
                 continue
             if sequence_coverage(seg, doubled) < PRESENT_COVERAGE:
                 continue                  # removed, as intended
+            if designed and sequence_coverage(seg, designed) >= PRESENT_COVERAGE:
+                continue                  # the design asks for these bases
             if any(sequence_coverage(seg, w) >= PRESENT_COVERAGE
                    for w in wanted):
                 continue                  # it is one of the parts asked for

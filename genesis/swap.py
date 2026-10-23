@@ -20,6 +20,7 @@ question.
 
 from __future__ import annotations
 
+import re as _re
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -994,7 +995,8 @@ def _trimmed(protein: str) -> str:
     return protein[1:] if protein[:1] == "M" else protein
 
 
-def interchangeable(want: str, other: str, feature_type: str = "CDS") -> bool:
+def interchangeable(want: str, other: str, feature_type: str = "CDS",
+                    name_a: str = "", name_b: str = "") -> bool:
     """Whether two catalogued parts are the same molecule, not merely alike.
 
     The inventory holds the same gene several times over at different
@@ -1016,6 +1018,17 @@ def interchangeable(want: str, other: str, feature_type: str = "CDS") -> bool:
         return False
     if want == other:
         return True
+    # Two generations of one indicator are never the same part, however
+    # close the sequence. jGCaMP7f is an exact substring of GCaMP6f and
+    # QuasAr2 and QuasAr3 differ by one residue, so containment and
+    # identity both say "same" where the bench says "wrong sensor". The
+    # only exception is proteins that are byte-identical, which are one
+    # molecule under two names whatever the numbering says.
+    if name_a or name_b:
+        if not same_generation(name_a or "", name_b or ""):
+            pa, pb = protein_of(want), protein_of(other)
+            if not (pa and pa == pb):
+                return False
     # A boundary difference is a few codons, not most of the gene. Without
     # this the catalogue's stub rows - there is a 6 bp part named "ASAP1" -
     # are contained in everything and make every plasmid an exact holder.
@@ -1047,8 +1060,8 @@ def equivalent_part_ids(conn: sqlite3.Connection, part_id: int) -> list[int]:
     filed as "GFP" and three bases shorter.
     """
     row = conn.execute(
-        "SELECT id, seq, seq_checksum, feature_type FROM part WHERE id = ?",
-        (part_id,)).fetchone()
+        "SELECT id, name, seq, seq_checksum, feature_type FROM part "
+        "WHERE id = ?", (part_id,)).fetchone()
     if row is None or not row["seq"]:
         return [part_id]
     # Keyed on what the part is, not on its row number: an id means
@@ -1064,11 +1077,61 @@ def equivalent_part_ids(conn: sqlite3.Connection, part_id: int) -> list[int]:
     marks = ",".join("?" * len(ids))
     same = [part_id]
     for other in conn.execute(
-            f"SELECT id, seq FROM part WHERE id IN ({marks})", tuple(ids)):
-        if other["id"] != part_id and interchangeable(seq, other["seq"], ftype):
+            f"SELECT id, name, seq FROM part WHERE id IN ({marks})",
+            tuple(ids)):
+        if other["id"] != part_id and interchangeable(
+                seq, other["seq"], ftype, row["name"] or "",
+                other["name"] or ""):
             same.append(other["id"])
     _EQUIVALENT_CACHE[key] = same
     return same
+
+
+#: Families whose members are numbered generations of one another. Within
+#: these, a different number is a different molecule however similar the
+#: sequence: jGCaMP7f's 415 residues are an exact substring of GCaMP6f's
+#: 450, and QuasAr2 and QuasAr3 differ by a single residue. Sequence
+#: evidence cannot separate those from an annotation boundary, so the name
+#: has to.
+#: Written WITHOUT their one-letter prefixes, so that jGCaMP7f and GCaMP6f
+#: land on the same family and zArchon1 on the same one as Archon. A
+#: prefixed spelling is still found, because the bare name occurs inside it.
+PROTECTED_FAMILIES = (
+    "GCaMP", "ASAP", "QuasAr", "Voltron", "GluSnFR", "Archon", "ArcLight",
+    "RGECO", "RCaMP", "Chrimson", "CheRiff", "Ace2N", "AceD81", "Solaris",
+    "Cepheid", "ReVolt", "cAMPinG",
+)
+
+_VERSION_AFTER = _re.compile(r"[-_ ]?(\d+[a-z]?)")
+
+
+def version_token(name: str) -> tuple | None:
+    """(family, generation) for a numbered indicator, else None.
+
+    "GCaMP6f" and "jGCaMP7f" are generations 6f and 7f of one family;
+    "QuasAr2" and "QuasAr3" are 2 and 3. Returning the pair lets a caller
+    refuse to treat two generations as the same part without having to
+    decide anything from the sequence, which is the one thing sequence
+    cannot settle here.
+    """
+    low = (name or "").lower()
+    for fam in PROTECTED_FAMILIES:
+        at = low.find(fam.lower())
+        if at < 0:
+            continue
+        match = _VERSION_AFTER.match(low[at + len(fam):])
+        return fam.lower(), (match.group(1) if match else "")
+    return None
+
+
+def same_generation(a: str, b: str) -> bool:
+    """Whether two names are the same generation, or unrelated to families."""
+    ta, tb = version_token(a), version_token(b)
+    if ta is None or tb is None:
+        return True                       # not a numbered family; no opinion
+    if ta[0] != tb[0]:
+        return True                       # different families entirely
+    return ta[1] == tb[1]
 
 
 def identify_segment(conn: sqlite3.Connection, seq: str,
@@ -1154,9 +1217,12 @@ def _holders(conn: sqlite3.Connection,
         ftype = m.get("type", "CDS")
         same = {pid}
         spellings = [seq.upper()]
+        mine = m.get("part_name") or ""
         for r in conn.execute(
-                f"SELECT id, seq FROM part WHERE id IN ({marks})", tuple(ids)):
-            if r["id"] != pid and interchangeable(seq, r["seq"], ftype):
+                f"SELECT id, name, seq FROM part WHERE id IN ({marks})",
+                tuple(ids)):
+            if r["id"] != pid and interchangeable(
+                    seq, r["seq"], ftype, mine, r["name"] or ""):
                 same.add(r["id"])
                 spellings.append((r["seq"] or "").upper())
         alts.append(spellings)

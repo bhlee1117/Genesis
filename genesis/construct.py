@@ -519,7 +519,13 @@ LOXFAS_SEQ = "ACAACTTCGTATATACCTTTCTATACGAAGTTGT"
 
 #: Module types a recombinase cassette encloses. The cassette stops at the
 #: elements that stay outside it, such as the polyA and the WPRE.
+#: "Kozak" belongs here because the Kozak that gets taken from a donor sits
+#: between the cassette and the coding sequence it initiates. Leaving it out
+#: ended the payload scan on it, so a pAAV-CAG-DIO-ASAP7y came out
+#: byte-identical to pAAV-CAG-ASAP7y: no lox sites, no error, a
+#: constitutive construct carrying the word DIO in its name.
 CASSETTE_PAYLOAD_TYPES = {"CDS", "trafficking_motif", "linker", "p2A", "tag",
+                          "Kozak",
                           "IRES"}
 
 
