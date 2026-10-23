@@ -4687,7 +4687,10 @@ class TestPinnedSourceAcrossTheOrigin(unittest.TestCase):
         body = tail + rand_seq(700, 305) + head
         conn, part, mine = self._inventory(body, True, cds)
         plan = self._plan(conn, part, mine)
+        # The coding sequence's own source, not the Kozak element that may
+        # now sit in front of it and also come from "mine".
         src = next(s for m in plan["modules"]
+                   if m.get("type") == "CDS"
                    for s in (m.get("sources") or []) if s["name"] == "mine")
         self.assertTrue(0 <= src["start"] < len(body), src)
         self.assertGreater(src["end"], len(body))
@@ -4711,7 +4714,10 @@ class TestPinnedSourceAcrossTheOrigin(unittest.TestCase):
         conn, part, mine = self._inventory(body, True, cds)
         plan = self._plan(conn, part, mine)
         self.assertEqual(self._chosen(plan), ["mine"], plan["modules"])
+        # The coding sequence's own source, not the Kozak element that may
+        # now sit in front of it and also come from "mine".
         src = next(s for m in plan["modules"]
+                   if m.get("type") == "CDS"
                    for s in (m.get("sources") or []) if s["name"] == "mine")
         self.assertEqual(src["strand"], -1, src)
         conn.close()

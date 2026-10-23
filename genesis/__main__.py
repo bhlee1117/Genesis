@@ -147,6 +147,35 @@ def cmd_stats(args, cfg: Config):
         print(f"  {r['feature_type']:20s} {r['n']}")
 
 
+def cmd_name_segments(args, cfg: Config):
+    """Rename fusion pieces after the protein each one actually encodes."""
+    from .importer import segment_name
+
+    conn = _conn(cfg, args.db)
+    rows = conn.execute(
+        """SELECT p.id, p.name, p.seq, p.segment_index, p.segment_of,
+                  q.name AS parent
+             FROM part p LEFT JOIN part q ON q.id = p.derived_from
+            WHERE p.segment_of IS NOT NULL""").fetchall()
+    changed = 0
+    for r in rows:
+        parent = r["parent"] or re.sub(r"\s*\[\d+ of \d+\]$", "", r["name"])
+        fresh = segment_name(conn, parent, r["seq"], r["segment_index"],
+                             r["segment_of"])
+        if fresh != r["name"]:
+            if not args.dry_run:
+                conn.execute("UPDATE part SET name = ? WHERE id = ?",
+                             (fresh, r["id"]))
+            changed += 1
+            if changed <= 12 or args.verbose:
+                print(f"  {r['name'][:44]:46} -> {fresh[:60]}")
+    if not args.dry_run:
+        conn.commit()
+    print(f"\n{changed} of {len(rows)} fusion pieces "
+          f"{'would be' if args.dry_run else ''} renamed")
+    return 0
+
+
 def cmd_addgene(args, cfg: Config):
     """Search Addgene for something the lab has not got.
 
@@ -475,6 +504,13 @@ def main(argv=None):
     s.add_argument("--disable", action="store_true")
     s.add_argument("--enable", action="store_true")
     s.set_defaults(fn=cmd_role)
+
+    s = sub.add_parser(
+        "name-segments",
+        help="rename fusion pieces after the protein each one encodes")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(fn=cmd_name_segments)
 
     s = sub.add_parser(
         "addgene", help="search Addgene for a part the lab has not got")

@@ -28,7 +28,7 @@ FEATURE_TYPES = [
     "backbone", "promoter", "enhancer", "CDS", "trafficking_motif", "linker",
     "p2A", "IRES", "Cre-lox", "lox_site", "AAV_ITR", "resistance", "origin",
     "tag", "polyA", "WPRE", "restriction_site", "primer_binding_site",
-    "terminator", "intron", "unknown",
+    "terminator", "intron", "Kozak", "unknown",
 ]
 
 #: "DIO" was the old name for the family. Specs and parts saved with it keep

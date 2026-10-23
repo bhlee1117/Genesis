@@ -579,6 +579,108 @@ def scan_sources(conn: sqlite3.Connection, spec: ConstructSpec,
     }
 
 
+#: The six bases Kozak's consensus puts before an initiating ATG. The
+#: position that matters most is -3: a purine there, with a G at +4, is
+#: most of the effect.
+KOZAK = "GCCACC"
+
+
+def _looks_like_kozak(upstream: str) -> bool:
+    """Whether these six bases already initiate translation well.
+
+    Judged on the -3 purine rather than the whole consensus, because that
+    is the position with the measurable effect and most lab plasmids
+    carry some variant of the rest.
+    """
+    return len(upstream) >= 3 and upstream[-3] in "AG"
+
+
+def _extend_to_kozak(conn: sqlite3.Connection, resolved: list) -> list[str]:
+    """Carry the donor's Kozak sequence into the initiating coding sequence.
+
+    A coding sequence amplified from its ATG arrives with no Kozak, and
+    the recipient's own one is cut away with the payload it belonged to,
+    so the new construct puts a strong promoter straight onto a bare ATG.
+    That still translates; it translates less well.
+
+    The plasmid the gene is taken from usually has one sitting right in
+    front of it - paav-ef1a-dio-asap7y has GCCACC - and six more bases on
+    an amplicon that is already being made costs nothing at all. Where
+    the donor has no Kozak this says so rather than inventing one, since
+    adding bases no template carries is a different and more expensive
+    kind of change.
+
+    Only the module that *starts* translation gets one. A coding sequence
+    after a 2A peptide is reached by the ribosome skipping, not by
+    initiating again, so a Kozak there would be meaningless.
+    """
+    from .construct import TRANSLATED_MODULE_TYPES
+
+    notes: list[str] = []
+    inserted: list = []
+    types = [rm.feature_type for rm in resolved]
+    for i, rm in enumerate(resolved):
+        if rm.feature_type not in TRANSLATED_MODULE_TYPES or not rm.seq:
+            continue
+        if rm.feature_type == "Kozak":
+            continue
+        prev = types[i - 1] if i else None
+        if prev in TRANSLATED_MODULE_TYPES or prev == "Kozak":
+            continue                      # reached by skipping, not initiating
+        if not rm.seq[:3].upper() == "ATG":
+            continue                      # nothing here initiates anyway
+        src = rm.sources[0] if rm.sources else None
+        if not src or src.get("start") is None or src.get("end") is None:
+            continue
+        row = conn.execute("SELECT seq, circular FROM plasmid WHERE id = ?",
+                           (src["id"],)).fetchone()
+        if row is None or not row["seq"]:
+            continue
+        host = row["seq"].upper()
+        circular = bool(row["circular"])
+        strand = src.get("strand", 1)
+        if strand == 1:
+            upstream = slice_region(host, src["start"] - len(KOZAK),
+                                    src["start"], circular)
+        else:
+            upstream = revcomp(slice_region(host, src["end"],
+                                            src["end"] + len(KOZAK), circular))
+        upstream = upstream.upper()
+        if len(upstream) < len(KOZAK):
+            continue
+        if not _looks_like_kozak(upstream):
+            notes.append(
+                f"{rm.part_name} is amplified from its ATG and "
+                f"{src.get('name', 'the donor')} has no Kozak sequence in "
+                f"front of it ({upstream}); the promoter will drive a bare "
+                f"start codon, which works but initiates less efficiently - "
+                f"add {KOZAK} to the 5' primer tail if that matters")
+            continue
+        # Its own element, not six bases glued onto the front of the gene.
+        # Folding it in left the coding sequence no longer starting with
+        # ATG, so the map reported a missing start codon for a construct
+        # that had just been given a better one.
+        from .construct import Module, ResolvedModule
+
+        if strand == 1:
+            k_src = {**src, "start": src["start"] - len(KOZAK),
+                     "end": src["start"]}
+        else:
+            k_src = {**src, "start": src["end"],
+                     "end": src["end"] + len(KOZAK)}
+        inserted.append((i, ResolvedModule(
+            Module(type="Kozak", name="Kozak"), None, "Kozak", upstream,
+            "Kozak", [k_src], [])))
+        notes.append(
+            f"the amplicon was extended by {len(KOZAK)} bp upstream to take "
+            f"the Kozak sequence ({upstream}) that already sits in front of "
+            f"{rm.part_name} in {src.get('name', 'the donor')}")
+
+    for offset, (at, module) in enumerate(inserted):
+        resolved.insert(at + offset, module)
+    return notes
+
+
 def _extend_to_stop(conn: sqlite3.Connection, resolved: list) -> list[str]:
     """Carry the donor's own stop codon into a terminal coding sequence.
 
@@ -717,6 +819,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         rm.pinned_source = True
 
     stop_notes = _extend_to_stop(conn, resolved)
+    stop_notes += _extend_to_kozak(conn, resolved)
     fused_notes = _prefer_fused_source(conn, resolved)
 
     from_recipient = (_prefer_backbone_as_source(resolved, backbone)

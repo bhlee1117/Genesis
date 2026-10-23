@@ -393,7 +393,7 @@ PAYLOAD_GAP = 60
 #: leader - that the importer could not type. Those belong to whatever
 #: they sit inside, so they extend the run without being able to start
 #: one; without that, a cut stopped at the Kozak and left the indicator.
-BRIDGE_TYPES = {"unknown", "misc_feature"}
+BRIDGE_TYPES = {"unknown", "misc_feature", "Kozak"}
 
 #: What the payload is definitely not, and must never be cut into. The
 #: run stops dead at the first of these, whatever the gap arithmetic says.
@@ -1069,6 +1069,34 @@ def equivalent_part_ids(conn: sqlite3.Connection, part_id: int) -> list[int]:
             same.append(other["id"])
     _EQUIVALENT_CACHE[key] = same
     return same
+
+
+def identify_segment(conn: sqlite3.Connection, seq: str,
+                     floor: float = 0.90) -> str:
+    """Name a piece of a fusion by the protein it actually encodes.
+
+    A fused coding sequence is catalogued as one annotation, and splitting
+    it gave each piece the whole fusion's name with its position after it:
+    "LR-Voltron2-LR-CheRiff_eYFP [2 of 3]" says where the piece sits and
+    nothing about what it is. Asked at the protein level the answer is
+    usually unambiguous - that piece is CheRiff - because the lab already
+    has the individual protein catalogued under its own name.
+
+    Returns "" when nothing matches well enough to be worth claiming.
+    """
+    target = protein_of(seq or "")
+    if len(target) < 40:
+        return ""
+    low, high = int(len(seq) * 0.6), int(len(seq) * 1.6)
+    best, best_name = floor, ""
+    for row in conn.execute(
+            """SELECT name, seq FROM part
+               WHERE feature_type = 'CDS' AND segment_of IS NULL
+                 AND seq_length BETWEEN ? AND ?""", (low, high)):
+        value = protein_identity(target, protein_of(row["seq"]))
+        if value > best:
+            best, best_name = value, row["name"]
+    return best_name
 
 
 def _holders(conn: sqlite3.Connection,
