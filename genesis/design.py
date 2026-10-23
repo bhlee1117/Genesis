@@ -10,7 +10,7 @@ import json
 import sqlite3
 
 from .config import Config
-from .seqtools import find_all, revcomp
+from .seqtools import find_all, revcomp, slice_region
 from .construct import (ConstructSpec, assemble,
                         assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
@@ -579,6 +579,63 @@ def scan_sources(conn: sqlite3.Connection, spec: ConstructSpec,
     }
 
 
+def _extend_to_stop(conn: sqlite3.Connection, resolved: list) -> list[str]:
+    """Carry the donor's own stop codon into a terminal coding sequence.
+
+    Some genes are catalogued without their stop - every ASAP7y row in
+    this inventory is - and when nothing translated follows, the ribosome
+    runs off the end of the insert and into whatever the vector puts
+    there. For pAAV-CAG-ASAP7y that was the WPRE, and the promoter drove
+    a 660 residue protein instead of a 427 residue one.
+
+    The plasmid the part is taken from usually has the stop sitting right
+    after it. Three more bases on the amplicon is free, so the amplified
+    region is extended to include it and the construct gets a sequence
+    that terminates.
+    """
+    from .construct import TRANSLATED_MODULE_TYPES, STOP_CODONS
+
+    notes: list[str] = []
+    types = [rm.feature_type for rm in resolved]
+    for i, rm in enumerate(resolved):
+        if rm.feature_type not in TRANSLATED_MODULE_TYPES or not rm.seq:
+            continue
+        nxt = types[i + 1] if i + 1 < len(types) else None
+        if nxt in TRANSLATED_MODULE_TYPES:
+            continue                       # a fusion continues; no stop here
+        if rm.seq[-3:].upper() in STOP_CODONS:
+            continue                       # already terminates
+        src = rm.sources[0] if rm.sources else None
+        if not src or src.get("start") is None or src.get("end") is None:
+            continue
+        row = conn.execute("SELECT seq, circular FROM plasmid WHERE id = ?",
+                           (src["id"],)).fetchone()
+        if row is None or not row["seq"]:
+            continue
+        host = row["seq"].upper()
+        circular = bool(row["circular"])
+        strand = src.get("strand", 1)
+        if strand == 1:
+            nxt_codon = slice_region(host, src["end"], src["end"] + 3,
+                                     circular)
+        else:
+            nxt_codon = revcomp(slice_region(host, src["start"] - 3,
+                                             src["start"], circular))
+        if nxt_codon.upper() not in STOP_CODONS:
+            continue
+        rm.seq = rm.seq + nxt_codon.upper()
+        if strand == 1:
+            src["end"] = src["end"] + 3
+        else:
+            src["start"] = src["start"] - 3
+        notes.append(
+            f"{rm.part_name} is catalogued without a stop codon, and nothing "
+            f"translated follows it; the amplicon was extended by 3 bp to "
+            f"take the {nxt_codon.upper()} that follows it in "
+            f"{src.get('name', 'the donor')}, so the protein terminates")
+    return notes
+
+
 def design(conn: sqlite3.Connection, spec: ConstructSpec,
            cfg: Config | None = None) -> dict:
     cfg = cfg or Config()
@@ -659,6 +716,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         }] + [x for x in rm.sources if x["id"] != wanted]
         rm.pinned_source = True
 
+    stop_notes = _extend_to_stop(conn, resolved)
     fused_notes = _prefer_fused_source(conn, resolved)
 
     from_recipient = (_prefer_backbone_as_source(resolved, backbone)
@@ -696,6 +754,15 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     else:
         construct = assemble(resolved, "", circular=spec.circular)
     construct.warnings.extend(dio_notes)
+    # These were being computed and dropped, so a plan could silently take
+    # a fusion whole, move a source onto the recipient or extend an
+    # amplicon to a stop codon without ever saying it had.
+    construct.warnings.extend(stop_notes)
+    construct.warnings.extend(fused_notes)
+    if from_recipient:
+        construct.warnings.append(
+            "taken from the recipient itself rather than another plasmid: "
+            + ", ".join(from_recipient))
 
     # A specification that never mentioned a vector takes the configured
     # default; one that explicitly asked for auto keeps inferring.
@@ -862,6 +929,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
             "layout": construct.layout,
             "codon_markers": codon_markers(construct),
             "sequence": construct.seq,
+            "warnings": list(construct.warnings),
         },
         "backbone": {
             "id": backbone["id"], "name": backbone["name"],

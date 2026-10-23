@@ -769,6 +769,12 @@ def expand_dio(resolved: list[ResolvedModule],
 expand_recombinase = expand_dio
 
 
+#: Shorter than this a "coding sequence" is an annotation artefact - a
+#: protease site, a tag fragment - and not something whose start and stop
+#: codons mean anything.
+MIN_TRANSLATED_RUN = 60
+
+
 def codon_markers(construct: AssembledConstruct) -> list[dict]:
     """Locate the start and stop codons of every translated run.
 
@@ -785,6 +791,11 @@ def codon_markers(construct: AssembledConstruct) -> list[dict]:
     """
     markers: list[dict] = []
     for run in translated_span(construct):
+        # A twelve base "CDS" is an annotation artefact, not a protein, and
+        # asking whether it starts with ATG and ends in a stop puts two
+        # false problems on every map that carries one.
+        if run["end"] - run["start"] < MIN_TRANSLATED_RUN:
+            continue
         strand = run.get("strand", 1)
         start, end = run["start"], run["end"]
         span = construct.seq[start:end]

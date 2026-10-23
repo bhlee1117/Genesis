@@ -24,7 +24,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from .config import Config
-from .seqtools import revcomp, slice_region
+from .seqtools import find_all, revcomp, slice_region
 from .construct import REGULATORY_TYPES, backbone_cassette
 from .vocab import canonical_feature_type
 
@@ -693,6 +693,28 @@ def analyse_swap(conn: sqlite3.Connection, resolved_modules: list[dict],
     if donor:
         occ = _occurrence(conn, donor.plasmid_id, new_module["part_id"],
                           new_module.get("seq", ""))
+        # The catalogued occurrence is the part's recorded boundaries, which
+        # are not always the bases the design settled on: a terminal coding
+        # sequence has its stop codon added from the donor, and amplifying
+        # the recorded span would leave that stop behind. Where the module
+        # carries its own sequence and the record disagrees about how long
+        # it is, the sequence wins.
+        want = (new_module.get("seq") or "").upper()
+        if want and occ and (occ["end"] - occ["start"]) != len(want):
+            row = conn.execute("SELECT seq, circular FROM plasmid WHERE id = ?",
+                               (donor.plasmid_id,)).fetchone()
+            if row is not None and row["seq"]:
+                host = row["seq"].upper()
+                circ = bool(row["circular"])
+                hits = find_all(host, want, circ)
+                if hits:
+                    occ = {"start": hits[0], "end": hits[0] + len(want),
+                           "strand": 1}
+                else:
+                    hits = find_all(host, revcomp(want), circ)
+                    if hits:
+                        occ = {"start": hits[0], "end": hits[0] + len(want),
+                               "strand": -1}
         if occ:
             insert = SwapRegion(occ["start"], occ["end"], occ["strand"],
                                 label=new_module["part_name"])

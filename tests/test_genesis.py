@@ -1275,8 +1275,10 @@ class TestCodonMarkers(unittest.TestCase):
 
     def test_premature_stop_is_marked_separately_from_the_real_one(self):
         from genesis.construct import codon_markers
-        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 5 + "TGA" + "GCT" * 5),
-                     ("CDS", "geneB", "GCT" * 5 + "TAA")])
+        # Long enough to be a protein: a run shorter than MIN_TRANSLATED_RUN
+        # is an annotation artefact and is deliberately not marked.
+        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 5 + "TGA" + "GCT" * 15),
+                     ("CDS", "geneB", "GCT" * 10 + "TAA")])
         kinds = [m["kind"] for m in codon_markers(c)]
         self.assertIn("premature_stop", kinds)
         self.assertEqual(kinds.count("stop"), 1)
@@ -5077,3 +5079,113 @@ class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
         self.assertEqual(donors[1].plasmid_id, small)
         self.assertTrue(any("not the part" in r for r in donors[1].reasons))
         conn.close()
+
+
+class TestPrimerSiteMovesToBetterBases(unittest.TestCase):
+    """A junction is where the DNA joins, not where a primer must bind.
+
+    The annealing site used to be fixed at the fragment boundary and only
+    its length could change, so a junction in an AT-rich stretch gave a
+    primer that was reported as too cold and used anyway. The site may now
+    move into the fragment, with the bases it steps over carried on the
+    tail - which leaves the product identical and only lengthens the oligo.
+    """
+
+    def setUp(self):
+        import random
+        rng = random.Random(909)
+        # An AT-rich mouth followed by balanced sequence, so moving in is
+        # the only way to reach NEB's 40-60% band.
+        poor = "".join(rng.choice("ATATATATGC") for _ in range(40))
+        good = "".join(rng.choice("ACGT") for _ in range(3000))
+        self.template = poor + good
+        self.up = "".join(rng.choice("ACGT") for _ in range(300))
+        self.dn = "".join(rng.choice("ACGT") for _ in range(300))
+
+    def _pair(self, shift):
+        from genesis.primers import design_gibson_pair
+        cfg = Config()
+        cfg.primer_max_shift = shift
+        return design_gibson_pair(0, "frag", self.template, 0, 1500,
+                                  self.up, self.dn, cfg,
+                                  carry_downstream=False), cfg
+
+    def test_the_product_is_unchanged_by_the_shift(self):
+        from genesis.seqtools import revcomp
+        products = []
+        for shift in (0, 15):
+            (f, r), _ = self._pair(shift)
+            at = self.template.find(f.anneal)
+            rc_at = self.template.find(revcomp(r.anneal))
+            products.append(f.sequence
+                            + self.template[at + len(f.anneal):rc_at]
+                            + revcomp(r.sequence))
+        self.assertEqual(products[0], products[1])
+
+    def test_it_reaches_better_bases_than_the_boundary_offers(self):
+        from genesis.seqtools import gc_fraction
+        (f0, _), _ = self._pair(0)
+        (f1, _), _ = self._pair(15)
+        self.assertGreater(gc_fraction(f1.anneal), gc_fraction(f0.anneal))
+
+    def test_the_bases_stepped_over_are_on_the_tail(self):
+        (f, _), _ = self._pair(15)
+        self.assertEqual(f.sequence, f.tail + f.anneal)
+        at = self.template.find(f.anneal)
+        self.assertTrue(f.tail.endswith(self.template[:at]), f.tail)
+
+    def test_moving_the_site_is_said_out_loud(self):
+        (f, _), _ = self._pair(15)
+        self.assertTrue(any("moved" in w for w in f.warnings), f.warnings)
+
+
+class TestStickyEndLigationIsSimulated(unittest.TestCase):
+    """A digest route cannot be judged by looking for homology.
+
+    Every restriction route was reported as "the fragments do not
+    assemble", because the simulator amplified what the primers described
+    and then looked for 15 bp of shared end sequence. A sticky-end
+    ligation does not have that and never will, so the cheapest route on
+    the page was being discarded by a test that did not apply to it.
+    """
+
+    def _plasmid(self):
+        import random
+        rng = random.Random(555)
+        filler = lambda n: "".join(rng.choice("ACGT") for _ in range(n))
+        # GGATCC = BamHI, AAGCTT = HindIII
+        return (filler(300) + "GGATCC" + filler(900) + "AAGCTT"
+                + filler(400))
+
+    def test_a_digest_cuts_into_the_expected_pieces(self):
+        from genesis.simulate import digest
+        seq = self._plasmid()
+        pieces = digest(seq, True, ["BamHI", "HindIII"])
+        self.assertEqual(len(pieces), 2)
+        self.assertEqual({p.left for p in pieces}, {"GATC", "AGCT"})
+
+    def test_the_pieces_religate_to_the_original(self):
+        from genesis.simulate import digest, ligate
+        seq = self._plasmid()
+        joined, note = ligate(digest(seq, True, ["BamHI", "HindIII"]))
+        self.assertIsNotNone(joined, note)
+        self.assertEqual(len(joined), len(seq))
+
+    def test_incompatible_ends_do_not_close(self):
+        from genesis.simulate import digest, ligate
+        seq = self._plasmid()
+        vector = [p for p in digest(seq, True, ["BamHI", "HindIII"])
+                  if len(p.seq) > 500][0]
+        # An insert cut with one enzyme only has two identical ends, so it
+        # cannot go into a vector cut with two different ones directionally.
+        from genesis.simulate import CutFragment
+        wrong = CutFragment("ACGT" * 50, "GATC", "GATC")
+        joined, note = ligate([vector, wrong])
+        self.assertIsNone(joined, note)
+
+    def test_blunt_ends_are_not_treated_as_a_join(self):
+        from genesis.simulate import CutFragment, ligate
+        a = CutFragment("ACGT" * 40, "", "")
+        b = CutFragment("TTGA" * 40, "", "")
+        joined, _ = ligate([a, b])
+        self.assertIsNone(joined)

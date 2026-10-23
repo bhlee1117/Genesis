@@ -182,6 +182,13 @@ class PDF:
             f"q {rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} RG {width} w {d}"
             f"{x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S Q")
 
+    def fill_tri(self, p1, p2, p3, rgb=(0.2, 0.2, 0.2)):
+        """A solid triangle at any orientation, from three points."""
+        self.pages[-1].ops.append(
+            f"q {rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} rg "
+            f"{p1[0]:.2f} {p1[1]:.2f} m {p2[0]:.2f} {p2[1]:.2f} l "
+            f"{p3[0]:.2f} {p3[1]:.2f} l f Q")
+
     def tri(self, x, y, size=4, rgb=(0.8, 0.1, 0.1), up=True):
         """A small solid triangle, used as a cut or insert marker."""
         dy = size if up else -size
@@ -614,14 +621,11 @@ def _arrow_head(doc, cx, cy, radius, fraction, strand, rgb):
     matters more than on a linear one, because an inverted payload - a
     Cre-lox cassette, say - looks exactly like an upright one.
     """
-    step = 0.004 * (1 if strand == 1 else -1)
-    tip = _polar(cx, cy, radius, fraction)
-    back = _polar(cx, cy, radius, fraction - step)
-    out = _polar(cx, cy, radius + 3.4, fraction - step)
-    inn = _polar(cx, cy, radius - 3.4, fraction - step)
-    doc.line(back[0], back[1], tip[0], tip[1], rgb=rgb, width=0.9)
-    doc.line(out[0], out[1], tip[0], tip[1], rgb=rgb, width=0.9)
-    doc.line(inn[0], inn[1], tip[0], tip[1], rgb=rgb, width=0.9)
+    step = 0.0085 * (1 if strand == 1 else -1)
+    tip = _polar(cx, cy, radius, fraction + step)
+    out = _polar(cx, cy, radius + 5.2, fraction)
+    inn = _polar(cx, cy, radius - 5.2, fraction)
+    doc.fill_tri(tip, out, inn, rgb)
 
 
 #: What each codon mark is called on the map.
@@ -686,10 +690,10 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
         _arc_path(doc, cx, cy, r, start_f, end_f, 7.5, rgb_f)
         span_f = ((end_f - start_f) % 1.0) or 1.0
         # Which way it is read, drawn on the arc itself.
-        if f["feature_type"] in _TRANSLATED and span_f > 0.02:
+        if f["feature_type"] in _TRANSLATED and span_f > 0.015:
             strand = f.get("strand", 1)
             at = (end_f if strand == 1 else start_f) % 1.0
-            _arrow_head(doc, cx, cy, r, at, strand, (1.0, 1.0, 1.0))
+            _arrow_head(doc, cx, cy, r, at, strand, rgb_f)
         mid = start_f + span_f / 2
         labelled.append((mid % 1.0, f, r))
 
@@ -734,6 +738,7 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
         doc.text_at(caption, cx, cy - 24, "F2", 7.5, rgb=rgb, centre=True)
 
     shown = []
+    placed: list = []
     for mark in codon_marks or []:
         mf = (mark["start"] % length) / length
         rgb = CODON_COLOURS.get(mark["kind"], (0.4, 0.4, 0.4))
@@ -743,7 +748,16 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
         # Name it. An unlabelled tick on a ring is not information.
         glyph = CODON_GLYPH.get(mark["kind"], "")
         if glyph:
-            gx, gy = _polar(cx, cy, radius - 20, mf)
+            # Two codon marks a few bases apart land on the same spot and
+            # overprint each other, which is how "no stop" and "no ATG"
+            # came out as one unreadable word. Step the label inwards
+            # until it has room.
+            depth = 20
+            while any(abs(mf - prev) * length < 260 and abs(depth - d) < 9
+                      for prev, d in placed):
+                depth += 9
+            placed.append((mf, depth))
+            gx, gy = _polar(cx, cy, radius - depth, mf)
             doc.text_at(glyph, gx, gy - 2, "F2", 5.6, rgb=rgb, centre=True)
         shown.append(mark["kind"])
 
