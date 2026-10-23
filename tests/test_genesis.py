@@ -5189,3 +5189,62 @@ class TestStickyEndLigationIsSimulated(unittest.TestCase):
         b = CutFragment("TTGA" * 40, "", "")
         joined, _ = ligate([a, b])
         self.assertIsNone(joined)
+
+
+class TestProteinEndsAreLabelled(unittest.TestCase):
+    """Which end of a block is the start of the protein.
+
+    On a circular map the two ends of a coding sequence look alike, and
+    for a Cre-lox payload - stored inverted - the amino end is the one
+    drawn second. Getting it from the drawing rather than the strand
+    would label every inverted cassette backwards.
+    """
+
+    def test_a_forward_gene_starts_at_its_low_end(self):
+        from genesis.pdf import _terminus_ends
+        f = {"_start_f": 0.2, "_end_f": 0.6, "strand": 1}
+        self.assertEqual(_terminus_ends(f), (0.2, 0.6))
+
+    def test_a_reverse_gene_starts_at_its_high_end(self):
+        from genesis.pdf import _terminus_ends
+        f = {"_start_f": 0.2, "_end_f": 0.6, "strand": -1}
+        self.assertEqual(_terminus_ends(f), (0.6, 0.2))
+
+    def test_a_feature_with_no_strand_reads_forward(self):
+        from genesis.pdf import _terminus_ends
+        f = {"_start_f": 0.1, "_end_f": 0.3}
+        self.assertEqual(_terminus_ends(f), (0.1, 0.3))
+
+    def test_only_coding_sequences_get_their_own_ends(self):
+        """A 2A peptide is part of somebody else's protein."""
+        from genesis.pdf import _PROTEIN_ENDS
+        self.assertIn("CDS", _PROTEIN_ENDS)
+        for borrowed in ("p2A", "trafficking_motif", "linker", "tag"):
+            self.assertNotIn(borrowed, _PROTEIN_ENDS)
+
+    def test_an_inverted_fusion_reads_from_high_to_low(self):
+        """The order the ribosome sees, for a payload stored backwards."""
+        from genesis.pdf import _terminus_ends
+        # ASAP7y then P2A then EGFP, all on the minus strand.
+        asap = {"_start_f": 0.30, "_end_f": 0.55, "strand": -1}
+        egfp = {"_start_f": 0.08, "_end_f": 0.26, "strand": -1}
+        asap_n, asap_c = _terminus_ends(asap)
+        egfp_n, egfp_c = _terminus_ends(egfp)
+        # ASAP7y is read first, so its C end comes before EGFP's N end.
+        self.assertGreater(asap_n, asap_c)
+        self.assertGreater(asap_c, egfp_n)
+        self.assertGreater(egfp_n, egfp_c)
+
+    def test_the_map_draws_them_for_a_real_construct(self):
+        from genesis.pdf import PDF, A4, circular_map
+        doc = PDF("test", A4)
+        doc._ensure(1)
+        feats = [{"feature_type": "CDS", "name": "ASAP7y", "start": 1920,
+                  "end": 3204, "strand": 1},
+                 {"feature_type": "promoter", "name": "CAG", "start": 92,
+                  "end": 1837, "strand": 1}]
+        circular_map(doc, "test", "7,219 bp", 7219, feats)
+        ops = "".join(o if isinstance(o, str) else o.decode("latin-1")
+                      for o in doc.pages[-1].ops)
+        self.assertIn("(N)", ops)
+        self.assertIn("(C)", ops)

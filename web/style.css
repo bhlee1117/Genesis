@@ -1211,6 +1211,12 @@ tr.row-bad td {
 .circ-topo { fill: var(--text-muted); font-size: 10px; font-family: var(--sans); }
 .circ-feature path { transition: stroke-width 0.1s; }
 .circ-feature:hover path { stroke-width: 11; }
+/* N and C termini, written inside the ring against the feature colour. */
+.circ-terminus {
+  font-size: 7px;
+  font-weight: 700;
+  pointer-events: none;
+}
 .circ-codon line { stroke-width: 1.6; }
 .circ-codon.mark-start line { stroke: var(--ok-border); }
 .circ-codon.mark-stop line { stroke: var(--accent); }

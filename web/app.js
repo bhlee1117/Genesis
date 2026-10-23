@@ -685,6 +685,11 @@ var CODING_TYPES = {
   CDS: 1, p2A: 1, trafficking_motif: 1, tag: 1, linker: 1, IRES: 1
 };
 
+/* Only these have two ends of their own. A 2A peptide or a trafficking
+   motif belongs to somebody else's protein, so labelling it N and C
+   would claim there are more proteins on the map than there are. */
+var PROTEIN_END_TYPES = { CDS: 1 };
+
 function polar(cx, cy, r, f) {
   var a = -Math.PI / 2 + 2 * Math.PI * f;           /* 0 at twelve o'clock */
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
@@ -781,6 +786,22 @@ function circularMap(length, items, opts) {
       if (CODING_TYPES[typeOf(f)]) {
         g.appendChild(arrowHead(cx, cy, r, reverse ? from : to % 1,
                                 !reverse, colour));
+      }
+      /* Which end is the start of the protein and which is the end of it.
+         A reverse-strand coding sequence begins at the end that is drawn
+         second, so the labels follow the strand and not the drawing. */
+      if (PROTEIN_END_TYPES[typeOf(f)] && (to - from) > 0.035) {
+        var nAt = (reverse ? to : from) % 1;
+        var cAt = (reverse ? from : to) % 1;
+        [['N', nAt], ['C', cAt]].forEach(function (pair) {
+          var at = polar(cx, cy, r - 9, pair[1]);
+          var t = svg('text', {
+            x: at[0].toFixed(1), y: (at[1] + 2).toFixed(1),
+            'text-anchor': 'middle', class: 'circ-terminus', fill: colour
+          });
+          t.textContent = pair[0];
+          g.appendChild(t);
+        });
       }
       node.appendChild(g);
       placed.push({ mid: ((from + to) / 2) % 1, f: f, r: r, colour: colour });

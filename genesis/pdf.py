@@ -527,8 +527,21 @@ def plasmid_track(doc: "PDF", title: str, subtitle: str, length: int,
         if f.get("strand") == -1:
             # a small notch on the left shows the feature reads right to left
             doc.tri(fx + 3, track_y + height / 2 - 2.5, 2.5, (1, 1, 1), up=True)
+        # The ends of the protein, named. On a linear track the left edge
+        # is the amino end only when the feature reads forwards; a reverse
+        # strand coding sequence starts at its right edge.
+        ends_fit = fw >= 16 and f["feature_type"] in _PROTEIN_ENDS
+        if ends_fit:
+            reverse = f.get("strand", 1) == -1
+            n_x = fx + fw - 4 if reverse else fx + 4
+            c_x = fx + 4 if reverse else fx + fw - 4
+            for text, tx in (("N", n_x), ("C", c_x)):
+                doc.text_at(text, tx, track_y + height / 2 - 2.3, "F2", 5.6,
+                            rgb=(1, 1, 1), centre=True)
+
         label = f["name"] or f["feature_type"]
-        if text_width(label, "F2", 6.6) + 6 <= fw:
+        room = fw - (18 if ends_fit else 0)
+        if text_width(label, "F2", 6.6) + 6 <= room:
             doc.text_at(label, fx + fw / 2, track_y + height / 2 - 2.3, "F2",
                         6.6, rgb=(1, 1, 1), centre=True)
         else:
@@ -613,6 +626,29 @@ def _arc_path(doc, cx, cy, radius, start_f, end_f, width, rgb):
         f"{path} S Q")
 
 
+#: Feature types whose two ends are the ends of a protein. A 2A peptide
+#: or a trafficking motif is part of somebody else's protein, so giving it
+#: its own N and C would say there are more proteins here than there are.
+_PROTEIN_ENDS = {"CDS"}
+
+#: Below this an annotation is too narrow to carry two labels without
+#: them sitting on top of each other.
+_ENDS_MIN_SPAN = 0.035
+
+
+def _terminus_ends(f: dict) -> tuple:
+    """(where the N-terminus is, where the C-terminus is), as fractions.
+
+    Translation starts at the low coordinate of a forward feature and at
+    the high coordinate of a reverse one, so which physical end is the
+    amino terminus depends on the strand and not on the drawing.
+    """
+    start_f, end_f = f["_start_f"], f["_end_f"]
+    if f.get("strand", 1) == -1:
+        return end_f, start_f
+    return start_f, end_f
+
+
 def _arrow_head(doc, cx, cy, radius, fraction, strand, rgb):
     """A chevron on a feature arc, pointing the way it is translated.
 
@@ -694,6 +730,16 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
             strand = f.get("strand", 1)
             at = (end_f if strand == 1 else start_f) % 1.0
             _arrow_head(doc, cx, cy, r, at, strand, rgb_f)
+        # Which end of the block is the start of the protein and which is
+        # the end of it. On a circle the two look alike, and on a reverse
+        # strand feature the answer is the opposite of the way it is drawn.
+        if f["feature_type"] in _PROTEIN_ENDS and span_f > _ENDS_MIN_SPAN:
+            f["_start_f"], f["_end_f"] = start_f, end_f
+            n_at, c_at = _terminus_ends(f)
+            for label, where in (("N", n_at), ("C", c_at)):
+                lx, ly = _polar(cx, cy, r - 8.5, where % 1.0)
+                doc.text_at(label, lx, ly - 1.8, "F2", 5.4, rgb=rgb_f,
+                            centre=True)
         mid = start_f + span_f / 2
         labelled.append((mid % 1.0, f, r))
 
@@ -782,6 +828,8 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
     key = []
     if any(f["feature_type"] in _TRANSLATED for f in features):
         key.append("arrowheads point the way each coding sequence is read")
+    if any(f["feature_type"] in _PROTEIN_ENDS for f in features):
+        key.append("N and C mark the amino and carboxy ends of each protein")
     for kind in ("start", "stop", "premature_stop",
                  "missing_start", "missing_stop"):
         if kind in shown:
