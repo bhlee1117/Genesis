@@ -104,13 +104,27 @@ def _slice_circular(seq: str, start: int, end: int) -> str:
 
 
 def slice_region(seq: str, start: int, end: int, circular: bool = False) -> str:
-    """Extract [start, end) honouring wrap-around on circular molecules."""
+    """Extract [start, end) honouring wrap-around on circular molecules.
+
+    Callers write a wrapped span either way round: with `end` past the last
+    base, which is how the occurrence table records one, or reduced so that
+    `end` lands at or before `start`. Both mean the same arc.
+
+    How long that arc is must be worked out before either coordinate is
+    reduced. Reducing `start` alone and leaving `end` where it was turned
+    an 18 base window at the origin into a whole turn of the plasmid plus
+    18, which is how primer design came to anneal a 1,174 nt oligo to a
+    1,156 bp template.
+    """
     if circular:
         n = len(seq)
+        if n == 0:
+            return ""
+        span = end - start
+        if span <= 0:
+            span += n
         start %= n
-        if end <= start:
-            end += n
-        return _slice_circular(seq, start, end)
+        return _slice_circular(seq, start, start + span)
     return seq[start:end]
 
 

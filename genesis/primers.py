@@ -26,6 +26,13 @@ class Primer:
     target_start: int = 0
     target_end: int = 0
     warnings: list = field(default_factory=list)
+    #: The part of `tail` that is template the annealing site stepped over,
+    #: sitting at its 3' end. Anything spliced into the tail later has to go
+    #: in FRONT of these, or the amplicon reads them out of order. Declared
+    #: last on purpose: other call sites build a Primer positionally, and
+    #: inserting a field mid-list silently shifted "F" into this one and
+    #: every argument after it.
+    shift_tail: str = ""
 
     @property
     def length(self) -> int:
@@ -63,6 +70,98 @@ class Junction:
 # --------------------------------------------------------------------------
 # Annealing-region selection
 # --------------------------------------------------------------------------
+
+def anneal_penalty(region: str, cfg: Config, shift: int = 0,
+                   unique_in: str = "", circular: bool = False) -> float:
+    """How poor a primer this stretch of template would make. Lower is better.
+
+    The criteria are NEB's for Q5: a melting temperature near the target,
+    40-60% GC, a G or C at the 3' end but not four of them in the last
+    five, no long single-base run, and no 3' self-complementarity. None of
+    them is a veto on its own - a site that fails one and passes the rest
+    beats a site that fails three - so they are weighed rather than
+    filtered.
+    """
+    if not region:
+        return 1e6
+    t = tm(region, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+    if t != t:                                  # ambiguous bases
+        return 1e6
+    score = abs(t - cfg.primer_tm_target)
+    if abs(t - cfg.primer_tm_target) > cfg.primer_tm_tolerance:
+        score += 6.0
+
+    gc = gc_fraction(region)
+    if gc < cfg.primer_ideal_min_gc:
+        score += (cfg.primer_ideal_min_gc - gc) * 40
+    elif gc > cfg.primer_ideal_max_gc:
+        score += (gc - cfg.primer_ideal_max_gc) * 40
+
+    # A G or C at the 3' end clamps the extending end; four of them in the
+    # last five is the opposite problem and misprimes.
+    if region[-1] in "GC":
+        score -= 1.5
+    if region[-5:].count("G") + region[-5:].count("C") >= 4:
+        score += 4.0
+
+    if max_homopolymer(region) >= 5:
+        score += 5.0
+    if self_dimer_3prime(region) >= 4:
+        score += 5.0
+    hair = hairpin_score(region)
+    if hair and hair["stem"] >= 6:
+        score += 4.0
+
+    # Every base of shift is a base of oligo somebody pays for.
+    score += 0.25 * shift
+
+    if unique_in:
+        from .seqtools import find_all
+        n = len(find_all(unique_in, region, circular)) + \
+            len(find_all(unique_in, revcomp(region), circular))
+        if n > 1:
+            score += 25.0 * (n - 1)
+    return score
+
+
+def pick_anneal_site(template: str, start: int, direction: str, cfg: Config,
+                     circular: bool = False, max_shift: int = 0,
+                     unique_in: str = "") -> tuple[str, int]:
+    """Choose where the primer binds, and how far in from the junction.
+
+    `pick_anneal` can only change how long the primer is, not where it
+    sits, so a junction falling in an AT-rich stretch produced a primer
+    that was reported as too cold and used regardless. The site may now
+    move *into* the fragment; the bases it steps over are added to the
+    primer's tail, which leaves the product identical and makes the oligo
+    longer by exactly the shift.
+
+    It never moves outward, because that would amplify template bases the
+    construct does not call for.
+
+    Returns the annealing region and the shift it took.
+    """
+    best, best_score = ("", 0), float("inf")
+    for shift in range(0, max(0, max_shift) + 1):
+        for length in range(cfg.primer_min_len, cfg.primer_max_len + 1):
+            if direction == "F":
+                lo = start + shift
+                region = slice_region(template, lo, lo + length, circular)
+            else:
+                hi = start - shift
+                lo = hi - length
+                if lo < 0 and not circular:
+                    break
+                region = revcomp(slice_region(template, lo, hi, circular))
+            if len(region) < length:
+                break
+            score = anneal_penalty(region, cfg, shift, unique_in, circular)
+            if score < best_score:
+                best_score, best = score, (region, shift)
+    if best[0]:
+        return best
+    return pick_anneal(template, start, direction, cfg, circular), 0
+
 
 def pick_anneal(template: str, start: int, direction: str, cfg: Config,
                 circular: bool = False) -> str:
@@ -196,8 +295,13 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     not amplified - a digested vector cannot be given a tail, so the insert
     has to carry both of its junctions.
     """
-    f_anneal = pick_anneal(template, start, "F", cfg, circular_template)
-    r_anneal = pick_anneal(template, end, "R", cfg, circular_template)
+    shift = max(0, getattr(cfg, "primer_max_shift", 0))
+    f_anneal, f_shift = pick_anneal_site(template, start, "F", cfg,
+                                         circular_template, shift,
+                                         unique_in=template)
+    r_anneal, r_shift = pick_anneal_site(template, end, "R", cfg,
+                                         circular_template, shift,
+                                         unique_in=template)
 
     f_tail = pick_overlap(upstream_seq, cfg, from_end=True,
                           unique_in=unique_in)
@@ -205,19 +309,49 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
                                    unique_in=unique_in))
               if carry_downstream else "")
 
+    # Whatever the annealing site stepped over has to be put back, or the
+    # amplicon is short by exactly that much and the junction it was
+    # designed for no longer exists. It goes on the tail, between the
+    # overlap and the binding region, which is where the polymerase will
+    # copy it from.
+    f_overlap, r_overlap = len(f_tail), len(r_tail)
+    if f_shift:
+        f_tail = f_tail + slice_region(template, start, start + f_shift,
+                                       circular_template)
+    if r_shift:
+        r_tail = r_tail + revcomp(slice_region(template, end - r_shift, end,
+                                               circular_template))
+
     fwd = Primer(
         name=f"{fragment_name}-F", sequence=f_tail + f_anneal, anneal=f_anneal,
-        tail=f_tail, direction="F", template=fragment_name,
+        tail=f_tail, shift_tail=f_tail[f_overlap:], direction="F",
+        template=fragment_name,
         target_start=start, target_end=end)
     rev = Primer(
         name=f"{fragment_name}-R", sequence=r_tail + r_anneal, anneal=r_anneal,
-        tail=r_tail, direction="R", template=fragment_name,
+        tail=r_tail, shift_tail=r_tail[r_overlap:], direction="R",
+        template=fragment_name,
         target_start=start, target_end=end)
 
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)
     rev.warnings = validate_primer(rev, template, cfg, circular_template)
 
-    for p, tail in ((fwd, f_tail), (rev, r_tail)):
+    # Say when the site was moved. A primer that sits 9 bases inside the
+    # fragment rather than at its edge is a deliberate choice, and the
+    # person checking it against their own map should not have to work
+    # out why the numbers do not line up with the junction.
+    for p, moved in ((fwd, f_shift), (rev, r_shift)):
+        if moved:
+            p.warnings.append(
+                f"annealing site moved {moved} bp into the fragment to reach "
+                f"better bases; those {moved} bp are carried on the tail, so "
+                f"the product is unchanged")
+
+    # Only the homology arm is an overlap. The bases added to reach a
+    # better annealing site are template, not homology, and measuring
+    # their melting temperature as if they were a HiFi arm reported a
+    # 3 nt tail as -118 C.
+    for p, tail in ((fwd, f_tail[:f_overlap]), (rev, r_tail[:r_overlap])):
         if tail:
             t_ov = tm(tail, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
             if t_ov == t_ov and t_ov < cfg.overlap_tm_min:

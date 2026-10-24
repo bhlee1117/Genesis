@@ -685,6 +685,11 @@ var CODING_TYPES = {
   CDS: 1, p2A: 1, trafficking_motif: 1, tag: 1, linker: 1, IRES: 1
 };
 
+/* Only these have two ends of their own. A 2A peptide or a trafficking
+   motif belongs to somebody else's protein, so labelling it N and C
+   would claim there are more proteins on the map than there are. */
+var PROTEIN_END_TYPES = { CDS: 1 };
+
 function polar(cx, cy, r, f) {
   var a = -Math.PI / 2 + 2 * Math.PI * f;           /* 0 at twelve o'clock */
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
@@ -781,6 +786,22 @@ function circularMap(length, items, opts) {
       if (CODING_TYPES[typeOf(f)]) {
         g.appendChild(arrowHead(cx, cy, r, reverse ? from : to % 1,
                                 !reverse, colour));
+      }
+      /* Which end is the start of the protein and which is the end of it.
+         A reverse-strand coding sequence begins at the end that is drawn
+         second, so the labels follow the strand and not the drawing. */
+      if (PROTEIN_END_TYPES[typeOf(f)] && (to - from) > 0.035) {
+        var nAt = (reverse ? to : from) % 1;
+        var cAt = (reverse ? from : to) % 1;
+        [['N', nAt], ['C', cAt]].forEach(function (pair) {
+          var at = polar(cx, cy, r - 9, pair[1]);
+          var t = svg('text', {
+            x: at[0].toFixed(1), y: (at[1] + 2).toFixed(1),
+            'text-anchor': 'middle', class: 'circ-terminus', fill: colour
+          });
+          t.textContent = pair[0];
+          g.appendChild(t);
+        });
       }
       node.appendChild(g);
       placed.push({ mid: ((from + to) / 2) % 1, f: f, r: r, colour: colour });
@@ -1219,6 +1240,21 @@ function fetchParts(type, query, form) {
   return PART_CACHE[key];
 }
 
+var FAMILY_CACHE = {};
+
+/* One entry per protein rather than per annotation. A name search for
+   "CheRiff" returns the same molecule seventeen times and hides the
+   soma-targeted one behind an identical label. */
+function fetchFamilies(type, query) {
+  var key = type + '\u0000' + query.toLowerCase();
+  if (!FAMILY_CACHE[key]) {
+    FAMILY_CACHE[key] = api('/api/parts' + qs({
+      type: type, q: query, group: 'protein', limit: 14
+    })).catch(function (err) { delete FAMILY_CACHE[key]; throw err; });
+  }
+  return FAMILY_CACHE[key];
+}
+
 var SEGMENT_CACHE = {};
 
 function fetchSegments(partId) {
@@ -1286,10 +1322,15 @@ function partPicker(mod) {
       if (document.activeElement === input && input.value.trim()) search();
     }
   },
+    h('option', { value: 'protein' }, 'by protein'),
     h('option', { value: 'all' }, 'all forms'),
     h('option', { value: 'whole' }, 'whole only'),
     h('option', { value: 'split' }, 'pieces only'));
-  formSel.value = mod.form || 'all';
+  /* Grouping is the useful default for a coding sequence, where the same
+     protein is catalogued many times over; for everything else the plain
+     list is what people expect. */
+  formSel.value = mod.form || (mod.type === 'CDS' ? 'protein' : 'all');
+  mod.form = formSel.value;
 
   var items = [];      // rows currently shown; see rowFor() for the shape
   var active = -1;     // highlighted row, -1 for none
@@ -1343,9 +1384,23 @@ function partPicker(mod) {
   }
 
   /** Pin one row — a whole part, a fusion, or one segment of a fusion. */
+  /* Move the highlight, skipping family headings: they name a group, they
+     are not something to pin, so landing on one would be a dead stop. */
+  function step(from, delta) {
+    var n = items.length;
+    if (!n) return -1;
+    var at = from;
+    for (var k = 0; k < n; k++) {
+      at = ((at + delta) % n + n) % n;
+      if (items[at].kind !== 'head') return at;
+    }
+    return from;
+  }
+
   function choose(i) {
     var row = items[i];
     if (!row) return;
+    if (row.kind === 'head') return;   // a family heading names, it does not pin
     if (row.kind === 'back') { showParts(); return; }
     mod.name = row.name || '';
     mod.part_id = row.id;
@@ -1368,8 +1423,12 @@ function partPicker(mod) {
     items.forEach(function (r, i) {
       var el = h('div', {
         class: 'combo-item' + (r.kind === 'back' ? ' combo-back' : '') +
-               (r.kind === 'segment' ? ' combo-segment' : ''),
-        role: 'option', id: listId + '-' + i, 'aria-selected': 'false',
+               (r.kind === 'segment' ? ' combo-segment' : '') +
+               (r.kind === 'head' ? ' combo-head' : '') +
+               (r.kind === 'part' && r.source && r.source.decorations
+                  ? ' combo-variant' : ''),
+        role: r.kind === 'head' ? 'presentation' : 'option',
+        id: listId + '-' + i, 'aria-selected': 'false',
         // mousedown fires before blur, and preventDefault keeps focus in the
         // input, so the click always lands on a list that is still open.
         onmousedown: function (e) { e.preventDefault(); choose(i); },
@@ -1442,6 +1501,65 @@ function partPicker(mod) {
         ];
       }
     };
+  }
+
+  /** A heading row naming the protein a group of variants share. */
+  function familyHead(fam) {
+    return {
+      kind: 'head', id: null, name: fam.core.name,
+      cells: function () {
+        return [
+          h('span', { class: 'fam-core' }, fam.core.name),
+          h('span', { class: 'fam-aa mono' }, fam.core.aa + ' aa'),
+          h('span', {
+            class: 'fam-count',
+            title: fam.n_rows + ' catalogued part(s) encode this protein, '
+              + 'across ' + fam.sources + ' plasmid occurrence(s)'
+          }, fam.n_variants + (fam.n_variants === 1 ? ' form' : ' forms'))
+        ];
+      }
+    };
+  }
+
+  /** One member of a family, named for what is fused to the core. */
+  function variantRow(fam, v) {
+    var alsoTitle = v.also && v.also.length
+      ? '\nalso catalogued as: ' + v.also.join(', ') : '';
+    return {
+      kind: 'part', id: v.part_id, name: fam.core.name, source: v,
+      note: v.label === 'plain' ? '' : v.label,
+      cells: function () {
+        return [
+          h('span', { class: 'var-label' + (v.is_core ? ' plain' : '') },
+            v.label === 'plain' ? fam.core.name : v.label),
+          v.n_rows > 1
+            ? h('span', {
+                class: 'var-rows',
+                title: v.n_rows + ' catalogued rows are this same protein, '
+                  + 'differing only in where the annotation starts or ends'
+                  + alsoTitle
+              }, '×' + v.n_rows)
+            : null,
+          h('span', { class: 'combo-len mono' }, bp(v.bp)),
+          sourcesCell(v.n_sources)
+        ];
+      }
+    };
+  }
+
+  function drawFamilies(groups, query) {
+    items = [];
+    groups.forEach(function (fam) {
+      items.push(familyHead(fam));
+      fam.variants.forEach(function (v) { items.push(variantRow(fam, v)); });
+    });
+    active = -1;
+    if (!items.length) {
+      show(h('div', { class: 'combo-empty muted' },
+        'No protein matching “' + query + '”'));
+      return;
+    }
+    paintList();
   }
 
   function showParts() {
@@ -1521,6 +1639,18 @@ function partPicker(mod) {
     var form = mod.form || 'all';
     view = 'parts';
     segmentsOf = null;
+    if (form === 'protein' && type === 'CDS') {
+      fetchFamilies(type, query).then(function (data) {
+        if (mine !== reqId || type !== mod.type) return;
+        drawFamilies((data && data.groups) || [], query);
+      }).catch(function (err) {
+        if (mine !== reqId) return;
+        items = [];
+        show(h('div', { class: 'combo-empty inline-warn' },
+          'search failed: ' + err.message));
+      });
+      return;
+    }
     fetchParts(type, query, form).then(function (rows) {
       // Ignore a slow response that a later keystroke or type change replaced.
       if (mine !== reqId || type !== mod.type) return;
@@ -1557,11 +1687,11 @@ function partPicker(mod) {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       if (list.hidden) { search(); return; }
-      if (items.length) { active = (active + 1) % items.length; paint(); }
+      if (items.length) { active = step(active, 1); paint(); }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       if (list.hidden || !items.length) return;
-      active = (active <= 0 ? items.length : active) - 1;
+      active = step(active, -1);
       paint();
     } else if (e.key === 'ArrowRight') {
       // Only hijack → when the caret is already at the end of the text, so

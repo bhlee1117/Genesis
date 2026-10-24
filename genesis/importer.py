@@ -317,6 +317,25 @@ def extract_parts(conn: sqlite3.Connection, plasmid_id: int, rec: Record,
     return created
 
 
+def segment_name(conn: sqlite3.Connection, parent: str, seq: str,
+                 index: int, total: int) -> str:
+    """What to call one piece of a fused coding sequence.
+
+    Naming it after the whole fusion and its position - "LR-Voltron2-LR-
+    CheRiff_eYFP [2 of 3]" - says where the piece sits and nothing about
+    what it is, which is no use to somebody deciding what to amplify. Ask
+    the protein first and keep the provenance after it.
+    """
+    from .swap import identify_segment
+
+    known = identify_segment(conn, seq)
+    if known and known.lower() != (parent or "").lower():
+        return f"{known} (piece {index} of {total} of {parent})"
+    # Nothing to add: either the protein is unrecognised, or it carries the
+    # same name as the fusion and repeating it tells nobody anything.
+    return f"{parent} [{index} of {total}]"
+
+
 def _store_segments(conn: sqlite3.Connection, plasmid_id: int, annotation: dict,
                     parent_seq: str, pieces: list[dict],
                     parent_id: int) -> int:
@@ -349,8 +368,8 @@ def _store_segments(conn: sqlite3.Connection, plasmid_id: int, annotation: dict,
                         seq_length, translated, confidence, derived_from,
                         segment_index, segment_of)
                    VALUES (?,?,?,?,?,1,?,?,?,?)""",
-                ("CDS",
-                 f"{annotation['name']} [{index} of {total}]",
+                ("CDS", segment_name(conn, annotation["name"], seq,
+                                      index, total),
                  seq, chk, len(seq), 0.8, parent_id, index, total))
             part_id = cur.lastrowid
             created += 1

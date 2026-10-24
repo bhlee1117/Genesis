@@ -30,6 +30,10 @@ TRANSLATED = {"CDS", "trafficking_motif", "linker", "p2A", "tag"}
 #: Elements a construct is *supposed* to carry more than one of. Two lox
 #: sites of each type are what makes a Cre-lox cassette work, and an AAV
 #: needs two ITRs, so finding them twice is confirmation, not a fault.
+#: Below this an element is too short for "it appears twice" to mean
+#: anything: a 6 bp Kozak occurs wherever those six bases fall.
+MIN_DISTINCT_ELEMENT = 20
+
 EXPECTED_REPEATS = {"lox_site", "AAV_ITR"}
 
 
@@ -117,7 +121,12 @@ def verify_design(construct, resolved_modules, circular: bool = True,
                 check.strand, check.start = -1, reverse[0]
             positions.append((check.start, rm.part_name))
 
+            # A short element recurs by arithmetic, not by accident: a six
+            # base Kozak turns up a dozen times in any plasmid and saying so
+            # is noise, not a finding. Only elements long enough to be
+            # distinctive are worth reporting as ambiguous.
             if (check.occurrences > 1
+                    and len(rm.seq or "") >= MIN_DISTINCT_ELEMENT
                     and rm.feature_type not in EXPECTED_REPEATS):
                 check.detail = (f"appears {check.occurrences} times; a "
                                 f"diagnostic digest or sequencing read cannot "

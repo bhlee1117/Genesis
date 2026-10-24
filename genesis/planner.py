@@ -190,15 +190,23 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
             current = None
             continue
 
+        # Which way along the template consecutive modules travel. It is
+        # not the source strand alone: a Cre-lox payload is placed
+        # inverted, so its modules run backwards through a donor that
+        # holds them the right way round, and testing only the source
+        # strand left P2A and EGFP - adjacent bases in one plasmid - as
+        # two reactions, one of them 66 bp long.
+        placed_strand = item.get("strand", 1)
+        forward = source["strand"] * placed_strand == 1
         can_extend = (
             current is not None
             and current.source_plasmid_id == source["id"]
             and current.strand == source["strand"]
-            and current.placed_strand == item.get("strand", 1)
+            and current.placed_strand == placed_strand
             and not current.needs_synthesis
             and (
-                (source["strand"] == 1 and source["start"] == current.end)
-                or (source["strand"] == -1 and source["end"] == current.start)
+                (forward and source["start"] == current.end)
+                or (not forward and source["end"] == current.start)
             )
             and (len(current.seq) + len(rm.seq)) <= cfg.max_pcr_length
         )
@@ -206,7 +214,7 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
             current.seq += rm.seq
             current.name += f"+{rm.part_name}"
             current.modules.append(item)
-            if source["strand"] == 1:
+            if forward:
                 current.end = source["end"]
             else:
                 current.start = source["start"]
@@ -1080,7 +1088,15 @@ def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
     """
     if not extra:
         return
-    fwd.tail = fwd.tail + extra
+    # The arc is template that sits UPSTREAM of this fragment, so it must
+    # come before the bases the annealing site stepped over - which are the
+    # first bases of the fragment itself. Appending it to the whole tail put
+    # the two the wrong way round and built a different molecule: every one
+    # of the six routes in a 28-construct sweep that used a carried arc on a
+    # shifted primer produced a product that was not the designed sequence.
+    shifted = fwd.shift_tail or ""
+    head = fwd.tail[:len(fwd.tail) - len(shifted)] if shifted else fwd.tail
+    fwd.tail = head + extra + shifted
     fwd.sequence = fwd.tail + fwd.anneal
     if len(fwd.sequence) > 100:
         route.warnings.append(
@@ -1110,7 +1126,13 @@ def _amplification_frame(template: str, start: int, end: int,
     treat the record as a fallback.
     """
     n = len(template)
-    flipped = (revcomp(template), n - end, n - start)
+    # Mapping a region onto the other strand is a subtraction, and on a
+    # region that wraps the origin - end past the last base, which is how
+    # a wrapped occurrence is recorded - the plain subtraction lands
+    # before position zero and the slice comes back empty or short.
+    # Reduce the far end into the sequence first, then measure from it.
+    low = (n - end) % n if n else 0
+    flipped = (revcomp(template), low, low + (end - start))
     if wanted:
         here = slice_region(template, start, end, circular=circular)
         if here == wanted:
@@ -1356,15 +1378,31 @@ def plan_swap_restriction_route(conn: sqlite3.Connection, analysis, cfg: Config,
     return route
 
 
+#: How far a cut may fall into the region being replaced. An enzyme cuts
+#: a base or two inside its site, and those bases are discarded with the
+#: rest of the region, so insisting the cut land exactly on the boundary
+#: rules out the enzymes that sit on it.
+SWAP_CUT_SLACK = 60
+
+
 def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
                        left_bound: int, right_bound: int, remove,
                        cfg: Config,
                        insert_must_lack_sites: bool = True) -> dict | None:
-    """Find two enzymes that cut only inside the region being replaced.
+    """Find two enzymes that cut at the boundaries of the region being replaced.
 
     Both cuts must lie between the conserved features either side, and
     neither enzyme may cut the incoming insert, or the piece would be
     chopped up in the same reaction.
+
+    The boundary is not a line, though. An enzyme's cut sits a base or
+    two inside its recognition site, so a site that begins exactly where
+    the region does cuts one base into it - and demanding that the cut
+    land before the region starts rejected BamHI at the very boundary of
+    a Voltron-2 cassette, which with EcoRI at the far end would have
+    dropped the whole thing out in one digest. The bases between the
+    boundary and the cut are being discarded anyway, so a cut is allowed
+    to fall a little way into the region.
     """
     names = [n for n in cfg.stocked_enzymes if n in CATALOG]
 
@@ -1385,9 +1423,9 @@ def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
             # as a PCR product joined by homology, the enzyme never touches
             # it and a site inside it is irrelevant.
             continue
-        if left_bound <= cut <= remove.start:
+        if left_bound <= cut <= remove.start + SWAP_CUT_SLACK:
             left_usable.append((n, cut))
-        elif remove.end <= cut <= right_bound:
+        elif remove.end - SWAP_CUT_SLACK <= cut <= right_bound:
             right_usable.append((n, cut))
 
     if not (left_usable and right_usable):
@@ -1398,11 +1436,27 @@ def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
         for b, cut_b in right_usable:
             lo, hi = sorted((cut_a, cut_b))
             dropout = hi - lo
-            if dropout < remove.length:
-                continue                 # must excise the whole region
+            if dropout < remove.length - 2 * SWAP_CUT_SLACK:
+                continue                 # must excise essentially the region
             if a != b and dropout < 50:
                 continue                 # ends too close to resolve on a gel
             warnings: list[str] = []
+            # Whatever the cuts leave behind of the old sequence, said out
+            # loud: it lands between the promoter and the new insert, or
+            # just after it, and the person at the bench should know it is
+            # there rather than discover it in the sequencing.
+            left_stub = max(0, lo - remove.start)
+            right_stub = max(0, remove.end - hi)
+            if left_stub:
+                warnings.append(
+                    f"the cut falls {left_stub} bp inside the region being "
+                    f"removed, so that much of the old sequence stays "
+                    f"upstream of the insert as a spacer")
+            if right_stub:
+                warnings.append(
+                    f"{right_stub} bp of the old sequence stays downstream "
+                    f"of the insert; it is after the stop codon, but check "
+                    f"it carries nothing you mind keeping")
             enz_a, enz_b = CATALOG[a], CATALOG[b]
             if a == b:
                 warnings.append(

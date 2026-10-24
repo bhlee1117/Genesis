@@ -204,6 +204,128 @@ def assemble_by_homology(fragments: list[SimulatedProduct]
 # --------------------------------------------------------------------------
 # Replaying a route
 # --------------------------------------------------------------------------
+# Restriction digestion and sticky-end ligation
+# --------------------------------------------------------------------------
+
+class CutFragment:
+    """One piece of a digest: a top strand and the overhang at each end.
+
+    The overhang is written 5' to 3' along whichever strand carries it, so
+    two ends anneal when one reads as the reverse complement of the other.
+    That one rule covers 5' overhangs, 3' overhangs and blunt ends alike.
+    """
+
+    __slots__ = ("seq", "left", "right")
+
+    def __init__(self, seq: str, left: str, right: str):
+        self.seq, self.left, self.right = seq, left, right
+
+    def flipped(self) -> "CutFragment":
+        """The same molecule the other way round.
+
+        Turning a fragment over does not change its overhangs - they are
+        the same single strands - it only swaps which end they are at.
+        """
+        return CutFragment(revcomp(self.seq), self.right, self.left)
+
+
+def _overhangs(seq: str, top: int, bottom: int) -> tuple[str, str]:
+    """(left end of the piece after the cut, right end of the piece before).
+
+    An enzyme leaves a 5' overhang when it cuts the bottom strand further
+    along than the top, and a 3' overhang when it is the other way about.
+    """
+    lo, hi = min(top, bottom), max(top, bottom)
+    single = seq[lo:hi]
+    if bottom > top:                       # 5' overhang
+        return single, revcomp(single)
+    if bottom < top:                       # 3' overhang
+        return revcomp(single), single
+    return "", ""                          # blunt
+
+
+def digest(seq: str, circular: bool, enzymes: list) -> list:
+    """Cut a molecule with the named enzymes and return the pieces."""
+    from .enzymes import CATALOG, find_sites
+
+    cuts = []
+    for name in enzymes:
+        enz = CATALOG.get(name)
+        if enz is None:
+            continue
+        for site in find_sites(seq, enz, circular):
+            cuts.append((site.top_cut % max(len(seq), 1), site.bottom_cut))
+    if not cuts:
+        return []
+    cuts.sort(key=lambda c: c[0])
+
+    pieces = []
+    if circular:
+        for i, (top, bottom) in enumerate(cuts):
+            nxt_top, nxt_bottom = cuts[(i + 1) % len(cuts)]
+            body = (seq[top:nxt_top] if nxt_top > top
+                    else seq[top:] + seq[:nxt_top])
+            left = _overhangs(seq, top, bottom)[0]
+            right = _overhangs(seq, nxt_top, nxt_bottom)[1]
+            pieces.append(CutFragment(body, left, right))
+    else:
+        bounds = [(0, 0)] + cuts + [(len(seq), len(seq))]
+        for i in range(len(bounds) - 1):
+            top, bottom = bounds[i]
+            nxt_top, nxt_bottom = bounds[i + 1]
+            body = seq[top:nxt_top]
+            if not body:
+                continue
+            left = _overhangs(seq, top, bottom)[0] if i else ""
+            right = (_overhangs(seq, nxt_top, nxt_bottom)[1]
+                     if i + 2 < len(bounds) else "")
+            pieces.append(CutFragment(body, left, right))
+    return pieces
+
+
+def _joins(left: CutFragment, right: CutFragment) -> bool:
+    """Whether these two ends anneal. Blunt ends never count here.
+
+    A blunt ligation closes on anything, which would let the simulation
+    agree with a plan that cannot actually be directional, so only
+    matching sticky ends are accepted.
+    """
+    return bool(left.right) and left.right == revcomp(right.left)
+
+
+def ligate(pieces: list) -> tuple:
+    """Join pieces on complementary overhangs into one circle.
+
+    Returns (sequence, note). The sequence is None when they do not close,
+    which is the answer a directional cloning is supposed to give when the
+    ends do not match.
+    """
+    if not pieces:
+        return None, "nothing to ligate"
+    chain = [pieces[0]]
+    rest = list(pieces[1:])
+    while rest:
+        for i, candidate in enumerate(rest):
+            for oriented in (candidate, candidate.flipped()):
+                if _joins(chain[-1], oriented):
+                    chain.append(oriented)
+                    rest.pop(i)
+                    break
+            else:
+                continue
+            break
+        else:
+            return None, ("the cut ends do not match: "
+                          f"{len(rest)} piece(s) have no compatible overhang")
+    if not _joins(chain[-1], chain[0]):
+        return None, ("the ends of the ligated chain do not match each "
+                      "other, so it stays linear")
+    return "".join(piece.seq for piece in chain), (
+        f"{len(chain)} piece(s) ligated on "
+        + " + ".join(sorted({p.right for p in chain if p.right})) + " ends")
+
+
+# --------------------------------------------------------------------------
 
 def _plasmid(conn: sqlite3.Connection, pid: int | None):
     if pid is None:
@@ -363,8 +485,19 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
 
     result.products = products
 
-    if any(op in ("HI_FI_ASSEMBLY", "GIBSON_ASSEMBLY", "LIGATION")
-           for op in operations):
+    if "RE_DIGEST" in operations:
+        # Sticky ends, not homology. Checking this route for shared end
+        # sequence asks it a question it was never going to answer.
+        product, notes = _simulate_digest_ligation(route, templates, products)
+        for n in notes:
+            result.steps.append({"operation": "DIGEST", "note": n})
+        if product is None:
+            result.passed = False
+            result.problems.extend(notes[-1:] or ["the ligation does not close"])
+            result.summary = "the cut fragments do not ligate"
+            return result
+    elif any(op in ("HI_FI_ASSEMBLY", "GIBSON_ASSEMBLY", "LIGATION")
+             for op in operations):
         product, notes = assemble_by_homology(products)
         for n in notes:
             result.steps.append({"operation": "ASSEMBLY", "note": n})
@@ -398,12 +531,237 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
             src["at_start"] = (at - offset) % len(product)
             src["at_end"] = (src["at_start"] + len(body)) % len(product)
 
-    _check_contents(result, product, plan, conn)
+    _check_contents(result, product, plan, conn, templates)
     return result
 
 
+#: Feature types whose presence defines what a construct *is*, as opposed
+#: to what carries it. A recipient legitimately supplies the vector parts -
+#: WPRE, polyA, ITRs, origin, resistance - without any of them being named
+#: in the request, so only these are leftovers worth failing over.
+LEFTOVER_TYPES = {"CDS"}
+
+#: Below this a match is not worth reporting: a 12 bp Factor Xa site turns
+#: up everywhere and says nothing about whether the payload was replaced.
+LEFTOVER_MIN_BP = 150
+
+
+def _check_leftovers(result: "SimulationResult", product: str, plan: dict,
+                     conn: sqlite3.Connection | None = None,
+                     templates: dict | None = None) -> None:
+    """Fail when the product still carries what it was meant to replace.
+
+    Checking that every requested part is present says nothing about what
+    else came along. A swap that removes too little leaves the old payload
+    in the plasmid, and every presence check still passes: the promoter is
+    there, the new coding sequence is there, and so is the indicator the
+    whole point was to get rid of.
+
+    That is not a cosmetic difference. It produced a plan whose steps
+    build pAAV-CAG-<new CDS>-Voltron2-Ace2N-HaloTag and reported it as
+    "2 of 2 requested parts present", with the 1,601 bp of leftover
+    payload explained away as the design "being built differently".
+    """
+    if conn is None or not product:
+        return
+    # Ask of every plasmid this route actually amplifies from, not of
+    # whichever one the plan calls the backbone: a swap edits the
+    # recipient while the generic planner names a different vector, and
+    # checking the wrong one of the two finds nothing.
+    parents: dict[int, str] = {}
+    for entry in (templates or {}).values():
+        try:
+            _seq, _circ, pname, ppid = entry
+        except (TypeError, ValueError):
+            continue
+        if ppid:
+            parents[ppid] = pname
+    for key in ("backbone",):
+        info = (plan.get(key) or {})
+        if info.get("id"):
+            parents.setdefault(info["id"], info.get("name") or "")
+    swap_recipient = ((plan.get("swap") or {}).get("recipient") or {})
+    if swap_recipient.get("id"):
+        parents.setdefault(swap_recipient["id"],
+                           swap_recipient.get("name") or "")
+    if not parents:
+        return
+    doubled = (product + product).upper()
+
+    # Anything the design itself contains is wanted, whatever the parent
+    # happens to call it. A recipient annotated "CheRiff_eGFP" spans two
+    # parts that a CheRiff-P2A-EGFP design asks for separately, and testing
+    # only module by module reported that annotation as old payload left
+    # behind - failing a route whose product was the designed molecule.
+    designed = ((plan.get("construct") or {}).get("sequence") or "").upper()
+
+    # What the construct says it is made of. A recipient's own copy of a
+    # part that was asked for is not a leftover.
+    wanted = []
+    for m in plan.get("modules") or []:
+        seq = (m.get("seq") or "").upper()
+        if not seq and m.get("part_id"):
+            got = conn.execute("SELECT seq FROM part WHERE id = ?",
+                               (m["part_id"],)).fetchone()
+            seq = (got["seq"] or "").upper() if got else ""
+        if seq:
+            wanted.append(seq)
+
+    marks = ",".join("?" * len(LEFTOVER_TYPES))
+    left: list[str] = []
+    blame = ""
+    for ppid, pname in parents.items():
+        prow = conn.execute("SELECT seq FROM plasmid WHERE id = ?",
+                            (ppid,)).fetchone()
+        if prow is None or not prow["seq"]:
+            continue
+        host = prow["seq"].upper()
+        for a in conn.execute(
+                f"""SELECT name, start, end FROM annotation
+                    WHERE plasmid_id = ? AND feature_type IN ({marks})
+                      AND (end - start) >= ?
+                    ORDER BY (end - start) DESC""",
+                (ppid, *sorted(LEFTOVER_TYPES), LEFTOVER_MIN_BP)):
+            seg = host[a["start"]:a["end"]]
+            if len(seg) < LEFTOVER_MIN_BP:
+                continue
+            if sequence_coverage(seg, doubled) < PRESENT_COVERAGE:
+                continue                  # removed, as intended
+            if designed and sequence_coverage(seg, designed) >= PRESENT_COVERAGE:
+                continue                  # the design asks for these bases
+            if any(sequence_coverage(seg, w) >= PRESENT_COVERAGE
+                   for w in wanted):
+                continue                  # it is one of the parts asked for
+            name = a["name"] or "an unnamed coding sequence"
+            if name not in left:
+                left.append(name)
+                blame = blame or pname
+
+    if not left:
+        return
+    result.passed = False
+    listed = ", ".join(left[:4]) + (", ..." if len(left) > 4 else "")
+    result.problems.append(
+        f"the product still carries {listed} from {blame or 'the recipient'}, "
+        f"which this design does not ask for: the region removed was too "
+        f"small, so the new coding sequence goes in beside the old payload "
+        f"instead of replacing it")
+
+
+def _simulate_digest_ligation(route: dict, templates: dict,
+                              products: list) -> tuple:
+    """Work out what a digest-and-ligate route actually produces.
+
+    This had never been simulated. The simulator amplified whatever the
+    route's primers described and then looked for 15 bp of shared end
+    sequence, which a sticky-end ligation does not have and never will,
+    so every restriction route was reported as "the fragments do not
+    assemble" whatever its enzymes were. The cheapest route on the page
+    was being thrown away by a check that did not apply to it.
+
+    The bands to carry forward are the ones the route itself says to cut
+    out of the gel, so the simulation follows the protocol rather than
+    guessing which piece somebody meant.
+    """
+    from .enzymes import CATALOG
+
+    enzymes: list = []
+    for step in route.get("steps") or []:
+        if step.get("operation") != "RE_DIGEST":
+            continue
+        named = (step.get("details") or {}).get("enzymes") or []
+        if not named:
+            # Not every route records them; read them off its own wording.
+            text = str(step.get("description") or "") + " " + \
+                " ".join(str(i) for i in (step.get("inputs") or []))
+            named = [n for n in CATALOG if n in text]
+        for name in named:
+            if name not in enzymes:
+                enzymes.append(name)
+    if not enzymes:
+        return None, ["the route names no enzymes to digest with"]
+
+    wanted = [int(sz) for sz in (
+        (step.get("details") or {}).get("size")
+        for step in route.get("steps") or []
+        if step.get("operation") == "GEL_EXTRACTION") if sz]
+
+    def choose(pieces: list, note: str) -> list:
+        """The band the protocol says to keep, or the biggest if it is silent."""
+        for size in wanted:
+            for piece in pieces:
+                if abs(len(piece.seq) - size) <= 4:
+                    return [piece]
+        return [max(pieces, key=lambda f: len(f.seq))] if pieces else []
+
+    notes: list[str] = []
+    pieces: list = []
+
+    # The vector: whichever named plasmid this route cuts.
+    cut_names = {str(i) for step in route.get("steps") or []
+                 if step.get("operation") == "RE_DIGEST"
+                 for i in (step.get("inputs") or [])}
+    for name in cut_names:
+        entry = templates.get(name)
+        if entry is None:
+            continue
+        seq, circular, real_name, _tid = entry
+        cut = digest(seq, circular, enzymes)
+        if len(cut) < 2:
+            notes.append(f"{', '.join(enzymes)} do not cut {real_name} twice, "
+                         f"so nothing drops out of it")
+            return None, notes
+        keep = choose(cut, real_name)
+        notes.append(f"{real_name} cut into "
+                     + ", ".join(f"{len(f.seq):,} bp" for f in cut)
+                     + f"; kept {len(keep[0].seq):,} bp")
+        pieces += keep
+        break
+
+    # The insert. A route may cut it too, or may give it homology arms and
+    # join it to the cut vector with HiFi - the hybrid route does exactly
+    # that - so an amplicon without sites is not a failure there.
+    by_homology = any(step.get("operation") in ("HI_FI_ASSEMBLY",
+                                                "GIBSON_ASSEMBLY")
+                      for step in route.get("steps") or [])
+    homology_pieces = []
+    for product in products:
+        cut = digest(product.seq, False, enzymes)
+        inner = [f for f in cut if f.left and f.right]
+        if not inner:
+            if by_homology:
+                homology_pieces.append(product)
+                notes.append(
+                    f"the {len(product.seq):,} bp {product.name} amplicon "
+                    f"carries no site for {', '.join(enzymes)}; it joins the "
+                    f"cut vector by homology instead")
+                continue
+            notes.append(f"{', '.join(enzymes)} do not cut the "
+                         f"{len(product.seq):,} bp {product.name} amplicon, "
+                         f"so it cannot be ligated directionally")
+            return None, notes
+        keep = choose(inner, product.name)
+        notes.append(f"{product.name} amplicon cut to {len(keep[0].seq):,} bp")
+        pieces += keep
+
+    if homology_pieces:
+        # The cut vector is now just another linear fragment with ends.
+        joined, more = assemble_by_homology(
+            [SimulatedProduct(f"cut vector", piece.seq, "digested")
+             for piece in pieces] + homology_pieces)
+        return joined, notes + list(more)
+
+    if len(pieces) < 2:
+        return None, notes + ["only one piece to ligate"]
+
+    joined, why = ligate(pieces)
+    notes.append(why)
+    return joined, notes
+
+
 def _check_contents(result: SimulationResult, product: str, plan: dict,
-                    conn: sqlite3.Connection | None = None) -> None:
+                    conn: sqlite3.Connection | None = None,
+                    templates: dict | None = None) -> None:
     """Confirm every requested part is in the molecule the steps produce."""
     doubled = (product + product).upper()
     missing = []
@@ -454,13 +812,13 @@ def _check_contents(result: SimulationResult, product: str, plan: dict,
                 "the product is the same length as the designed construct "
                 "but not the same sequence; compare them before building")
 
+    _check_leftovers(result, product, plan, conn, templates)
+
     stated = (plan.get("construct") or {}).get("length")
     if stated and stated != len(product):
         result.warnings.append(
             f"the plan prints a {stated:,} bp construct while its steps "
-            f"produce {len(product):,} bp; the parts are all there, so this "
-            f"is the two being built differently rather than anything "
-            f"missing")
+            f"produce {len(product):,} bp")
 
     present = sum(1 for m in result.modules if m["present"])
     result.summary = (

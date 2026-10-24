@@ -115,6 +115,17 @@ CREATE TABLE IF NOT EXISTS part (
 CREATE INDEX IF NOT EXISTS idx_part_type ON part(feature_type);
 CREATE INDEX IF NOT EXISTS idx_part_name ON part(name);
 
+CREATE TABLE IF NOT EXISTS part_alias (
+    id         INTEGER PRIMARY KEY,
+    part_id    INTEGER NOT NULL REFERENCES part(id) ON DELETE CASCADE,
+    alias      TEXT NOT NULL,
+    source     TEXT,              -- folder | plasmid | label | user
+    authoritative INTEGER DEFAULT 0,
+    note       TEXT,
+    UNIQUE(part_id, alias)
+);
+CREATE INDEX IF NOT EXISTS idx_part_alias_name ON part_alias(alias COLLATE NOCASE);
+
 CREATE TABLE IF NOT EXISTS part_occurrence (
     id         INTEGER PRIMARY KEY,
     part_id    INTEGER NOT NULL REFERENCES part(id) ON DELETE CASCADE,
@@ -205,7 +216,21 @@ _ADDED_COLUMNS = (
 )
 
 
+#: Tables added after the first release. `_ADDED_COLUMNS` only ever widens
+#: an existing table, so a genuinely new one needs saying here or an
+#: already-populated database never gets it.
+_ADDED_TABLES = ("part_alias",)
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
+    have = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if any(t not in have for t in _ADDED_TABLES):
+        # The script is written with IF NOT EXISTS throughout, so running it
+        # again only fills in what is missing.
+        conn.executescript(SCHEMA)
+        conn.commit()
+
     for table, column, decl in _ADDED_COLUMNS:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:

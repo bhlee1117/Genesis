@@ -182,6 +182,13 @@ class PDF:
             f"q {rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} RG {width} w {d}"
             f"{x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S Q")
 
+    def fill_tri(self, p1, p2, p3, rgb=(0.2, 0.2, 0.2)):
+        """A solid triangle at any orientation, from three points."""
+        self.pages[-1].ops.append(
+            f"q {rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} rg "
+            f"{p1[0]:.2f} {p1[1]:.2f} m {p2[0]:.2f} {p2[1]:.2f} l "
+            f"{p3[0]:.2f} {p3[1]:.2f} l f Q")
+
     def tri(self, x, y, size=4, rgb=(0.8, 0.1, 0.1), up=True):
         """A small solid triangle, used as a cut or insert marker."""
         dy = size if up else -size
@@ -436,6 +443,7 @@ FEATURE_COLOURS = {
     "CDS": (0.20, 0.40, 0.70), "trafficking_motif": (0.48, 0.35, 0.68),
     "p2A": (0.85, 0.55, 0.15), "IRES": (0.80, 0.60, 0.25),
     "linker": (0.55, 0.55, 0.58), "tag": (0.30, 0.60, 0.65),
+    "Kozak": (0.20, 0.62, 0.52),
     "polyA": (0.40, 0.45, 0.70), "WPRE": (0.35, 0.50, 0.55),
     "lox_site": (0.78, 0.22, 0.28), "DIO": (0.70, 0.30, 0.45),
     "AAV_ITR": (0.45, 0.45, 0.45), "origin": (0.60, 0.60, 0.62),
@@ -520,8 +528,21 @@ def plasmid_track(doc: "PDF", title: str, subtitle: str, length: int,
         if f.get("strand") == -1:
             # a small notch on the left shows the feature reads right to left
             doc.tri(fx + 3, track_y + height / 2 - 2.5, 2.5, (1, 1, 1), up=True)
+        # The ends of the protein, named. On a linear track the left edge
+        # is the amino end only when the feature reads forwards; a reverse
+        # strand coding sequence starts at its right edge.
+        ends_fit = fw >= 16 and f["feature_type"] in _PROTEIN_ENDS
+        if ends_fit:
+            reverse = f.get("strand", 1) == -1
+            n_x = fx + fw - 4 if reverse else fx + 4
+            c_x = fx + 4 if reverse else fx + fw - 4
+            for text, tx in (("N", n_x), ("C", c_x)):
+                doc.text_at(text, tx, track_y + height / 2 - 2.3, "F2", 5.6,
+                            rgb=(1, 1, 1), centre=True)
+
         label = f["name"] or f["feature_type"]
-        if text_width(label, "F2", 6.6) + 6 <= fw:
+        room = fw - (18 if ends_fit else 0)
+        if text_width(label, "F2", 6.6) + 6 <= room:
             doc.text_at(label, fx + fw / 2, track_y + height / 2 - 2.3, "F2",
                         6.6, rgb=(1, 1, 1), centre=True)
         else:
@@ -606,11 +627,63 @@ def _arc_path(doc, cx, cy, radius, start_f, end_f, width, rgb):
         f"{path} S Q")
 
 
+#: Feature types whose two ends are the ends of a protein. A 2A peptide
+#: or a trafficking motif is part of somebody else's protein, so giving it
+#: its own N and C would say there are more proteins here than there are.
+_PROTEIN_ENDS = {"CDS"}
+
+#: Below this an annotation is too narrow to carry two labels without
+#: them sitting on top of each other.
+_ENDS_MIN_SPAN = 0.035
+
+
+def _terminus_ends(f: dict) -> tuple:
+    """(where the N-terminus is, where the C-terminus is), as fractions.
+
+    Translation starts at the low coordinate of a forward feature and at
+    the high coordinate of a reverse one, so which physical end is the
+    amino terminus depends on the strand and not on the drawing.
+    """
+    start_f, end_f = f["_start_f"], f["_end_f"]
+    if f.get("strand", 1) == -1:
+        return end_f, start_f
+    return start_f, end_f
+
+
+def _arrow_head(doc, cx, cy, radius, fraction, strand, rgb):
+    """A chevron on a feature arc, pointing the way it is translated.
+
+    A coding sequence on a plasmid map is a block, and a block says
+    nothing about which way the ribosome reads it. On a circular map that
+    matters more than on a linear one, because an inverted payload - a
+    Cre-lox cassette, say - looks exactly like an upright one.
+    """
+    step = 0.0085 * (1 if strand == 1 else -1)
+    tip = _polar(cx, cy, radius, fraction + step)
+    out = _polar(cx, cy, radius + 5.2, fraction)
+    inn = _polar(cx, cy, radius - 5.2, fraction)
+    doc.fill_tri(tip, out, inn, rgb)
+
+
+#: What each codon mark is called on the map.
+CODON_GLYPH = {
+    "start": "ATG",
+    "stop": "stop",
+    "premature_stop": "early stop",
+    "missing_start": "no ATG",
+    "missing_stop": "no stop",
+}
+
+#: Feature types that are read by a ribosome, and so get a direction.
+_TRANSLATED = {"CDS", "p2A", "tag", "trafficking_motif", "linker"}
+
+
 def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
                  features: list, radius: float = 108,
                  codon_marks: list | None = None,
                  highlight: dict | None = None,
-                 highlight_kind: str = "cut"):
+                 highlight_kind: str = "cut",
+                 primer_marks: list | None = None):
     """Draw a plasmid the way a plasmid is drawn: as a circle.
 
     A linear track is fine for comparing two parents side by side, but it
@@ -650,9 +723,25 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
             start_f, end_f = 0.0, 1.0
         inner = f.get("strand", 1) == -1
         r = radius - (9 if inner else 0)
-        _arc_path(doc, cx, cy, r, start_f, end_f, 7.5,
-                  _feature_rgb(f["feature_type"]))
-        mid = start_f + (((end_f - start_f) % 1.0) or 1.0) / 2
+        rgb_f = _feature_rgb(f["feature_type"])
+        _arc_path(doc, cx, cy, r, start_f, end_f, 7.5, rgb_f)
+        span_f = ((end_f - start_f) % 1.0) or 1.0
+        # Which way it is read, drawn on the arc itself.
+        if f["feature_type"] in _TRANSLATED and span_f > 0.015:
+            strand = f.get("strand", 1)
+            at = (end_f if strand == 1 else start_f) % 1.0
+            _arrow_head(doc, cx, cy, r, at, strand, rgb_f)
+        # Which end of the block is the start of the protein and which is
+        # the end of it. On a circle the two look alike, and on a reverse
+        # strand feature the answer is the opposite of the way it is drawn.
+        if f["feature_type"] in _PROTEIN_ENDS and span_f > _ENDS_MIN_SPAN:
+            f["_start_f"], f["_end_f"] = start_f, end_f
+            n_at, c_at = _terminus_ends(f)
+            for label, where in (("N", n_at), ("C", c_at)):
+                lx, ly = _polar(cx, cy, r - 8.5, where % 1.0)
+                doc.text_at(label, lx, ly - 1.8, "F2", 5.4, rgb=rgb_f,
+                            centre=True)
+        mid = start_f + span_f / 2
         labelled.append((mid % 1.0, f, r))
 
     # labels outside the circle, nudged apart so they stay readable
@@ -695,16 +784,67 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
             caption += f" ({highlight['label'][:28]})"
         doc.text_at(caption, cx, cy - 24, "F2", 7.5, rgb=rgb, centre=True)
 
+    shown = []
+    placed: list = []
     for mark in codon_marks or []:
         mf = (mark["start"] % length) / length
         rgb = CODON_COLOURS.get(mark["kind"], (0.4, 0.4, 0.4))
         x1, y1 = _polar(cx, cy, radius - 14, mf)
         x2, y2 = _polar(cx, cy, radius + 3, mf)
         doc.line(x1, y1, x2, y2, rgb=rgb, width=1.0)
+        # Name it. An unlabelled tick on a ring is not information.
+        glyph = CODON_GLYPH.get(mark["kind"], "")
+        if glyph:
+            # Two codon marks a few bases apart land on the same spot and
+            # overprint each other, which is how "no stop" and "no ATG"
+            # came out as one unreadable word. Step the label inwards
+            # until it has room.
+            depth = 20
+            while any(abs(mf - prev) * length < 260 and abs(depth - d) < 9
+                      for prev, d in placed):
+                depth += 9
+            placed.append((mf, depth))
+            gx, gy = _polar(cx, cy, radius - depth, mf)
+            doc.text_at(glyph, gx, gy - 2, "F2", 5.6, rgb=rgb, centre=True)
+        shown.append(mark["kind"])
+
+    # Where the primers sit, drawn as arrows reading the way they extend.
+    for pm in primer_marks or []:
+        pf = (pm["start"] % length) / length
+        ef = (pm["end"] % length) / length
+        rgb = (0.55, 0.20, 0.60)
+        _arc_path(doc, cx, cy, radius + 13, min(pf, ef), max(pf, ef), 1.6, rgb)
+        _arrow_head(doc, cx, cy, radius + 13, ef,
+                    pm.get("strand", 1), rgb)
+        tx, ty = _polar(cx, cy, radius + 19, (pf + ef) / 2)
+        doc.text_at(str(pm.get("name", ""))[:18], tx, ty - 2, "F1", 5.6,
+                    rgb=rgb, centre=True)
 
     # Size only. A plasmid name runs off both sides of a circle this size
     # and overprints the ring; the heading above already carries it.
     doc.text_at(f"{length:,} bp", cx, cy + 2, "F2", 9, centre=True)
     doc.text_at("circular", cx, cy - 10, "F1", 7, rgb=(0.5, 0.5, 0.52),
                 centre=True)
+
+    key = []
+    if any(f["feature_type"] in _TRANSLATED for f in features):
+        key.append("arrowheads point the way each coding sequence is read")
+    if any(f["feature_type"] in _PROTEIN_ENDS for f in features):
+        key.append("N and C mark the amino and carboxy ends of each protein")
+    for kind in ("start", "stop", "premature_stop",
+                 "missing_start", "missing_stop"):
+        if kind in shown:
+            key.append(CODON_GLYPH[kind] + {
+                "start": " = start codon", "stop": " = stop codon",
+                "premature_stop": " = in-frame stop inside the fusion",
+                "missing_start": " = no start codon where one belongs",
+                "missing_stop": " = no stop codon where one belongs",
+            }[kind])
+    if primer_marks:
+        key.append("purple arcs are primers, pointing 5' to 3'")
+    if key:
+        doc.y -= 2
+        doc.text_at("; ".join(key), doc.ml, doc.y, "F1", 6.2,
+                    rgb=(0.45, 0.45, 0.48))
+        doc.y -= 8
     doc.y -= 6
