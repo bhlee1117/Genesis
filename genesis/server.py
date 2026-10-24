@@ -206,7 +206,19 @@ class Handler(BaseHTTPRequestHandler):
                  ".js": "application/javascript; charset=utf-8",
                  ".css": "text/css; charset=utf-8",
                  ".svg": "image/svg+xml"}.get(target.suffix, "application/octet-stream")
-        self._send(200, target.read_bytes(), ctype)
+        body = target.read_bytes()
+        # Revalidate every time. Nothing here was cache-busted, so a browser
+        # applying its own heuristic happily serves the app.js from before a
+        # deploy and the new feature simply is not there - which looks like a
+        # bug in the feature rather than a stale file. The files are tens of
+        # kilobytes over a LAN; a conditional request costs nothing.
+        stamp = str(int(target.stat().st_mtime))
+        tag = '"%s-%d"' % (stamp, len(body))
+        if self.headers.get("If-None-Match") == tag:
+            return self._send(304, b"", ctype, {"ETag": tag,
+                                                "Cache-Control": "no-cache"})
+        self._send(200, body, ctype,
+                   {"ETag": tag, "Cache-Control": "no-cache"})
 
     # -- GET endpoints ---------------------------------------------------
     def api_get(self, path: str, q: dict):
