@@ -73,6 +73,12 @@
 
   <!-- ================= DESIGN ================= -->
   <section class="panel" id="panel-design">
+    <!-- The design reads as a sequence of steps, so it is laid out as one.
+         Each step is a pane; only the current one is on screen, which is
+         what stops the page being a single column several screens long. -->
+    <nav class="steps" id="steps" aria-label="Design steps"></nav>
+
+    <div class="step-pane" id="step-spec">
     <div class="card builder">
       <div class="card-head">
         <h2>Construct specification</h2>
@@ -142,8 +148,17 @@
       </div>
       <p class="save-link muted small" id="save-link"></p>
     </div>
+    </div>
 
-    <div id="plan-out"></div>
+    <div class="step-pane" id="step-target" hidden></div>
+    <div class="step-pane" id="step-scan" hidden></div>
+    <div class="step-pane" id="step-parents" hidden></div>
+    <div class="step-pane" id="step-select" hidden></div>
+    <div class="step-pane" id="step-routes" hidden></div>
+    <div class="step-pane" id="step-scheme" hidden></div>
+
+    <!-- Kept for anything not yet filed under a step. -->
+    <div id="plan-out" hidden></div>
   </section>
 
   <!-- ================= DESIGNS ================= -->

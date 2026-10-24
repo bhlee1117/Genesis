@@ -1385,3 +1385,91 @@ tr.row-bad td {
   opacity: 0.75;
   background: var(--chip, rgba(255,255,255,0.08));
 }
+
+/* --- design steps ------------------------------------------------------ */
+/* The design is a sequence, so it reads as one: a numbered rail across the
+   top, one pane on screen at a time. The alternative was a single column
+   several screens tall, where finding the routes meant scrolling past the
+   whole construct. */
+.steps {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 0;
+  margin: 0 0 1rem;
+  padding: 0.25rem;
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 10px;
+  background: var(--panel, rgba(255, 255, 255, 0.02));
+}
+.steps .step {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.55rem 0.7rem;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  opacity: 0.72;
+}
+.steps .step:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); opacity: 1; }
+.steps .step.active {
+  background: var(--accent-soft, rgba(90, 150, 255, 0.16));
+  opacity: 1;
+  box-shadow: inset 0 0 0 1px var(--accent, #5a96ff);
+}
+.steps .step:disabled { cursor: default; opacity: 0.32; }
+/* The number carries the order, so the label does not have to. */
+.steps .step-n {
+  flex: 0 0 auto;
+  width: 1.35rem;
+  height: 1.35rem;
+  line-height: 1.35rem;
+  text-align: center;
+  border-radius: 50%;
+  font-size: 0.74rem;
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.1);
+}
+.steps .step.active .step-n { background: var(--accent, #5a96ff); color: #fff; }
+.steps .step-label { font-weight: 600; font-size: 0.9rem; white-space: nowrap; }
+.steps .step-hint {
+  font-size: 0.76rem;
+  opacity: 0.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.steps .step-sep {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 1px;
+  height: 1.4rem;
+  background: var(--line, #2a2f3a);
+}
+/* Below a tablet the hints are the first thing to go, then the rail wraps. */
+@media (max-width: 1100px) {
+  .steps .step-hint { display: none; }
+}
+@media (max-width: 720px) {
+  .steps .step { flex: 1 1 42%; }
+  .steps .step-sep { display: none; }
+}
+
+/* --- step 5: the choices in force -------------------------------------- */
+.sel-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--line, #2a2f3a);
+}
+.sel-row:last-child { border-bottom: 0; }
+.sel-what { flex: 0 0 11rem; opacity: 0.7; font-size: 0.88rem; }
+.sel-name { flex: 1 1 auto; font-weight: 600; }

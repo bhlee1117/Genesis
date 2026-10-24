@@ -2144,7 +2144,7 @@ function clearSpec() {
   state.saved = null;
   state.appliedSuggestion = null;
 
-  clear($('plan-out'));
+  resetSteps();
   renderModules();
   refreshSaveButtons();   // also clears the saved-design link
   setStatus($('design-status'), 'specification cleared');
@@ -2203,9 +2203,106 @@ async function scanSources() {
   }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Design steps                                                        */
+/* ------------------------------------------------------------------ */
+/* The design is a sequence - say what you want, see it, look for parts,
+   choose parents, pick a route, read the scheme - and it was laid out as
+   one column several screens tall. It is now one pane per step, so the
+   thing you are working on is the thing on screen. */
+
+var STEPS = [
+  { id: 'spec',    n: 1, label: 'Specification',
+    hint: 'what to build' },
+  { id: 'target',  n: 2, label: 'Target construct',
+    hint: 'the molecule asked for' },
+  { id: 'scan',    n: 3, label: 'Scan source',
+    hint: 'what the inventory has' },
+  { id: 'parents', n: 4, label: 'Candidate parents',
+    hint: 'what to start from' },
+  { id: 'select',  n: 5, label: 'Select',
+    hint: 'the choices in force' },
+  { id: 'routes',  n: 6, label: 'Routes',
+    hint: 'how to build it' },
+  { id: 'scheme',  n: 7, label: 'Cloning scheme',
+    hint: 'the plan at the bench' }
+];
+
+var stepState = { current: 'spec', ready: { spec: true } };
+
+function stepPane(id) { return $('step-' + id); }
+
+/** Mark a step as having something to show. */
+function stepReady(id, yes) {
+  stepState.ready[id] = yes !== false;
+  paintSteps();
+}
+
+function showStep(id) {
+  if (!stepState.ready[id]) return;
+  stepState.current = id;
+  STEPS.forEach(function (st) {
+    var pane = stepPane(st.id);
+    if (pane) pane.hidden = st.id !== id;
+  });
+  paintSteps();
+  var panel = $('panel-design');
+  if (panel && panel.scrollIntoView) {
+    panel.scrollIntoView({ block: 'start', behavior: 'auto' });
+  }
+}
+
+function paintSteps() {
+  var nav = $('steps');
+  if (!nav) return;
+  clear(nav);
+  STEPS.forEach(function (st, i) {
+    var ready = !!stepState.ready[st.id];
+    var active = stepState.current === st.id;
+    var btn = h('button', {
+      type: 'button',
+      class: 'step' + (active ? ' active' : '') + (ready ? '' : ' step-todo'),
+      disabled: ready ? null : 'disabled',
+      'aria-current': active ? 'step' : null,
+      title: ready ? st.hint : 'Not available yet — ' + st.hint,
+      onclick: function () { showStep(st.id); }
+    },
+      h('span', { class: 'step-n' }, String(st.n)),
+      h('span', { class: 'step-label' }, st.label),
+      h('span', { class: 'step-hint' }, st.hint));
+    nav.appendChild(btn);
+    if (i < STEPS.length - 1) {
+      nav.appendChild(h('span', { class: 'step-sep', 'aria-hidden': 'true' }, ''));
+    }
+  });
+}
+
+/** Put a built section into a step, and light the step up. */
+function fillStep(id, nodes) {
+  var pane = stepPane(id);
+  if (!pane) return false;
+  clear(pane);
+  var list = [].concat(nodes).filter(Boolean);
+  if (!list.length) { stepReady(id, false); return false; }
+  list.forEach(function (n) { pane.appendChild(n); });
+  stepReady(id, true);
+  return true;
+}
+
+/** Clear every step but the specification — a new run starts over. */
+function resetSteps() {
+  STEPS.forEach(function (st) {
+    if (st.id === 'spec') return;
+    var pane = stepPane(st.id);
+    if (pane) clear(pane);
+    stepState.ready[st.id] = false;
+  });
+  showStep('spec');
+}
+
 function renderScan() {
-  var out = $('plan-out');
-  clear(out);
+  resetSteps();
   var scan = state.scan;
   if (!scan) return;
 
@@ -2232,10 +2329,60 @@ function renderScan() {
       { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
     ], scan.modules));
   }
-  out.appendChild(card);
+  fillStep('scan', card);
 
   var cands = renderCandidates(scan);
-  if (cands) out.appendChild(cands);
+  fillStep('parents', cands);
+  fillStep('select', selectionSummary(scan));
+  showStep('scan');
+}
+
+/* ------------------------------------------------------------------ */
+/* Step 5: the choices currently in force                              */
+/* ------------------------------------------------------------------ */
+/* Candidate parents is a long list to read; this is the short answer to
+   "so what is it going to use?", which is the thing worth checking before
+   spending a protocol on it. */
+
+function selectionSummary(data) {
+  if (!data) return null;
+  var rows = [];
+  var scheme = data.scheme || {};
+  var rec = (scheme.recipient || {}).name || (data.backbone || {}).name;
+  if (rec) rows.push(['Backbone / recipient', rec, pinnedParents.recipient]);
+  var don = (scheme.donor || {}).name;
+  if (don) rows.push(['Donor', don, pinnedParents.donor]);
+
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', null, 'Selected parents')),
+    h('p', { class: 'muted small' },
+      'What the plan will use. A value marked ' +
+      '“pinned” was chosen by hand on the previous step; the rest were ' +
+      'picked by the ranking and can be overridden there.'));
+
+  if (!rows.length && !Object.keys(pinnedSources).length) {
+    card.appendChild(h('p', { class: 'muted' },
+      'Nothing chosen yet — the planner will pick for you.'));
+    return card;
+  }
+  rows.forEach(function (r) {
+    card.appendChild(h('div', { class: 'sel-row' },
+      h('span', { class: 'sel-what' }, r[0]),
+      h('span', { class: 'sel-name' }, r[1]),
+      r[2] ? h('span', { class: 'pill pill-ok' }, 'pinned') : null));
+  });
+
+  var pins = Object.keys(pinnedSources || {});
+  if (pins.length) {
+    card.appendChild(h('h4', null, 'Pinned part sources'));
+    pins.forEach(function (k) {
+      card.appendChild(h('div', { class: 'sel-row' },
+        h('span', { class: 'sel-what' }, 'part #' + k),
+        h('span', { class: 'sel-name' }, 'plasmid #' + pinnedSources[k]),
+        h('span', { class: 'pill pill-ok' }, 'pinned')));
+    });
+  }
+  return card;
 }
 
 async function generatePlan() {
@@ -2584,8 +2731,7 @@ function schemeCard(plan) {
 }
 
 function renderPlan() {
-  var out = $('plan-out');
-  clear(out);
+  resetSteps();
   var plan = state.plan;
   if (!plan) return;
 
@@ -2625,39 +2771,50 @@ function renderPlan() {
             ? h('span', { class: 'pill pill-warn' }, 'required') : 'no'; } }
     ], plan.fragments));
   }
-  out.appendChild(summary);
+  /* --- 2. the molecule that was asked for -------------------------- */
+  fillStep('target', [summary, renderConstruct(c),
+                      plan.vector ? renderVector(plan.vector, plan) : null]);
 
-  var cands = renderCandidates(plan);
-  if (cands) out.appendChild(cands);
+  /* --- 3 and 4. where the parts would come from -------------------- */
+  fillStep('scan', scanRecap(plan));
+  fillStep('parents', renderCandidates(plan));
+  fillStep('select', selectionSummary(plan));
 
-  var scheme = schemeCard(plan);
-  if (scheme) out.appendChild(scheme);
-
-  /* --- the designed molecule itself -------------------------------- */
-  out.appendChild(renderConstruct(c));
-
-  /* --- what the protocol actually makes ---------------------------- */
-  var simCard = renderSimulation(selectedRoute(), plan);
-  if (simCard) out.appendChild(simCard);
-
-  /* --- read-back verification -------------------------------------- */
-  if (plan.verification) out.appendChild(renderVerification(plan.verification));
-
-  /* --- vector family ----------------------------------------------- */
-  if (plan.vector) out.appendChild(renderVector(plan.vector, plan));
-
-  /* --- validation -------------------------------------------------- */
-  out.appendChild(renderValidation(plan.validation || {}));
-
-  /* --- routes ------------------------------------------------------ */
-  out.appendChild(renderRoutes(plan.routes || []));
-
-  /* --- selected route detail --------------------------------------- */
+  /* --- 6. how to build it ------------------------------------------ */
   var route = selectedRoute();
-  if (route) out.appendChild(renderRouteDetail(route));
+  fillStep('routes', [renderRoutes(plan.routes || []),
+                      route ? renderRouteDetail(route) : null]);
 
-  /* --- export ------------------------------------------------------ */
-  out.appendChild(renderExports());
+  /* --- 7. the plan at the bench, and whether it holds up ------------ */
+  fillStep('scheme', [schemeCard(plan),
+                      renderSimulation(route, plan),
+                      plan.verification
+                        ? renderVerification(plan.verification) : null,
+                      renderValidation(plan.validation || {}),
+                      renderExports()]);
+
+  /* Land on the routes: with a plan in hand that is the decision to
+     make, and every earlier step stays one click away. */
+  showStep(stepState.ready.routes ? 'routes' : 'target');
+}
+
+/** Step 3 once a plan exists: where each module resolved to. */
+function scanRecap(plan) {
+  if (!(plan.modules || []).length) return null;
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', null, 'Sources found'),
+      h('span', { class: 'muted small' },
+        plan.modules.length + ' module(s) resolved')));
+  card.appendChild(table([
+    { label: 'Type', cell: function (m) { return typeTag(m.type); } },
+    { label: 'Requested', key: 'requested' },
+    { label: 'Resolved part', key: 'part_name' },
+    { label: 'Length', numeric: true, cell: function (m) { return bp(m.length); } },
+    { label: 'Found in', numeric: true,
+      cell: function (m) { return (m.sources || []).length; } },
+    { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
+  ], plan.modules));
+  return card;
 }
 
 /* ------------------------------------------------------------------ */
@@ -3898,6 +4055,7 @@ function selectTab(name) {
 }
 
 async function init() {
+  paintSteps();
   document.querySelectorAll('#tabs .tab').forEach(function (btn) {
     btn.addEventListener('click', function () { selectTab(btn.dataset.tab); });
   });
