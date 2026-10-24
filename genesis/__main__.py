@@ -176,6 +176,105 @@ def cmd_name_segments(args, cfg: Config):
     return 0
 
 
+def cmd_alias_parts(args, cfg: Config):
+    """Teach parts the names their own plasmids and folders use for them.
+
+    A part is named from the annotation label inside the file, and labels
+    go stale: the CDS in BHL021_pAAV_ef1a_FLEX_ASAP6c is annotated
+    "ASAP4c 413G", and the same sequence in BHL020_..._DIO_ASAP6c_Kv is
+    annotated "ASAP6b (VR; 6.2)". Neither is findable as ASAP6c, which is
+    what the folder, the file and the person who made it all call it.
+
+    The folder name is the most reliable of the three, because it is what
+    the lab writes down deliberately.
+    """
+    from .orfs import name_from_plasmid
+    from .swap import version_token
+
+    conn = _conn(cfg, args.db)
+    rows = conn.execute(
+        """SELECT p.id, p.name,
+                  (SELECT rel_path FROM source_file f WHERE f.id = p.source_file_id)
+                    AS rel_path
+             FROM plasmid p""").fetchall()
+    added = conflicts = 0
+    for r in rows:
+        folder = ""
+        if r["rel_path"]:
+            parts = str(r["rel_path"]).split("/")
+            if len(parts) >= 2:
+                folder = parts[-2]
+        names = [n for n in (name_from_plasmid(folder),
+                             name_from_plasmid(r["name"])) if n]
+        if not names:
+            continue
+        # The payload: the longest CDS this plasmid carries.
+        payload = conn.execute(
+            """SELECT o.part_id, pt.name, pt.seq_length
+                 FROM part_occurrence o JOIN part pt ON pt.id = o.part_id
+                WHERE o.plasmid_id = ? AND pt.feature_type = 'CDS'
+                ORDER BY pt.seq_length DESC LIMIT 1""", (r["id"],)).fetchone()
+        if payload is None:
+            continue
+        for alias in dict.fromkeys(names):
+            if alias.lower() == (payload["name"] or "").lower():
+                continue
+            ta, tb = version_token(alias), version_token(payload["name"] or "")
+            clash = bool(ta and tb and ta[0] == tb[0] and ta[1] != tb[1])
+            note = (f"the part is labelled {payload['name']!r}; "
+                    f"{r['name']} calls it {alias!r}" if clash else None)
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO part_alias
+                           (part_id, alias, source, authoritative, note)
+                       VALUES (?,?,?,?,?)""",
+                    (payload["part_id"], alias,
+                     "folder" if alias == names[0] else "plasmid",
+                     0 if clash else 1, note))
+            except Exception:
+                continue
+            added += 1
+            if clash:
+                conflicts += 1
+                if conflicts <= 12 or args.verbose:
+                    print(f"  CONFLICT {payload['name'][:28]:30} <- {alias:14} "
+                          f"({r['name'][:34]})")
+    conn.commit()
+    print(f"\n{added} alias(es) recorded; {conflicts} disagree with the part's "
+          f"own label on a version number and are NOT used for search until "
+          f"confirmed (genesis alias-confirm)")
+    return 0
+
+
+def cmd_alias_confirm(args, cfg: Config):
+    """Accept a disputed alias as the part's real name."""
+    conn = _conn(cfg, args.db)
+    row = conn.execute(
+        """SELECT a.id, a.part_id, a.alias, a.note, p.name
+             FROM part_alias a JOIN part p ON p.id = a.part_id
+            WHERE a.alias = ? COLLATE NOCASE""", (args.alias,)).fetchone()
+    if row is None:
+        print(f"no part carries the alias {args.alias!r}")
+        return 1
+    conn.execute("UPDATE part_alias SET authoritative = 1 WHERE id = ?",
+                 (row["id"],))
+    if args.rename:
+        conn.execute("UPDATE part SET name = ? WHERE id = ?",
+                     (args.alias, row["part_id"]))
+        conn.execute(
+            """INSERT OR IGNORE INTO part_alias(part_id, alias, source,
+                   authoritative, note) VALUES (?,?,?,0,?)""",
+            (row["part_id"], row["name"], "label",
+             f"superseded label; the part is now {args.alias}"))
+        print(f"part {row['part_id']} renamed {row['name']!r} -> {args.alias!r}; "
+              f"the old label is kept as a non-searchable alias")
+    else:
+        print(f"{args.alias!r} is now searchable for part {row['part_id']} "
+              f"({row['name']})")
+    conn.commit()
+    return 0
+
+
 def cmd_addgene(args, cfg: Config):
     """Search Addgene for something the lab has not got.
 
@@ -504,6 +603,19 @@ def main(argv=None):
     s.add_argument("--disable", action="store_true")
     s.add_argument("--enable", action="store_true")
     s.set_defaults(fn=cmd_role)
+
+    s = sub.add_parser(
+        "alias-parts",
+        help="teach parts the names their folders and plasmids use")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(fn=cmd_alias_parts)
+
+    s = sub.add_parser(
+        "alias-confirm", help="accept a disputed alias as a part's real name")
+    s.add_argument("alias")
+    s.add_argument("--rename", action="store_true",
+                   help="also make it the part's primary name")
+    s.set_defaults(fn=cmd_alias_confirm)
 
     s = sub.add_parser(
         "name-segments",

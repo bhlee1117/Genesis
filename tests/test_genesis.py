@@ -5254,3 +5254,130 @@ class TestProteinEndsAreLabelled(unittest.TestCase):
                       for o in doc.pages[-1].ops)
         self.assertIn("(N)", ops)
         self.assertIn("(C)", ops)
+
+
+class TestSensorGenerationsAreNeverTheSamePart(unittest.TestCase):
+    """A number after a sensor name is a different molecule.
+
+    The lab's rule, stated plainly: the number is the version, a higher
+    one is a better model, and two versions are completely different
+    coding sequences however similar they look. Sequence cannot enforce
+    that - jGCaMP7f's 415 residues are an exact substring of GCaMP6f's
+    450, and QuasAr2 and QuasAr3 differ by a single residue, which is
+    exactly the distance an annotation boundary or a one-base error
+    produces. So the name decides.
+    """
+
+    def test_a_numbered_family_is_recognised(self):
+        from genesis.swap import version_token
+        self.assertEqual(version_token("GCaMP6f"), ("gcamp", "6f"))
+        self.assertEqual(version_token("QuasAr3"), ("quasar", "3"))
+        self.assertEqual(version_token("ASAP7y"), ("asap", "7y"))
+
+    def test_a_one_letter_prefix_does_not_make_a_new_family(self):
+        from genesis.swap import version_token
+        self.assertEqual(version_token("jGCaMP7f")[0], version_token("GCaMP6f")[0])
+        self.assertEqual(version_token("zArchon1")[0], version_token("Archon")[0])
+
+    def test_unnumbered_proteins_are_left_alone(self):
+        from genesis.swap import version_token, same_generation
+        self.assertIsNone(version_token("EGFP"))
+        self.assertIsNone(version_token("HaloTag"))
+        self.assertTrue(same_generation("EGFP", "GFP"))
+
+    def test_different_generations_are_not_the_same_generation(self):
+        from genesis.swap import same_generation
+        for a, b in (("GCaMP6s", "GCaMP6m"), ("QuasAr2", "QuasAr3"),
+                     ("ASAP1", "ASAP7y"), ("ASAP6c", "ASAP7y"),
+                     ("jGCaMP7f", "GCaMP6f")):
+            self.assertFalse(same_generation(a, b), f"{a} vs {b}")
+
+    def test_a_substring_of_a_later_generation_is_refused(self):
+        """The failure this exists to stop."""
+        from genesis.swap import interchangeable
+        later = orf(900, 501)
+        # An exact substring, long enough to pass the length gate - which is
+        # the shape of the real failure: jGCaMP7f's 415 residues sit inside
+        # GCaMP6f's 450.
+        earlier = later[:int(len(later) * 0.92)]
+        self.assertTrue(interchangeable(later, earlier, "CDS"))
+        self.assertFalse(interchangeable(later, earlier, "CDS",
+                                         "GCaMP6f", "jGCaMP7f"))
+
+    def test_one_residue_apart_is_refused(self):
+        from genesis.swap import interchangeable
+        a = orf(900, 502)
+        b = a[:30] + ("A" if a[30] != "A" else "T") + a[31:]
+        self.assertFalse(interchangeable(a, b, "CDS", "QuasAr2", "QuasAr3"))
+
+    def test_the_same_generation_still_merges(self):
+        from genesis.swap import interchangeable
+        cds = orf(900, 503)
+        self.assertTrue(interchangeable(cds, cds[3:], "CDS",
+                                        "ASAP7y", "ASAP7y"))
+
+    def test_an_identical_protein_is_one_molecule_whatever_the_number(self):
+        """Archon and zArchon1 are the same 253 aa protein."""
+        from genesis.swap import interchangeable
+        cds = orf(900, 504)
+        self.assertTrue(interchangeable(cds, cds, "CDS", "Archon", "zArchon1"))
+
+
+class TestPartAliasesFromFolderNames(unittest.TestCase):
+    """A part answers to the name its own folder uses for it.
+
+    The CDS in BHL021_pAAV_ef1a_FLEX_ASAP6c is annotated "ASAP4c 413G"
+    and the same sequence in BHL020_..._DIO_ASAP6c_Kv is annotated
+    "ASAP6b (VR; 6.2)". Neither is findable as ASAP6c, which is what the
+    folder, the file and the person who made it all call it.
+    """
+
+    def test_status_words_are_not_insert_names(self):
+        from genesis.orfs import name_from_plasmid
+        self.assertEqual(
+            (name_from_plasmid("paav-ef1a-flex-asap6c-wpre_estimated") or "").lower(),
+            "asap6c")
+        self.assertEqual(
+            (name_from_plasmid("paav-hsyn-dio-asap6c-kv-wpre_confirmed") or "").lower(),
+            "asap6c")
+
+    def test_a_folder_name_yields_the_insert(self):
+        from genesis.orfs import name_from_plasmid
+        self.assertEqual(name_from_plasmid("BHL021_pAAV_ef1a_FLEX_ASAP6c"),
+                         "ASAP6c")
+
+    def test_the_alias_table_exists_on_an_old_database(self):
+        """A new table needs migrating, not just declaring."""
+        conn = connect(":memory:")
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("part_alias", names)
+        conn.close()
+
+    def test_only_an_authoritative_alias_is_searchable(self):
+        from genesis.construct import candidate_parts, Module
+        conn = connect(":memory:")
+        cds = orf(900, 511)
+        pid = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','ASAP4c 413G',?,'x',?)""",
+            (cds, len(cds))).lastrowid
+        conn.execute(
+            """INSERT INTO part_alias(part_id, alias, source, authoritative)
+               VALUES (?,?,'folder',0)""", (pid, "ASAP6c"))
+        conn.commit()
+        self.assertEqual(candidate_parts(conn, Module(type="CDS", name="ASAP6c")),
+                         [], "a disputed alias must not answer a search")
+        conn.execute("UPDATE part_alias SET authoritative = 1")
+        conn.commit()
+        found = candidate_parts(conn, Module(type="CDS", name="ASAP6c"))
+        self.assertEqual([f["id"] for f in found], [pid])
+        conn.close()
+
+
+class TestShortElementsAreNotAmbiguousRepeats(unittest.TestCase):
+    """Six bases recur by arithmetic, not by accident."""
+
+    def test_a_kozak_is_not_reported_as_an_ambiguous_repeat(self):
+        from genesis.verify import MIN_DISTINCT_ELEMENT
+        self.assertGreater(MIN_DISTINCT_ELEMENT, 6)

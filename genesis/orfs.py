@@ -85,6 +85,11 @@ _NAME_NOISE = {
     "version", "ver", "draft", "assembly", "assembled", "map", "full",
     "sequence", "sequencing", "tbd", "fdio", "fdo", "con", "coff", "goal",
     "contig", "colony", "stats", "result", "results", "unknown", "none",
+    # Status words a lab puts on the end of a file name. Without these the
+    # insert name of "paav-ef1a-flex-asap6c-wpre_estimated" comes out as
+    # "estimated", because it is simply the longest token left standing.
+    "estimated", "confirmed", "verified", "unverified", "checked",
+    "putative", "likely", "approx", "approximate", "partial", "complete",
     "cohen", "lab", "ape", "snapgene", "benchling", "expected", "reversed",
     "complete", "completed", "cropseq", "backup", "orig", "original",
     "multi", "sample", "otherwise", "fck", "fugw", "fuw", "sin", "min",

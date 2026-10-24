@@ -202,7 +202,19 @@ def candidate_parts(conn: sqlite3.Connection, module: Module, limit: int = 12) -
              WHERE p.feature_type = ? AND p.seq_length >= ?"""
     args: list = [module.type, min_part_length(module.type)]
     if module.name:
-        sql += " AND (p.name LIKE ? COLLATE NOCASE)"
+        # Also the names this part's own plasmids and folders use for it.
+        # The CDS in BHL021_pAAV_ef1a_FLEX_ASAP6c is annotated "ASAP4c
+        # 413G"; without the alias, ASAP6c is unfindable even though the
+        # folder, the file and the person who made it all say ASAP6c.
+        # Only authoritative aliases count: one that disagrees with the
+        # part's own label about a version number stays out until a human
+        # settles it, because a different number is a different sensor.
+        sql += (" AND (p.name LIKE ? COLLATE NOCASE"
+                "      OR EXISTS (SELECT 1 FROM part_alias a"
+                "                  WHERE a.part_id = p.id"
+                "                    AND a.authoritative = 1"
+                "                    AND a.alias LIKE ? COLLATE NOCASE))")
+        args.append(f"%{module.name}%")
         args.append(f"%{module.name}%")
     # Relevance before popularity. A search for "LR-Voltron2" must not land
     # on "LR-Voltron2-LR-WiChR-eGFP" just because that row has more sources:
@@ -211,11 +223,14 @@ def candidate_parts(conn: sqlite3.Connection, module: Module, limit: int = 12) -
     if module.name:
         sql += """ GROUP BY p.id ORDER BY
                      (p.name = ? COLLATE NOCASE) DESC,
+                     (EXISTS (SELECT 1 FROM part_alias a WHERE a.part_id = p.id
+                              AND a.authoritative = 1
+                              AND a.alias = ? COLLATE NOCASE)) DESC,
                      (p.name LIKE ? COLLATE NOCASE) DESC,
                      LENGTH(p.name) ASC,
                      n_sources DESC
                    LIMIT ?"""
-        args += [module.name, f"{module.name}%", limit]
+        args += [module.name, module.name, f"{module.name}%", limit]
     else:
         sql += " GROUP BY p.id ORDER BY n_sources DESC, p.seq_length DESC LIMIT ?"
         args.append(limit)
