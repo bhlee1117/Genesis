@@ -1147,8 +1147,44 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
         rm.seq = match[1]
         satisfied.append((rm, match[0]))
 
+    # The same courtesy for a regulatory element the recipient already
+    # carries. YD030 holds the very CAG this design asks for - the same
+    # 1,745 bases, sitting exactly where they belong - and rebuilding it
+    # anyway cost a second PCR off the same plasmid and left 61 bp of it
+    # duplicated, because the kept arc and the re-inserted copy overlap.
+    #
+    # The bases have to match exactly. A promoter of the right *type* is
+    # not the promoter that was asked for, and quietly keeping a CAG when
+    # someone asked for hSyn is the same class of mistake as handing them
+    # the wrong sensor.
+    still_needed = []
+    for rm in regulatory:
+        match = None
+        for a in backbone_annotations:
+            if a["feature_type"] != rm.feature_type or id(a) in taken:
+                continue
+            bases = backbone_seq[a["start"]:a["end"]].upper()
+            if bases and bases == (rm.seq or "").upper():
+                match = a
+                break
+        if match is None:
+            still_needed.append(rm)
+            continue
+        taken.add(id(match))
+        satisfied.append((rm, match))
+        warnings.append(
+            f"the recipient already carries exactly this {rm.part_name}; "
+            f"that copy is kept and amplified with the backbone rather than "
+            f"adding a second one")
+    regulatory = still_needed
+
     payload_seq, payload_layout = block(payload)
     regulatory_seq, regulatory_layout = block(regulatory)
+
+    # Where the recipient's own regulatory elements end, so the payload
+    # can be told not to start before them.
+    satisfied_marks = {(a["feature_type"], a["name"], a["start"])
+                       for _rm, a in satisfied}
 
     # --- rotate so the payload region is contiguous ----------------------
     total = len(backbone_seq)
@@ -1164,6 +1200,7 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
         arc_end = (arc[1] - arc[0]) % total or total
 
     rotated_seq = backbone_seq[rotation:] + backbone_seq[:rotation]
+    keep_until = 0
     rotated = []
     for a in backbone_annotations:
         start, end = (a["start"] - rotation) % total, (a["end"] - rotation) % total
@@ -1175,6 +1212,8 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                 f"boundary and was not carried over")
             continue
         rotated.append({**a, "start": start, "end": end})
+        if (a["feature_type"], a["name"], a["start"]) in satisfied_marks:
+            keep_until = max(keep_until, end)
 
     edits: list[dict] = []
 
@@ -1210,6 +1249,14 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                         and a["start"] < arc_end]
             if cassette:
                 lo = min(a["start"] for a in cassette)
+                # A regulatory element the recipient supplies is being kept,
+                # so the payload must begin after it. Without this the start
+                # is the lowest coding annotation in the arc, and YD030 has
+                # a spurious ORF inside its chimeric intron at 899 - inside
+                # the CAG - which cut the promoter in half and reported it
+                # as "disrupted".
+                if keep_until:
+                    lo = max(lo, keep_until)
                 hi = arc_end
                 if not (spec_types & {"polyA", "WPRE"}):
                     after = [a["start"] for a in rotated
