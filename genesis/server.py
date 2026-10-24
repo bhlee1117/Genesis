@@ -293,6 +293,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/parts":
             ftype = (q.get("type") or [""])[0]
             term = (q.get("q") or [""])[0].strip()
+            # One row per protein, not per annotation. A name search for
+            # "CheRiff" returns the same molecule six times and hides the
+            # soma-targeted one behind an identical label; grouping shows
+            # the family and names what is fused to each member.
+            if (q.get("group") or [""])[0] == "protein" and ftype == "CDS":
+                from .families import protein_families
+                return self.json({
+                    "groups": protein_families(
+                        self.conn, term, ftype,
+                        limit=min(int((q.get("limit") or ["12"])[0]), 40)),
+                })
             limit = min(int((q.get("limit") or ["120"])[0]), 300)
             # Hide annotations too short to be a believable instance of their
             # type, so the picker cannot offer something the planner would

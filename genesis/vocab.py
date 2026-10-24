@@ -225,6 +225,16 @@ PROTEIN_MOTIFS: list[Motif] = [
     Motif("V5 tag", "tag", "GKPIPNPLLGLDST", level="protein"),
     Motif("6xHis tag", "tag", "HHHHHH", level="protein"),
     Motif("XTEN linker", "linker", "SGSETPGTSESATPES", level="protein"),
+    # The soma-targeting tag that makes a "SomCheRiff" out of a CheRiff. It
+    # is 65 aa; a 24 aa probe from the middle still matches a copy whose
+    # boundaries were annotated short. 111 CDS parts in this inventory
+    # carry it, and none of them said so.
+    Motif("Kv2.1 soma-targeting (ST)", "trafficking_motif",
+          "MSSMPSPVAPLPARTEGVIDMRSM", level="protein"),
+    # The "LR-" that prefixes LR-Voltron2 and LR-CheRiff: a Lucy-Rho
+    # leader, 41 aa, which is a signal peptide and not part of the sensor.
+    Motif("LR / Lucy-Rho leader", "trafficking_motif",
+          "MGRPQILLLLALLTLGLANGTEGPNFYVPFSNKTGVVRSG", level="protein"),
 ]
 
 

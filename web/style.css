@@ -1359,3 +1359,29 @@ tr.row-bad td {
 .cand-name .pill { margin-left: 7px; font-size: 0.72rem; vertical-align: middle; }
 .pill-soft { background: var(--line); color: var(--muted); }
 .cand-score-soft { opacity: 0.65; }
+
+/* --- part picker grouped by protein ------------------------------------ */
+/* A family heading names the protein its rows share; it is a label, not a
+   choice, so it does not highlight and cannot be selected. */
+.combo-item.combo-head {
+  cursor: default;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line, #2a2f3a);
+  opacity: 0.95;
+}
+.combo-item.combo-head:hover { background: none; }
+.fam-core { font-weight: 700; }
+.fam-aa { opacity: 0.6; font-size: 0.85em; margin-left: 0.5rem; }
+.fam-count { margin-left: auto; opacity: 0.6; font-size: 0.85em; }
+.combo-item.combo-variant { padding-left: 1.5rem; }
+.var-label { }
+.var-label.plain { opacity: 0.85; }
+/* How many catalogued rows collapsed into this one entry. */
+.var-rows {
+  margin-left: 0.45rem;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  font-size: 0.78em;
+  opacity: 0.75;
+  background: var(--chip, rgba(255,255,255,0.08));
+}

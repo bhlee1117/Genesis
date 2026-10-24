@@ -5381,3 +5381,138 @@ class TestShortElementsAreNotAmbiguousRepeats(unittest.TestCase):
     def test_a_kozak_is_not_reported_as_an_ambiguous_repeat(self):
         from genesis.verify import MIN_DISTINCT_ELEMENT
         self.assertGreater(MIN_DISTINCT_ELEMENT, 6)
+
+
+def _back_translate(protein):
+    """One arbitrary coding sequence for a peptide, for building fixtures."""
+    table = {"A": "GCT", "R": "CGT", "N": "AAT", "D": "GAT", "C": "TGT",
+             "Q": "CAA", "E": "GAA", "G": "GGT", "H": "CAT", "I": "ATT",
+             "L": "CTG", "K": "AAA", "M": "ATG", "F": "TTT", "P": "CCT",
+             "S": "TCT", "T": "ACT", "W": "TGG", "Y": "TAT", "V": "GTT"}
+    return "".join(table[a] for a in protein)
+
+
+class TestPickerGroupsByProtein(unittest.TestCase):
+    """One row per protein, not per annotation.
+
+    A name search for "CheRiff" returned the same molecule seventeen times,
+    hid the soma-targeted version behind an identical label, and missed
+    every row whose annotation says "ChR64". Grouping by the protein fixes
+    all three, provided it never puts two generations of a sensor in one
+    family.
+    """
+
+    def _inventory(self):
+        conn = connect(":memory:")
+        # Proportions that match the real case: CheRiff is 320 aa and the
+        # Kv2.1 soma tag that makes a SomCheRiff out of it is 65 aa. A tag
+        # that is a rounding error next to its core would simply read as a
+        # different annotation boundary, which is the thing being tested.
+        core = orf(320, 601)
+        from genesis.swap import protein_of
+        self.core_aa = protein_of(core)
+
+        host = [0]
+        made = [0]
+
+        def part(name, seq, occ=1):
+            made[0] += 1
+            pid = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (name, seq, "chk%d" % made[0], len(seq))).lastrowid
+            for _ in range(occ):
+                host[0] += 1
+                plid = conn.execute(
+                    """INSERT INTO plasmid(name, owner, seq, seq_length,
+                            seq_checksum, circular, verified)
+                       VALUES (?,'t',?,?,?,1,'unverified')""",
+                    ("host%d" % host[0], seq, len(seq),
+                     "h%d" % host[0])).lastrowid
+                conn.execute(
+                    """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                            end, strand) VALUES (?,?,0,?,1)""",
+                    (pid, plid, len(seq)))
+            return pid
+
+        # the same protein at four boundaries, as the real catalogue has it
+        self.plain = part("CheRiff", core, occ=9)
+        part("CheRiff", core[:-9], occ=5)
+        part("CheRiff", core[:-15], occ=3)
+        part("ChR64", core[:-6], occ=2)          # encodes it under another name
+        # a decorated version: the core plus the real 65 aa Kv2.1 soma tag
+        kv = _back_translate("MSSMPSPVAPLPARTEGVIDMRSMSSIDSFISCATDFPEATRF"
+                             "QSQPILNTKEMAPQSKPPEE")
+        self.soma = part("CheRiff", core[:-3] + kv, occ=4)
+        conn.commit()
+        return conn
+
+    def test_duplicate_boundaries_collapse_into_one_entry(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        self.assertTrue(fams)
+        plain = [v for v in fams[0]["variants"] if v["label"] == "plain"]
+        self.assertEqual(len(plain), 1, [v["label"] for v in fams[0]["variants"]])
+        self.assertGreater(plain[0]["n_rows"], 1)
+        conn.close()
+
+    def test_sources_are_summed_across_the_collapsed_rows(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        plain = next(v for v in fams[0]["variants"] if v["label"] == "plain")
+        self.assertGreaterEqual(plain["n_sources"], 9 + 5 + 3)
+        conn.close()
+
+    def test_a_part_named_something_else_is_still_found(self):
+        """The recall half: 56 real CheRiff rows are named ChR64 and friends."""
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        names = {n for v in fams[0]["variants"]
+                 for n in ([v["name"]] + list(v.get("also") or []))}
+        self.assertIn("ChR64", names)
+        conn.close()
+
+    def test_a_decorated_version_is_its_own_entry(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        labels = [v["label"] for v in fams[0]["variants"]]
+        self.assertTrue(any(l != "plain" for l in labels), labels)
+        conn.close()
+
+    def test_two_generations_never_share_a_family(self):
+        """The rule that overrides every sequence argument."""
+        from genesis.families import protein_families
+        conn = connect(":memory:")
+        later = orf(900, 602)
+        earlier = later[:int(len(later) * 0.92)]
+        for n, (name, seq) in enumerate((("GCaMP6f", later),
+                                         ("jGCaMP7f", earlier)), start=1):
+            pid = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (name, seq, name, len(seq))).lastrowid
+            plid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'unverified')""",
+                ("h%d" % n, seq, len(seq), "k%d" % n)).lastrowid
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                        strand) VALUES (?,?,0,?,1)""", (pid, plid, len(seq)))
+        conn.commit()
+        fams = protein_families(conn, "GCaMP", limit=5)
+        for fam in fams:
+            names = {v["name"] for v in fam["variants"]}
+            self.assertFalse({"GCaMP6f", "jGCaMP7f"} <= names,
+                             "two generations were put in one family")
+        conn.close()
+
+    def test_an_empty_query_does_not_explode(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        self.assertIsInstance(protein_families(conn, "", limit=3), list)
+        conn.close()
