@@ -26,6 +26,12 @@ class Enzyme:
     top: int               # top-strand cut offset
     bottom: int            # bottom-strand cut offset
     dam_sensitive: bool = False
+    #: The mirror image of dam_sensitive: this enzyme *requires* the
+    #: methyl group rather than being blocked by it. DpnI is the only one
+    #: that matters here, and the distinction is the whole reason the
+    #: step works - the same GATC is cut in the plasmid and ignored in
+    #: the PCR product off it.
+    dam_dependent: bool = False
     dcm_sensitive: bool = False
     cpg_sensitive: bool = False
     star_activity: bool = False
@@ -72,6 +78,9 @@ CATALOG: dict[str, Enzyme] = {e.name: e for e in [
     _e("SpeI", "ACTAGT", 1, 5),
     _e("AgeI", "ACCGGT", 1, 5),
     _e("BglII", "AGATCT", 1, 5),
+    _e("DpnI", "GATC", 2, 2, dam_dependent=True,
+       notes="cuts only Gm6ATC: destroys dam+ plasmid template, leaves an "
+             "unmethylated PCR product untouched"),
     _e("MluI", "ACGCGT", 1, 5),
     _e("BsrGI", "TGTACA", 1, 5),
     _e("NcoI", "CCATGG", 1, 5),
@@ -200,12 +209,19 @@ class Fragment:
         return len(self.seq)
 
 
-def digest(seq: str, enzyme_names: list[str], circular: bool = False) -> list[Fragment]:
+def digest(seq: str, enzyme_names: list[str], circular: bool = False,
+           methylated: bool = False) -> list[Fragment]:
     """Simulate a single or multiple digest and return the fragments.
 
     Fragment boundaries are taken at the top-strand nick; the resulting
     single-stranded overhang is recorded so that end compatibility can be
     checked later.
+
+    ``methylated`` says whether this molecule came out of a dam+ cell.
+    It changes nothing for an ordinary enzyme and everything for DpnI,
+    which cuts only where the adenine carries a methyl group: a plasmid
+    miniprepped from DH5-alpha is cut at every GATC, and the PCR product
+    amplified off it - built from plain dNTPs - at none of them.
     """
     n = len(seq)
     cuts: list[CutSite] = []
@@ -213,6 +229,12 @@ def digest(seq: str, enzyme_names: list[str], circular: bool = False) -> list[Fr
         enz = CATALOG.get(name)
         if enz is None:
             raise KeyError(f"unknown enzyme: {name}")
+        # A methylation-dependent enzyme cuts nothing in DNA that was
+        # made in vitro. Letting it cut anyway would model a PCR product
+        # being chewed up by its own DpnI step, which is the opposite of
+        # what happens.
+        if enz.dam_dependent and not methylated:
+            continue
         cuts.extend(find_sites(seq, enz, circular))
 
     cuts.sort(key=lambda c: c.top_cut)

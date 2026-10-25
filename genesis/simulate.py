@@ -252,14 +252,22 @@ def _overhangs(seq: str, top: int, bottom: int) -> tuple[str, str]:
     return "", ""                          # blunt
 
 
-def digest(seq: str, circular: bool, enzymes: list) -> list:
-    """Cut a molecule with the named enzymes and return the pieces."""
+def digest(seq: str, circular: bool, enzymes: list,
+           methylated: bool = False) -> list:
+    """Cut a molecule with the named enzymes and return the pieces.
+
+    ``methylated`` marks DNA that came out of a dam+ cell. It matters
+    only for a methylation-dependent enzyme: DpnI cuts every GATC in a
+    miniprepped plasmid and none in the PCR product amplified off it.
+    """
     from .enzymes import CATALOG, find_sites
 
     cuts = []
     for name in enzymes:
         enz = CATALOG.get(name)
         if enz is None:
+            continue
+        if getattr(enz, "dam_dependent", False) and not methylated:
             continue
         for site in find_sites(seq, enz, circular):
             cuts.append((site.top_cut % max(len(seq), 1), site.bottom_cut))
@@ -388,6 +396,64 @@ def template_atlas(conn: sqlite3.Connection, plan: dict) -> dict:
             atlas[real] = entry
             atlas.setdefault(name, entry)
     return atlas
+
+
+def _simulate_dpni(result, route: dict, templates: dict,
+                   products: list) -> None:
+    """Replay the DpnI step instead of taking its word for it.
+
+    The step claims two things: that the parental plasmid is destroyed,
+    and that the amplicon is not. Both are checkable against the real
+    sequences, and neither was being checked - the simulation simply
+    never put the template in the tube, so there was nothing for DpnI to
+    act on and the step was skipped as a no-op. That made "the template
+    is removed" an assumption the simulation quietly inherited rather
+    than a result it produced.
+    """
+    if "DPNI_DIGEST" not in [s.get("operation") for s in route.get("steps") or []]:
+        return
+
+    seen: set[str] = set()
+    for step in route.get("steps") or []:
+        if step.get("operation") != "PCR":
+            continue
+        name = ((step.get("details") or {}).get("template")
+                or next(iter(step.get("inputs") or []), None))
+        entry = templates.get(name)
+        if entry is None:
+            continue
+        seq, circular, real_name, _tid = entry
+        if real_name in seen:
+            continue
+        seen.add(real_name)
+
+        pieces = digest(seq, circular, ["DpnI"], methylated=True)
+        n = len(pieces)
+        if n >= 2:
+            result.steps.append({
+                "operation": "DPNI_DIGEST", "template": real_name,
+                "pieces": n,
+                "note": f"{real_name} is cut into {n:,} pieces, so no "
+                        f"circular parent survives to transform"})
+        elif n == 1:
+            result.warnings.append(
+                f"DpnI cuts {real_name} once, which only linearises it; a "
+                f"linear plasmid still transforms at a low rate, so gel "
+                f"purify if the background matters")
+        else:
+            result.warnings.append(
+                f"DpnI does not cut {real_name} at all - it has no GATC "
+                f"site - so the parental plasmid survives the step intact")
+
+    # ...and the other half of the claim: the product is untouched.
+    for made in products:
+        if not made.seq:
+            continue
+        if digest(made.seq, False, ["DpnI"], methylated=False):
+            result.problems.append(
+                f"the DpnI step would cut {made.name}, which it must not: "
+                f"a PCR product is unmethylated")
+            result.passed = False
 
 
 def _templates(conn: sqlite3.Connection, plan: dict,
@@ -553,6 +619,11 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
         return result
 
     result.products = products
+
+    # DpnI acts on the templates, not on the pieces being joined, so it
+    # runs here: after the amplicons exist and before anything is
+    # assembled, which is where it sits on the bench too.
+    _simulate_dpni(result, route, templates, products)
 
     if "RE_DIGEST" in operations:
         # Sticky ends, not homology. Checking this route for shared end

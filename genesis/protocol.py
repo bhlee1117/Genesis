@@ -182,7 +182,13 @@ RECIPES = {
         "title": "Column or bead clean-up",
         "items": [("PCR or digest reaction", "all"),
                   ("spin column or SPRI beads", "per kit")],
-        "conditions": "Elute in 20-30 uL. Quantify before assembly.",
+        "conditions": "A silica column or SPRI beads, not a gel: it "
+                      "removes enzymes, buffer, dNTPs and primers but "
+                      "keeps every DNA species in the tube whatever its "
+                      "size. Separating one band from another is the gel "
+                      "extraction step, listed separately when the plan "
+                      "needs it. Elute in 20-30 uL; quantify before "
+                      "assembly.",
     },
     "GEL_EXTRACTION": {
         "title": "Gel extraction",
@@ -747,12 +753,12 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                  "and the products assembled, to check the steps build this "
                  "construct rather than merely describe it.", 8.6)
         doc.paragraph(
-            "It replays the steps that change DNA - PCR, digestion, "
-            "synthesis and the join - against the real inventory "
-            "sequences. The steps that only change what else is in the "
-            "tube (DpnI, clean-up, transformation, screening) are not "
-            "replayed, so this says the intended molecule can form, not "
-            "what fraction of colonies will carry it.", 8.2, gray=0.45)
+            "It replays every step that changes DNA - PCR, digestion, "
+            "synthesis, DpnI and the join - against the real inventory "
+            "sequences. Clean-up, transformation and screening are not "
+            "replayed, so this says the intended molecule can form and "
+            "that nothing else in the tube can, not what fraction of "
+            "colonies will carry it.", 8.2, gray=0.45)
         doc.paragraph(f"Result: {sim.get('summary', '')}", 9.0)
         if sim.get("modules"):
             doc.table(["Part", "Length", "In the product"],
@@ -761,6 +767,10 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                         + f" ({m['coverage']*100:.0f}%)"]
                        for m in sim["modules"]],
                       widths=[0.46, 0.18, 0.36], size=8.2)
+        dpni = [x for x in sim.get("steps") or []
+                if x.get("operation") == "DPNI_DIGEST" and x.get("note")]
+        for x in dpni:
+            doc.bullet(x["note"], 8.6)
         for w in sim.get("warnings", []):
             doc.bullet(w, 8.6)
         for pr in sim.get("problems", []):

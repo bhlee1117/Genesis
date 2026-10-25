@@ -5326,6 +5326,90 @@ class TestEveryPieceInTheTubeIsDrawable(unittest.TestCase):
         self.assertEqual(d["sources"][0]["name"], "a")
 
 
+class TestDpnIIsActuallySimulated(unittest.TestCase):
+    """The step claims two things; both are now checked, not assumed.
+
+    The simulation never put the template in the tube, so DpnI had
+    nothing to act on and was skipped as a no-op. "The template is
+    removed" was therefore an assumption the simulation inherited from
+    the plan rather than a result it produced.
+    """
+
+    def test_dpni_cuts_a_plasmid_and_not_the_product_off_it(self):
+        """The same GATC, two different answers - which is the whole
+        mechanism, and is wrong if the model ignores methylation."""
+        from genesis.enzymes import digest
+        seq = ("GATC" + rand_seq(300, 41)) * 8
+        cut = digest(seq, ["DpnI"], circular=True, methylated=True)
+        self.assertGreaterEqual(len(cut), 8)
+        # the amplicon carries the same sites and is made in vitro
+        whole = digest(seq, ["DpnI"], circular=False, methylated=False)
+        self.assertEqual(len(whole), 1, "a PCR product is unmethylated; "
+                                        "DpnI must leave it alone")
+        self.assertEqual(whole[0].seq, seq)
+
+    def test_dpni_leaves_blunt_ends(self):
+        from genesis.enzymes import CATALOG
+        self.assertEqual(CATALOG["DpnI"].overhang_len, 0)
+        self.assertTrue(CATALOG["DpnI"].dam_dependent)
+
+    def _route(self, template_seq):
+        """A one-PCR route whose template is `template_seq`."""
+        conn = connect(":memory:")
+        conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular) VALUES ('pT','t',?,?,'dsim',1)""",
+            (template_seq, len(template_seq)))
+        pid = conn.execute("SELECT id FROM plasmid").fetchone()["id"]
+        plan = {"backbone": {"id": pid}, "modules": [], "fragments": [],
+                "construct": {"length": len(template_seq)}}
+        arm_l, arm_r = template_seq[-25:], template_seq[:25]
+        route = {"id": "r", "steps": [
+            {"operation": "PCR", "output": "vector amplicon",
+             "inputs": ["pT", "v-F+v-R"], "details": {"template": "pT"}},
+            {"operation": "DPNI_DIGEST", "output": "template-free"},
+            {"operation": "SYNTHESIS", "output": "insert",
+             "details": {"sequence": arm_l + rand_seq(400, 42) + arm_r}},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": ["vector", "insert"]}],
+            "primers": [
+                {"name": "v-F", "direction": "F", "template": "backbone",
+                 "tail": "", "anneal": template_seq[:20],
+                 "target_start": 0, "target_end": len(template_seq)},
+                {"name": "v-R", "direction": "R", "template": "backbone",
+                 "tail": "", "anneal": _rc(template_seq[-20:])}]}
+        return conn, plan, route
+
+    def test_the_simulation_reports_the_template_being_destroyed(self):
+        from genesis import simulate
+        conn, plan, route = self._route(("GATC" + rand_seq(300, 43)) * 8)
+        result = simulate.simulate_route(conn, plan, route)
+        notes = [x for x in result.steps
+                 if x.get("operation") == "DPNI_DIGEST"]
+        self.assertTrue(notes, "the DpnI step was not replayed")
+        self.assertIn("cut into", notes[0]["note"])
+        self.assertGreaterEqual(notes[0]["pieces"], 8)
+        conn.close()
+
+    def test_a_template_dpni_cannot_cut_is_reported_as_surviving(self):
+        """Not a wrong molecule - a wrong plate. The simulation used to
+        be silent about it because it never ran the step."""
+        from genesis import simulate
+        conn, plan, route = self._route("ACGTTGCA" * 300)   # no GATC
+        result = simulate.simulate_route(conn, plan, route)
+        self.assertTrue(any("does not cut" in w and "survives" in w
+                            for w in result.warnings), result.warnings)
+        conn.close()
+
+    def test_a_single_site_only_linearises_and_says_so(self):
+        from genesis import simulate
+        conn, plan, route = self._route("ACGTTGCA" * 150 + "GATC"
+                                        + "ACGTTGCA" * 150)
+        result = simulate.simulate_route(conn, plan, route)
+        self.assertTrue(any("only linearises" in w for w in result.warnings),
+                        result.warnings)
+        conn.close()
+
+
 class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
     """DpnI reads methylation, not a rare sequence.
 
