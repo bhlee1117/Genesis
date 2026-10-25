@@ -83,6 +83,19 @@ def wrap(s: str, font: str, size: float, max_width: float) -> list[str]:
     return lines
 
 
+#: Greek letters that turn up in gene and promoter names, spelled out.
+#: The base-14 fonts are WinAnsi only, so the alternative is a question
+#: mark in the middle of a name.
+_GREEK = {
+    "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma",
+    "\u03b4": "delta", "\u03b5": "epsilon", "\u03ba": "kappa",
+    "\u03bb": "lambda", "\u03bc": "u", "\u03c3": "sigma",
+    "\u03c6": "phi", "\u03c8": "psi", "\u03c9": "omega",
+    "\u0391": "Alpha", "\u0392": "Beta", "\u0393": "Gamma",
+    "\u0394": "Delta", "\u039b": "Lambda", "\u03a9": "Omega",
+}
+
+
 def _escape(s: str) -> bytes:
     """Encode to WinAnsi and escape the three PDF string metacharacters."""
     out = []
@@ -104,6 +117,10 @@ def _escape(s: str) -> bytes:
             out.append("\\265")      # micro sign
         elif code == 0x2192:
             out.append("->")
+        elif ch in _GREEK:
+            # "chicken beta-actin" is a name somebody has to read; WinAnsi
+            # has no beta, and "chicken ?-actin" is not a name.
+            out.append(_GREEK[ch])
         elif 160 <= code <= 255:
             out.append(f"\\{code:03o}")
         else:
@@ -848,3 +865,326 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
                     rgb=(0.45, 0.45, 0.48))
         doc.y -= 8
     doc.y -= 6
+
+
+# --------------------------------------------------------------------------
+# The cloning figure
+# --------------------------------------------------------------------------
+# Until now the PDF said where each fragment was cut from by drawing a
+# full plasmid track per source and then tabulating where each landed.
+# That is the data, not the picture: it never showed the reaction, so
+# "two PCRs and a HiFi" and "a digest, then a ligation" looked identical
+# on the page. This is the figure a cloning paper draws - one lane per
+# piece, one column per bench stage - and it is the same drawing the web
+# app shows, from the same lane model in genesis.figure.
+
+#: Geometry, in points. The whole figure has to fit the A4 content width
+#: (491 pt) at its widest, which is two stage columns.
+_FIG = {
+    "r": 30,            # parent circle
+    "pr": 34,           # product circle
+    "row": 110,
+    "parent": 100,      # the parent column, its labels included
+    "stage": 54,
+    "frag": 86,
+    "bracket": 10,
+    "label": 50,        # how wide a name beside a circle may be
+}
+
+_FIG_GREY = (0.52, 0.54, 0.57)
+_FIG_INK = (0.16, 0.18, 0.21)
+_FIG_PRIMER = (0.13, 0.55, 0.25)
+
+
+def _fig_label(doc, placed, cx, cy, r, fraction, text, rgb, size=5.6):
+    """A name beside a circle, nudged clear of whatever is already there.
+
+    Two cut sites a few hundred bases apart sit at nearly the same angle
+    and their names overprint into a smudge, and a label at three
+    o'clock lands on the stage arrow's caption. Clashing labels are
+    pushed away from the circle - never across it - and a nudged label
+    keeps a leader line back to the arc it names, so moving it does not
+    make it ambiguous.
+    """
+    if not text:
+        return
+    at = fraction % 1.0
+    anchor = _polar(cx, cy, r + 2, at)
+    # At twelve and six o'clock a label set beside the point lies along
+    # the tangent and so runs straight across the ring. There it is
+    # centred on the pole and pushed clear instead.
+    pole = min(at, 1 - at) < 0.06 or abs(at - 0.5) < 0.06
+    x, y = _polar(cx, cy, r + (13 if pole else 6), at)
+    right = at < 0.5
+    while len(text) > 3 and text_width(text, "F1", size) > _FIG["label"]:
+        text = text[:-1]
+    w = text_width(text, "F1", size)
+    # PDF y grows upwards, so "away from the circle" in the lower half
+    # means a smaller y. The JavaScript port has the opposite sign.
+    step = -7 if 0.25 <= at <= 0.75 else 7
+    y0 = y
+    for _ in range(9):
+        if not any((p[1] == right or pole) and abs(p[0] - y) < 6.5
+                   for p in placed):
+            break
+        y += step
+    placed.append((y, right))
+    if pole:
+        placed.append((y, not right))
+    tx = (x - w / 2) if pole else x + (2 if right else -2 - w)
+    if abs(y - y0) > 3:
+        doc.line(anchor[0], anchor[1], tx + (0 if right else w), y - 2,
+                 rgb=(0.72, 0.73, 0.75), width=0.3)
+    doc.text_at(text, tx, y - 2, "F1", size, rgb=rgb)
+
+
+def _fig_primer(doc, cx, cy, r, fraction, forward, placed):
+    """A primer, drawn the way a cloning figure draws one: a short arc on
+    the backbone with a head on the end it extends towards."""
+    w = 0.03 * (1 if forward else -1)
+    _arc_path(doc, cx, cy, r + 4.5, min(fraction, fraction + w) % 1.0,
+              max(fraction, fraction + w) % 1.0, 1.3, _FIG_PRIMER)
+    tip = _polar(cx, cy, r + 4.5, fraction + w)
+    doc.fill_tri(tip, _polar(cx, cy, r + 2, fraction + w * 0.55),
+                 _polar(cx, cy, r + 7, fraction + w * 0.55), _FIG_PRIMER)
+    _fig_label(doc, placed, cx, cy, r + 3, fraction + w * 0.5,
+               "F" if forward else "R", _FIG_PRIMER, 5.4)
+
+
+def _fig_cut(doc, cx, cy, r, fraction, name, placed):
+    """An enzyme cut: a tick through the backbone, with the enzyme named."""
+    a = _polar(cx, cy, r - 5, fraction)
+    b = _polar(cx, cy, r + 5, fraction)
+    doc.line(a[0], a[1], b[0], b[1], rgb=CUT_RED, width=1.3)
+    _fig_label(doc, placed, cx, cy, r + 2, fraction, name, CUT_RED)
+
+
+def _fig_caption(doc, cx, cy, r, name, size_text):
+    """The plasmid's name under its circle, its size inside it.
+
+    Inventory names run to thirty characters; inside a 60 pt circle they
+    either overflow the ring or have to be cut so short they stop
+    identifying the plasmid. Under it there is a whole column of room.
+    """
+    doc.text_at(size_text, cx, cy - 2, "F1", 6.2, rgb=_FIG_GREY, centre=True)
+    text = str(name or "template")
+    # Shrink to fit the column before breaking the name in half; splitting
+    # "paav-ef1a-dio-asap7y-wpre_" after 24 characters left "e_" on a line
+    # of its own.
+    size = 6.6
+    while size > 5.2 and text_width(text, "F2", size) > _FIG["parent"] - 4:
+        size -= 0.3
+    while len(text) > 6 and text_width(text, "F2", size) > _FIG["parent"] - 4:
+        text = (text[:-4] if text.endswith("...") else text[:-1]) + "..."
+    doc.text_at(text, cx, cy - r - 16, "F2", size, rgb=_FIG_INK, centre=True)
+
+
+def _within(s, e, lo, hi) -> bool:
+    """Is the arc s..e inside the arc lo..hi, on a circle?"""
+    def rel(x):
+        return (x - lo) % 1.0
+    span = (hi - lo) % 1.0 or 1.0
+    return rel(s) <= span and rel(e) <= span and rel(s) <= rel(e)
+
+
+def _fig_parent(doc, lane, cx, cy):
+    """One parent plasmid: what it is, what comes out, and how."""
+    src = lane.get("src") or {}
+    span = src.get("template_length") or 0
+    r = _FIG["r"]
+    _arc_path(doc, cx, cy, r, 0.0, 1.0, 1.0, (0.76, 0.77, 0.79))
+
+    f0, f1 = src.get("from_start"), src.get("from_end")
+    if not span or not isinstance(f0, int) or not isinstance(f1, int):
+        # Nobody simulated this route, so there is no geometry to draw.
+        # An empty ring with the right name beats an invented arc.
+        _fig_caption(doc, cx, cy, r, src.get("template"),
+                     f"{span:,} bp" if span else "size unknown")
+        return
+
+    from .figure import figure_features
+    #: The stage arrow's verb and size sit level with the circle on the
+    #: right. Claiming that band up front moves a label out of it
+    #: instead of printing "EF-1-alpha pro" across "1,305 bp".
+    placed: list = [(cy + 6, True), (cy, True), (cy - 6, True),
+                    (cy - 12, True),
+                    # and the plasmid's own name, under the circle
+                    (cy - r - 16, True), (cy - r - 16, False),
+                    (cy - r - 10, True), (cy - r - 10, False)]
+    take_s, take_e = (f0 % span) / span, (f1 % span) / span
+    for a in figure_features(src):
+        s, e = (a["start"] % span) / span, (a["end"] % span) / span
+        _arc_path(doc, cx, cy, r, s, e, 3.6, _feature_rgb(a["feature_type"]))
+        # Only the promoter that ends up in the product earns a name. A
+        # donor's own promoter is not part of what is being taken out of
+        # it, and labelling it crowded the figure with a fact about the
+        # parent that the construct never inherits.
+        if a["feature_type"] == "promoter" and _within(s, e, take_s, take_e):
+            mid = s + (((e - s) % 1.0) or 1.0) / 2
+            _fig_label(doc, placed, cx, cy, r, mid,
+                       (a.get("name") or "promoter")[:14],
+                       _feature_rgb("promoter"))
+
+    s, e = take_s, take_e
+    _arc_path(doc, cx, cy, r, s, e, 4.6, lane["colour"])
+
+    cuts = lane.get("cuts_parent") or []
+    if cuts:
+        second = cuts[1] if len(cuts) > 1 else cuts[0]
+        # Two sites a few bases apart are one tick at this scale, and two
+        # names stacked on it read as a smudge rather than as two
+        # enzymes. Say so once.
+        if min((s - e) % 1.0, (e - s) % 1.0) < 0.02:
+            _fig_cut(doc, cx, cy, r, s, f"{cuts[0]}/{second}", placed)
+        else:
+            _fig_cut(doc, cx, cy, r, s, cuts[0], placed)
+            _fig_cut(doc, cx, cy, r, e, second, placed)
+    else:
+        _fig_primer(doc, cx, cy, r, s, True, placed)
+        _fig_primer(doc, cx, cy, r, e, False, placed)
+
+    _fig_caption(doc, cx, cy, r, src.get("template"), f"{span:,} bp")
+
+
+def _fig_order(doc, lane, cx, cy):
+    """A piece nobody has a plasmid for: it gets ordered."""
+    w, hgt = 74, 34
+    x0, y0, x1, y1 = cx - w / 2, cy - hgt / 2, cx + w / 2, cy + hgt / 2
+    for a, b in (((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)),
+                 ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))):
+        doc.line(a[0], a[1], b[0], b[1], rgb=_FIG_GREY, width=0.8,
+                 dash="3 2")
+    doc.text_at("synthesise", cx, cy + 3, "F2", 6.6, rgb=_FIG_INK, centre=True)
+    bp = (lane.get("src") or {}).get("bp") or 0
+    doc.text_at(f"{bp:,} bp gBlock", cx, cy - 7, "F1", 6.2, rgb=_FIG_GREY,
+                centre=True)
+
+
+def _fig_arrow(doc, x, y, w, verb, sub):
+    """A stage: the operation, an arrow, and what comes out of it."""
+    x1, x2 = x + 7, x + w - 7
+    doc.line(x1, y, x2 - 4, y, rgb=_FIG_GREY, width=0.8)
+    doc.fill_tri((x2, y), (x2 - 5, y + 2.6), (x2 - 5, y - 2.6), _FIG_GREY)
+    doc.text_at(verb, (x1 + x2) / 2, y + 6, "F2", 7, rgb=_FIG_INK, centre=True)
+    if sub and text_width(sub, "F1", 6.2) <= w - 14:
+        doc.text_at(sub, (x1 + x2) / 2, y - 12, "F1", 6.2, rgb=_FIG_GREY,
+                    centre=True)
+
+
+def _fig_fragment(doc, lane, x, y, w):
+    """The linear piece in the tube, with whatever its ends are."""
+    doc.fill_rect(x, y - 3, w, 6, rgb=lane["colour"])
+    ends = lane.get("ends") or []
+    sticky = lane.get("end_kind") == "sticky"
+    for i, end in enumerate(ends):
+        if not end:
+            continue
+        ex = x if i == 0 else x + w
+        doc.fill_rect(ex - 1.8, y - 5.5, 3.6, 11,
+                      rgb=CUT_RED if sticky else (0.62, 0.64, 0.67))
+        doc.text_at(end, ex, y - 15, "F1", 5.8, rgb=_FIG_GREY, centre=True)
+    doc.text_at(str(lane.get("piece") or "")[:26], x + w / 2, y + 7, "F2", 7,
+                rgb=_FIG_INK, centre=True)
+    bp = (lane.get("src") or {}).get("bp") or 0
+    doc.text_at(f"{bp:,} bp", x + w / 2, y - 15, "F1", 6.2, rgb=_FIG_GREY,
+                centre=True)
+
+
+def _fig_product(doc, lanes, construct, product_bp, cx, cy):
+    """The new plasmid, each lane's contribution in that lane's colour."""
+    span = product_bp or (construct or {}).get("length") or 1
+    r = _FIG["pr"]
+    _arc_path(doc, cx, cy, r, 0.0, 1.0, 1.0, (0.76, 0.77, 0.79))
+
+    for lane in lanes:
+        src = lane.get("src") or {}
+        if not isinstance(src.get("at_start"), int):
+            continue
+        _arc_path(doc, cx, cy, r, src["at_start"] / span,
+                  src["at_end"] / span, 4.2, lane["colour"])
+
+    named = [a for a in ((construct or {}).get("layout") or [])
+             if isinstance(a.get("start"), int)
+             and a.get("type") in ("promoter", "CDS")
+             and (a["end"] - a["start"]) > span * 0.03]
+    named.sort(key=lambda a: a["end"] - a["start"], reverse=True)
+    placed: list = [(cy - r - 16, True), (cy - r - 16, False),
+                    (cy - r - 10, True), (cy - r - 10, False)]
+    for a in named[:3]:
+        s, e = (a["start"] % span) / span, (a["end"] % span) / span
+        _arc_path(doc, cx, cy, r - 7, s, e, 3.6, _feature_rgb(a["type"]))
+        mid = s + (((e - s) % 1.0) or 1.0) / 2
+        _fig_label(doc, placed, cx, cy, r, mid,
+                   (a.get("name") or a["type"])[:14], _feature_rgb(a["type"]))
+
+    _fig_caption(doc, cx, cy, r, (construct or {}).get("name")
+                 or "new plasmid", f"{span:,} bp")
+
+
+def figure_height(lanes: list) -> float:
+    """How much vertical room the figure wants, so a caller can keep the
+    heading with it. ``_ensure`` inside the figure only protects the
+    drawing; the heading above it had already gone on the previous page.
+    """
+    if not lanes:
+        return 0.0
+    return max(len(lanes) * _FIG["row"], 2 * _FIG["pr"] + 40) + 30
+
+
+def cloning_figure(doc: "PDF", lanes: list, join: str,
+                   construct: dict | None = None, product_bp: int = 0):
+    """Draw the whole route: parents, stages, pieces, and the join."""
+    if not lanes:
+        return
+    max_stages = max(len(l.get("stages") or []) for l in lanes) or 1
+    x_parent = doc.ml
+    x_stage = x_parent + _FIG["parent"]
+    x_frag = x_stage + max_stages * _FIG["stage"]
+    x_bracket = x_frag + _FIG["frag"] + 6
+    x_join = x_bracket + _FIG["bracket"]
+    x_prod = x_join + _FIG["stage"] + _FIG["pr"]
+
+    rows = len(lanes)
+    height = max(rows * _FIG["row"], 2 * _FIG["pr"] + 40)
+    doc._ensure(height + 20)
+    doc.y -= 10
+    top_y = doc.y
+
+    centres = []
+    for i, lane in enumerate(lanes):
+        cy = top_y - _FIG["row"] / 2 - i * _FIG["row"]
+        centres.append(cy)
+        cx = x_parent + _FIG["parent"] / 2
+        if lane.get("origin") == "order":
+            _fig_order(doc, lane, cx, cy)
+        else:
+            _fig_parent(doc, lane, cx, cy)
+        for k, stage in enumerate(lane.get("stages") or []):
+            _fig_arrow(doc, x_stage + k * _FIG["stage"], cy, _FIG["stage"],
+                       stage.get("verb", ""), stage.get("sub", ""))
+        _fig_fragment(doc, lane, x_frag, cy, _FIG["frag"])
+
+    # One bracket gathering the pieces into the single reaction.
+    if rows > 1:
+        top, bot = centres[0], centres[-1]
+        doc.line(x_bracket, top, x_bracket + 6, top, rgb=_FIG_GREY, width=0.8)
+        doc.line(x_bracket + 6, top, x_bracket + 6, bot, rgb=_FIG_GREY,
+                 width=0.8)
+        doc.line(x_bracket + 6, bot, x_bracket, bot, rgb=_FIG_GREY, width=0.8)
+    mid_y = (centres[0] + centres[-1]) / 2
+    _fig_arrow(doc, x_join, mid_y, _FIG["stage"], join,
+               f"{rows} piece" + ("" if rows == 1 else "s"))
+    _fig_product(doc, lanes, construct, product_bp, x_prod, mid_y)
+
+    doc.y = top_y - height - 6
+    key = []
+    if any(not (l.get("cuts_parent") or l.get("origin") == "order")
+           for l in lanes):
+        key.append("green arrows on a circle are primers")
+    if any(l.get("cuts_parent") or l.get("cuts_fragment") for l in lanes):
+        key.append("red ticks are enzyme cuts")
+    if any(l.get("origin") == "order" for l in lanes):
+        key.append("a dashed box is DNA nobody has, so it is ordered")
+    key.append("each colour follows one piece into the product")
+    doc.text_at("; ".join(key), doc.ml, doc.y, "F1", 6.2, rgb=(0.45, 0.45, 0.48))
+    doc.y -= 10

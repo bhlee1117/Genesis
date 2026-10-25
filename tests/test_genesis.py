@@ -41,6 +41,22 @@ def rand_seq(n, seed=None):
     return "".join(r.choice("ACGT") for _ in range(n))
 
 
+def pdf_text(data: bytes) -> bytes:
+    """Everything a Genesis PDF draws, with the page streams inflated.
+
+    Content streams are Flate-compressed, so searching the file for a
+    heading finds nothing whether or not the heading is there.
+    """
+    import re, zlib
+    out = []
+    for m in re.finditer(rb"stream\r?\n(.*?)endstream", data, re.S):
+        try:
+            out.append(zlib.decompress(m.group(1)))
+        except zlib.error:
+            out.append(m.group(1))
+    return b"".join(out)
+
+
 def _rc(seq):
     from genesis.seqtools import revcomp
     return revcomp(seq)
@@ -1016,6 +1032,35 @@ class TestPDF(unittest.TestCase):
         data = protocol_pdf(plan, cfg)
         self.assertTrue(data.startswith(b"%PDF"))
         self.assertGreater(len(data), 3000)
+        # The route figure goes in the protocol, not only on screen.
+        drawn = pdf_text(data)
+        self.assertIn(b"How this route builds it", drawn)
+        self.assertIn(b"NEBuilder HiFi", drawn)
+
+    def test_the_figure_fits_the_page(self):
+        """A figure wider than the text column runs off the paper, and a
+        PDF gives no sign of it - the ink is simply outside the sheet."""
+        from genesis.pdf import PDF, A4, cloning_figure, figure_height, _FIG
+        lanes = [{"origin": "plasmid", "template": "pHost", "piece": "insert",
+                  "colour": (0.2, 0.4, 0.8), "primers": ["a-F", "a-R"],
+                  "cuts_parent": ["HindIII", "EcoRV"],
+                  "ends": ["HindIII", "EcoRV"], "end_kind": "sticky",
+                  "stages": [{"verb": "PCR", "sub": "1,200 bp"},
+                             {"verb": "Digest", "sub": "HindIII + EcoRV"}],
+                  "src": {"template": "pHost", "template_length": 5000,
+                          "from_start": 100, "from_end": 1300, "bp": 1200,
+                          "features": [], "at_start": 0, "at_end": 1200}}]
+        doc = PDF(title="t", page_size=A4)
+        width = (_FIG["parent"] + 2 * _FIG["stage"] + _FIG["frag"]
+                 + _FIG["bracket"] + 6 + _FIG["stage"] + 2 * _FIG["pr"])
+        self.assertLessEqual(width, doc.content_width,
+                             "the widest figure must fit the text column")
+        before = len(doc.pages)
+        cloning_figure(doc, lanes, "T4 ligase", {"name": "p", "length": 6200,
+                                                 "layout": []}, 6200)
+        self.assertEqual(len(doc.pages), before, "one lane should not paginate")
+        self.assertGreater(figure_height(lanes), 0)
+        self.assertTrue(doc.to_bytes().startswith(b"%PDF"))
 
     def test_plan_carries_a_suggested_name(self):
         conn = connect(":memory:")
@@ -5255,6 +5300,175 @@ class TestEveryPieceInTheTubeIsDrawable(unittest.TestCase):
         d = result.to_dict()
         self.assertNotIn("seq", d["sources"][0])
         self.assertEqual(d["sources"][0]["name"], "a")
+
+
+class TestTheTwoFiguresAgree(unittest.TestCase):
+    """One idea, two languages.
+
+    The cloning figure is drawn twice - once in the browser and once in
+    the protocol PDF - from the same lane model. Two implementations of
+    one idea are worth nothing if nobody checks they still agree, so the
+    JavaScript is run against the same routes as the Python and the
+    lanes compared field by field.
+    """
+
+    #: Routes covering the shapes the walk has to get right: a plain
+    #: two-PCR assembly, a digest of a named plasmid, a bare digest that
+    #: applies to the amplicon before it, a synthesis, and a primer pair
+    #: whose part names contain the separator.
+    ROUTES = [
+        {"id": "hifi", "steps": [
+            {"operation": "PCR", "output": "backbone2 amplicon",
+             "inputs": ["pHost", "backbone2-F+backbone2-R"],
+             "details": {"template": "pHost", "length": 5791}},
+            {"operation": "PCR", "output": "Kozak+ASAP7y amplicon",
+             "inputs": ["pDon", "Kozak+ASAP7y-F+Kozak+ASAP7y-R"],
+             "details": {"template": "pDon", "length": 1290}},
+            {"operation": "DPNI_DIGEST", "inputs": [], "output": "clean"},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": ["backbone2", "Kozak"]},
+         ],
+         "primers": [{"name": "backbone2-F"}, {"name": "backbone2-R"},
+                     {"name": "Kozak+ASAP7y-F"}, {"name": "Kozak+ASAP7y-R"}]},
+        {"id": "restriction", "steps": [
+            {"operation": "PCR", "output": "Kozak+ASAP7y amplicon with sites",
+             "inputs": ["pDon", "Kozak+ASAP7y-F+Kozak+ASAP7y-R"],
+             "details": {"length": 1290, "template": "pDon"}},
+            {"operation": "RE_DIGEST", "inputs": ["HindIII, EcoRV"],
+             "output": "digested insert"},
+            {"operation": "RE_DIGEST", "inputs": ["pHost"],
+             "output": "linearised backbone"},
+            {"operation": "LIGATION", "inputs": ["backbone", "insert"]},
+         ],
+         "primers": [{"name": "Kozak+ASAP7y-F", "target_start": 2218,
+                      "target_end": 3508},
+                     {"name": "Kozak+ASAP7y-R"}]},
+        {"id": "gblock", "steps": [
+            {"operation": "SYNTHESIS", "output": "synthetic insert",
+             "inputs": [], "details": {"length": 2571}},
+            {"operation": "PCR", "output": "linearised vector",
+             "inputs": ["pHost", "backbone-F+backbone-R"],
+             "details": {"length": 4004, "template": "pHost"}},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": ["vector", "insert"]},
+         ],
+         "primers": [{"name": "backbone-F"}, {"name": "backbone-R"}]},
+        # a route the planner rejected: no steps at all
+        {"id": "swap_re", "steps": [], "primers": []},
+    ]
+
+    PLAN = {"templates": {
+        "pHost": {"id": 1, "name": "pHost", "bp": 6539, "circular": True,
+                  "features": []},
+        "pDon": {"id": 2, "name": "pDon", "bp": 6880, "circular": True,
+                 "features": []}}}
+
+    SIM = {"sources": [
+        {"name": "backbone2", "template": "pHost", "template_length": 6539,
+         "from_start": 23, "from_end": 5814, "bp": 5807, "features": []},
+        {"name": "Kozak+ASAP7y", "template": "pDon", "template_length": 6880,
+         "from_start": 2218, "from_end": 3508, "bp": 1305, "features": []},
+    ]}
+
+    @staticmethod
+    def _shape(lanes):
+        """The fields both ports are responsible for, in order."""
+        return [{"origin": l["origin"], "template": l["template"],
+                 "piece": l["piece"], "ends": l.get("ends") or [],
+                 "stages": [[s["verb"], s["sub"]] for s in l["stages"]],
+                 "primers": l.get("primers") or []}
+                for l in lanes]
+
+    def test_the_javascript_walks_a_route_the_same_way(self):
+        import json
+        import shutil
+        import subprocess
+        import tempfile
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed; cannot check the port")
+
+        from genesis.figure import route_lanes
+        want = [self._shape(route_lanes(r, self.SIM, self.PLAN))
+                for r in self.ROUTES]
+
+        app = (Path(__file__).resolve().parent.parent / "web" / "app.js")
+        driver = """
+          global.document = { createElement: t => node(t),
+            createElementNS: (ns, t) => node(t),
+            createTextNode: t => node('#text'),
+            getElementById: () => null, addEventListener(){},
+            querySelector: () => null, querySelectorAll: () => [] };
+          function node(t){ return { tagName:t, children:[], attrs:{},
+            textContent:'', appendChild(c){this.children.push(c);return c;},
+            setAttribute(){}, addEventListener(){},
+            classList:{add(){},remove(){},toggle(){}} }; }
+          global.Node = class Node {};
+          global.window = { addEventListener(){}, location:{hash:''} };
+          global.fetch = async () => ({ ok:true, json: async () => ({}) });
+          global.localStorage = { getItem:()=>null, setItem(){}, removeItem(){} };
+          global.ResizeObserver = class { observe(){} disconnect(){} };
+          global.setTimeout = () => 0; global.clearTimeout = () => {};
+          require('vm').runInThisContext(
+            require('fs').readFileSync(process.argv[2], 'utf8'));
+          const input = JSON.parse(require('fs').readFileSync(process.argv[3]));
+          const out = input.routes.map(r => routeLanes(r, input.sim, input.plan)
+            .map(l => ({ origin: l.origin, template: l.template,
+                         piece: l.piece, ends: l.ends || [],
+                         stages: (l.stages||[]).map(s => [s.verb, s.sub]),
+                         primers: l.primers || [] })));
+          process.stdout.write(JSON.stringify(out));
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            drv = Path(tmp) / "drive.js"
+            inp = Path(tmp) / "in.json"
+            drv.write_text(driver)
+            inp.write_text(json.dumps({"routes": self.ROUTES, "sim": self.SIM,
+                                       "plan": self.PLAN}))
+            proc = subprocess.run(
+                [node, str(drv), str(app), str(inp)],
+                capture_output=True, text=True, cwd=str(app.parent.parent))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        got = json.loads(proc.stdout)
+
+        self.assertEqual(len(got), len(want))
+        for route, a, b in zip(self.ROUTES, got, want):
+            self.assertEqual(a, b, f"route {route['id']} is walked "
+                                   f"differently by the two ports")
+
+    def test_a_bare_digest_applies_to_the_amplicon_before_it(self):
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[1], self.SIM, self.PLAN)
+        self.assertEqual(len(lanes), 2)
+        self.assertEqual([s["verb"] for s in lanes[0]["stages"]],
+                         ["PCR", "Digest"])
+        self.assertEqual(lanes[0]["ends"], ["HindIII", "EcoRV"])
+        # and the plasmid digest is its own lane, not a stage on that one
+        self.assertEqual(lanes[1]["template"], "pHost")
+        self.assertEqual([s["verb"] for s in lanes[1]["stages"]], ["Digest"])
+
+    def test_a_digest_with_no_enzymes_borrows_the_route_pair(self):
+        """The backbone digest names no enzymes of its own, and was
+        drawn as a bare "Digest" with nothing to say which ones."""
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[1], self.SIM, self.PLAN)
+        self.assertEqual(lanes[1]["stages"][0]["sub"], "HindIII + EcoRV")
+
+    def test_a_fused_name_does_not_split_the_primer_pair(self):
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[0], self.SIM, self.PLAN)
+        self.assertEqual(lanes[1]["primers"],
+                         ["Kozak+ASAP7y-F", "Kozak+ASAP7y-R"])
+
+    def test_an_unsimulated_route_still_has_geometry(self):
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[1], {}, self.PLAN)
+        src = lanes[0]["src"]
+        self.assertEqual(src["template_length"], 6880)
+        self.assertEqual(src["from_start"], 2218)
+        self.assertTrue(src["estimated"])
+
+    def test_a_route_with_no_steps_draws_nothing(self):
+        from genesis.figure import route_lanes
+        self.assertEqual(route_lanes(self.ROUTES[3], {}, self.PLAN), [])
 
 
 class TestTemplateAtlas(unittest.TestCase):

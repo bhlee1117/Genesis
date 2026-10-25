@@ -4079,8 +4079,15 @@ function figParent(lane, cx, cy) {
   }));
   var cuts = lane.cutsParent || [];
   if (cuts.length) {
-    figCut(g, cx, cy, r, f0, cuts[0]);
-    figCut(g, cx, cy, r, f1, cuts[1] || cuts[0]);
+    var second = cuts[1] || cuts[0];
+    /* Two sites a few bases apart are one tick at this scale, and two
+       names stacked on it read as a smudge rather than as two enzymes. */
+    if (Math.min((f0 - f1 + 1) % 1, (f1 - f0 + 1) % 1) < 0.02) {
+      figCut(g, cx, cy, r, f0, cuts[0] + '/' + second);
+    } else {
+      figCut(g, cx, cy, r, f0, cuts[0]);
+      figCut(g, cx, cy, r, f1, second);
+    }
   } else {
     var pn = lane.primers || [];
     figPrimer(g, cx, cy, r, f0, true, pn[0]);

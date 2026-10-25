@@ -22,7 +22,8 @@ import datetime as _dt
 import re
 
 from .config import Config
-from .pdf import PDF, A4, circular_map, plasmid_track
+from .pdf import (PDF, A4, circular_map, cloning_figure,
+                  figure_height, plasmid_track)
 from .seqtools import gc_fraction, tm
 
 # --------------------------------------------------------------------------
@@ -441,7 +442,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
     construct = p["construct"]
     v = p["validation"]
 
-    # --- 1. header -----------------------------------------------------
+    # --- 1. header --------------------------------------------------
     doc.heading(name, 1)
     doc.paragraph(route["title"], 10.5, gray=0.35)
     doc.spacer(4)
@@ -483,7 +484,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
             if issue["level"] == "error":
                 doc.bullet(f"{issue['category']}: {issue['message']}", 9)
 
-    # --- 2. the designed construct --------------------------------------
+    # --- 2. the designed construct ----------------------------------
     layout = construct.get("layout") or []
     marks = construct.get("codon_markers") or []
     if layout:
@@ -531,7 +532,36 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                           8.4, gray=0.4)
         doc.spacer(4)
 
-    # --- 3. the scheme --------------------------------------------------
+    # --- 3. how the route builds it ---------------------------------
+    # The scheme below this draws two parents and the regions they give
+    # up, which only exists for a swap; and the simulation section drew
+    # each source as a separate track with a table saying where it
+    # landed. Neither showed the reaction, so "two PCRs and a HiFi" and
+    # "a digest then a ligation" looked identical on the page.
+    from .figure import route_lanes, join_verb
+    lanes = route_lanes(route, route.get("simulation") or {}, plan)
+    if lanes:
+        # Keep the heading and its caption with the drawing: the figure
+        # protects its own height, which left the title stranded at the
+        # foot of the page before.
+        doc._ensure(figure_height(lanes) + 56)
+        doc.heading("How this route builds it", 2)
+        doc.paragraph(
+            "One row per piece that goes in the tube: the plasmid it comes "
+            "out of, the reaction that takes it out, and the piece itself. "
+            "The bracket is the single reaction that closes the circle.",
+            8.8, gray=0.4)
+        sim_fig = route.get("simulation") or {}
+        cloning_figure(doc, lanes, join_verb(route),
+                       plan.get("construct") or {},
+                       sim_fig.get("product_bp") or 0)
+        if not sim_fig.get("simulated"):
+            doc.paragraph(
+                "Drawn from the planned steps. This route was not "
+                "simulated, so the product shown is the design rather "
+                "than a checked molecule.", 8.2, gray=0.45)
+
+    # --- 4. the scheme ----------------------------------------------
     scheme = route.get("scheme") or {}
     if scheme.get("recipient"):
         doc.heading("Cloning scheme", 2)
@@ -590,14 +620,14 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                           f"enzymes cut between.", 8.6, gray=0.35)
         doc.spacer(4)
 
-    # --- 4. reagents ---------------------------------------------------
+    # --- 5. reagents ------------------------------------------------
     doc.heading("Reagents and consumables", 2)
     doc.paragraph("Quantities are per reaction. Check against the current "
                   "package insert for the kits in use.", 8.6, gray=0.4)
     doc.table(["Item", "Amount"], [[i, a] for i, a in p["reagents"]],
               widths=[0.68, 0.32], size=8.6)
 
-    # --- 3. primers ----------------------------------------------------
+    # --- 6. primers -------------------------------------------------
     if p["primers"]:
         doc.heading("Primers to order", 2)
         doc.paragraph("Lower case is the overlap or adapter tail; upper case "
@@ -621,7 +651,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
             "parent maps above draw the same sites in purple.",
             8.2, gray=0.45)
 
-    # --- 4. the protocol -----------------------------------------------
+    # --- 7. the protocol --------------------------------------------
     doc.heading("Protocol", 2)
     for step in p["steps"]:
         doc.step(f"{step['index']}.", step["description"],
@@ -638,7 +668,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                               font="F3", gray=0.2)
             doc.spacer(2)
 
-    # --- 5. everything else --------------------------------------------
+    # --- 8. everything else -----------------------------------------
     doc.page_break()
     doc.heading("Detail", 1)
     doc.paragraph("Everything behind the protocol above: how the design was "
@@ -723,10 +753,12 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         if sources:
             doc.heading("Where each fragment is cut from", 3)
             doc.paragraph(
-                "The marked region is what the primers amplify. Each one is "
-                "drawn on the plasmid it comes out of, in that plasmid's own "
-                "coordinates.", 8.6)
+                "The same pieces as the figure above, each drawn against "
+                "its whole parent so the coordinates can be checked "
+                "against the plasmid's own map.", 8.6)
             for src in sources:
+                if src.get("synthesised"):
+                    continue          # ordered DNA has no parent to draw
                 hi = None
                 if (isinstance(src.get("from_start"), int)
                         and isinstance(src.get("from_end"), int)):
@@ -865,6 +897,33 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
             if i["level"] == "error":
                 out.append(f"> - {i['category']}: {i['message']}")
         out.append("")
+
+    # The same walk the figure draws, in the form a lab notebook takes.
+    from .figure import route_lanes, join_verb
+    lanes = route_lanes(route, route.get("simulation") or {}, plan)
+    if lanes:
+        out += ["## How this route builds it", ""]
+        for lane in lanes:
+            src = lane.get("src") or {}
+            where = ("ordered as a gBlock" if lane["origin"] == "order"
+                     else f"from `{src.get('template') or lane['template']}`"
+                          + (f" ({src['template_length']:,} bp)"
+                             if src.get("template_length") else ""))
+            # The last stage's size is the piece's size, printed at the
+            # end of the line; saying it twice reads as two numbers.
+            final = f"{src.get('bp', 0):,} bp"
+            how = " then ".join(
+                st["verb"] + (f" ({st['sub']})"
+                              if st.get("sub") and st["sub"] != final else "")
+                for st in lane["stages"])
+            ends = (f", ends {' / '.join(lane['ends'])}"
+                    if lane.get("ends") else "")
+            out.append(f"- **{lane['piece']}** {where} - {how}"
+                       f" -> {src.get('bp', 0):,} bp{ends}")
+        sim_bp = (route.get("simulation") or {}).get("product_bp") or 0
+        out += ["", f"Then {join_verb(route)}: "
+                    f"{len(lanes)} piece{'' if len(lanes) == 1 else 's'}"
+                    + (f" -> {sim_bp:,} bp" if sim_bp else ""), ""]
 
     scheme = route.get("scheme") or {}
     if scheme.get("recipient"):
