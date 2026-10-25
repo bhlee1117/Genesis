@@ -5519,6 +5519,54 @@ class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
         conn.close()
 
 
+class TestTheStylesheetDoesNotCollide(unittest.TestCase):
+    """Two different things called "steps".
+
+    The design step navigation is `nav class="steps"` and the protocol's
+    numbered bench list is `ol class="steps"`. A rule written as plain
+    `.steps` matches both, and the navigation's `display: flex` turned
+    the bench steps into a wrapping row, so step 4 and step 5 printed on
+    top of each other. CSS gives no error for this; the page just looks
+    wrong.
+    """
+
+    @staticmethod
+    def _css():
+        root = Path(__file__).resolve().parent.parent
+        return (root / "web" / "style.css").read_text()
+
+    @staticmethod
+    def _html():
+        root = Path(__file__).resolve().parent.parent
+        return (root / "web" / "index.html").read_text()
+
+    def test_shared_class_names_are_scoped_to_their_element(self):
+        import re
+        css = self._css()
+        app = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+        # class names used on more than one kind of element
+        for name, elements in (("steps", ("nav", "ol")),):
+            self.assertIn(f'<{elements[0]} class="{name}"', self._html())
+            self.assertIn(f"'{elements[1]}', {{ class: '{name}' }}", app)
+            bare = [l for l in css.splitlines()
+                    if re.match(r"^\s*\.%s\b" % name, l)]
+            self.assertEqual(bare, [],
+                             f"a bare .{name} rule matches both "
+                             f"{' and '.join(elements)}: {bare}")
+
+    def test_every_custom_property_used_is_declared(self):
+        """var(--line) and var(--muted) were never declared, so 22 rules
+        silently fell through to a dark-theme fallback - in light mode,
+        near-white text on a white card."""
+        import re
+        css = self._css()
+        declared = set(re.findall(r"^\s*(--[a-z0-9-]+)\s*:", css, re.M))
+        used = set(re.findall(r"var\((--[a-z0-9-]+)", css))
+        missing = sorted(u for u in used - declared)
+        self.assertEqual(missing, [],
+                         f"used but never declared at :root: {missing}")
+
+
 class TestTheFigureShowsWhatMeetsWhat(unittest.TestCase):
     """Two grey caps both labelled "overlap" said only that an overlap
     existed, not which end goes into which."""

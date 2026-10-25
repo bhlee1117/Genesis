@@ -4819,7 +4819,12 @@ function renderRouteDetail(route) {
           h('span', { class: 'step-desc' }, s.description || ''),
           h('span', { class: 'step-min muted' }, hours(s.minutes))),
         s.output ? h('div', { class: 'step-io muted small' }, '→ ' + s.output) : null,
-        s.notes ? h('div', { class: 'step-note' }, s.notes) : null);
+        s.notes ? h('div', { class: 'step-note' }, s.notes) : null,
+        /* What this plan found, as opposed to what the operation always
+           does: how many sites DpnI has to cut here, for instance. The
+           PDF has carried it since it was added; the screen did not. */
+        (s.details && s.details.note)
+          ? h('div', { class: 'step-note' }, s.details.note) : null);
     })));
   }
 
