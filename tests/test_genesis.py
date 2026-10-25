@@ -5519,6 +5519,99 @@ class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
         conn.close()
 
 
+class TestTheProtocolNamesWhatTheLabBuys(unittest.TestCase):
+    """A generic recipe is right for every kit and exact for none.
+
+    "2x assembly master mix, 10 uL" fits any kit; the conditions that
+    differ between them are the ones worth printing. The purchasing
+    record says which products this bench runs, and two of their
+    published conditions contradict what Genesis used to print.
+    """
+
+    def test_every_catalogue_entry_is_complete(self):
+        from genesis.reagents import CATALOGUE
+        for product in CATALOGUE:
+            with self.subTest(product.catalogue):
+                self.assertTrue(product.setup, "no reaction setup")
+                self.assertTrue(product.program, "no programme")
+                self.assertTrue(product.url.startswith("https://"))
+                self.assertTrue(product.title)
+                for amount, item in product.setup:
+                    self.assertTrue(amount and item)
+
+    def test_each_operation_resolves_to_one_product(self):
+        from genesis.reagents import CATALOGUE, for_operation
+        claimed = [op for p in CATALOGUE for op in p.operations]
+        self.assertEqual(len(claimed), len(set(claimed)),
+                         "two products claim the same operation")
+        for op in ("PCR", "HI_FI_ASSEMBLY", "LIGATION", "RE_DIGEST",
+                   "DPNI_DIGEST", "TRANSFORMATION"):
+            self.assertIsNotNone(for_operation(op), op)
+
+    def test_the_stable_strain_recovers_cold_and_not_in_soc(self):
+        """The generic text said 37 C in SOC. This lab buys NEB Stable
+        for AAV transfer plasmids, whose ITRs are exactly the repeats
+        the strain exists to hold together, and NEB specifies 30 C in
+        its own outgrowth medium - not SOC."""
+        from genesis.reagents import for_operation
+        cells = for_operation("TRANSFORMATION")
+        self.assertIn("C3040", cells.catalogue)
+        programme = " ".join(f"{a} {b}" for a, b in cells.program)
+        self.assertIn("30 C", programme)
+        self.assertNotIn("37 C", programme)
+        self.assertTrue(any("Outgrowth Medium" in a or "Outgrowth Medium" in b
+                            for a, b in cells.setup))
+        self.assertTrue(any("not to substitute SOC" in n or "SOC" in n
+                            for n in cells.notes))
+
+    def test_the_extension_rate_comes_from_the_polymerase(self):
+        """Printed twice, it can disagree with itself: Q5 extends
+        plasmid at 20-30 s/kb and Phusion at 15."""
+        from genesis.reagents import CATALOGUE, for_operation
+        q5 = for_operation("PCR")
+        self.assertEqual(q5.catalogue, "M0492")
+        self.assertTrue(q5.extension_s_per_kb)
+        phusion = [p for p in CATALOGUE if p.catalogue == "M0531"][0]
+        self.assertEqual(phusion.extension_s_per_kb, 15)
+        self.assertNotEqual(phusion.extension_s_per_kb,
+                            q5.extension_s_per_kb)
+
+    def test_the_protocol_prints_the_catalogue_number_and_the_link(self):
+        import hashlib
+        from genesis.export import protocol_pdf
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'kitbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 330), 2506)).lastrowid
+        seq = orf(150, 331)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'kitd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 332), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("kit test", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]), cfg)
+        drawn = pdf_text(protocol_pdf(plan, cfg))
+        self.assertIn(b"M0492", drawn)
+        self.assertIn(b"Kits and catalogue numbers", drawn)
+        self.assertIn(b"neb.com", drawn)
+        # the strain's own conditions, not the generic ones
+        self.assertIn(b"30 C, 60 min", drawn)
+        conn.close()
+
+
 class TestTheStylesheetDoesNotCollide(unittest.TestCase):
     """Two different things called "steps".
 

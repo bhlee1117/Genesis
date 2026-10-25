@@ -237,9 +237,9 @@ RECIPES = {
         "items": [("competent cells", "50 uL"),
                   ("assembly or ligation product", "2 uL"),
                   ("SOC medium", "950 uL")],
-        "conditions": "Ice 30 min, 42 C for 30 s, ice 5 min, add SOC, recover "
-                      "37 C for 1 h with shaking, plate on selective agar, "
-                      "incubate overnight at 37 C.",
+        "conditions": "Timings below are for the strain this lab stocks. "
+                      "A construct with no repeats can go into NEB "
+                      "5-alpha instead, recovered at 37 C in SOC.",
     },
     "COLONY_SCREEN": {
         "title": "Colony screen",
@@ -280,9 +280,13 @@ def _pcr_conditions(step: dict, primers: list[dict], cfg: Config) -> str:
             bits.append(f"primer Tm differ by {abs(tms[0] - tms[1]):.0f} C, "
                         f"consider a gradient")
     if length:
-        seconds = max(int(round(length / 1000 * 30)), 15)
+        from .reagents import for_operation
+        product = for_operation("PCR")
+        rate = (product.extension_s_per_kb if product
+                and product.extension_s_per_kb else 30)
+        seconds = max(int(round(length / 1000 * rate)), 15)
         bits.append(f"extension {seconds // 60}:{seconds % 60:02d} for "
-                    f"{length:,} bp at 30 s/kb")
+                    f"{length:,} bp at {rate} s/kb")
     gc = step.get("details", {}).get("gc")
     if gc and gc > 0.68:
         bits.append(f"{gc:.0%} GC, add the high-GC enhancer")
@@ -352,10 +356,20 @@ def build_protocol(plan: dict, cfg: Config | None = None,
         own = (step.get("details") or {}).get("note")
         if own:
             detail = (detail + " " + own).strip()
+        # A generic recipe is right for every kit and exact for none.
+        # Where the purchasing record names the product this bench runs,
+        # that product's own published setup replaces the generic one.
+        from .reagents import for_operation
+        product = for_operation(op)
+        if product is not None and product.setup:
+            recipe = {"title": product.title,
+                      "items": [(item, amount)
+                                for amount, item in product.setup]}
         steps.append({
             "index": step["index"], "operation": op,
             "description": step["description"], "detail": detail,
             "recipe": recipe, "notes": step.get("notes", ""),
+            "product": product,
         })
 
     return {
@@ -437,6 +451,42 @@ def _primer_marks(route: dict, template_name: str) -> list[dict]:
         marks.append({"name": pr.get("name", ""), "start": lo, "end": hi,
                       "strand": strand})
     return marks
+
+
+def _kit_protocols(doc, steps: list) -> None:
+    """What to buy, and where each set of conditions came from.
+
+    The conditions above are reaction parameters - volumes, temperatures,
+    times. The vendors' own protocol pages carry their figures and their
+    wording, which are theirs; this points at them rather than copying
+    them, and names the catalogue number so the page that opens is the
+    right one.
+    """
+    from .reagents import used_by, alternatives
+    ops = [s["operation"] for s in steps]
+    products = used_by(ops)
+    if not products:
+        return
+    doc.heading("Kits and catalogue numbers", 2)
+    doc.paragraph(
+        "The products this lab buys, with the page each set of conditions "
+        "above was taken from. Open the vendor page for the "
+        "manufacturer's own figures and for the current revision.", 8.6,
+        gray=0.4)
+    doc.table(["Catalogue", "Product", "Protocol"],
+              [[f"{x.vendor} #{x.catalogue}", x.name, x.url]
+               for x in products],
+              widths=[0.17, 0.35, 0.48], size=7.4)
+    extra = []
+    for op in dict.fromkeys(ops):
+        for alt in alternatives(op):
+            if alt not in extra:
+                extra.append(alt)
+    if extra:
+        doc.paragraph("Also on the shelf for these steps:", 8.4, gray=0.4)
+        for alt in extra:
+            doc.bullet(alt, 8.2, gray=0.4)
+    doc.spacer(4)
 
 
 def protocol_pdf(plan: dict, cfg: Config | None = None,
@@ -675,14 +725,27 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         if step["detail"]:
             doc.paragraph(step["detail"], 8.8, gray=0.3, indent=22)
         recipe = step["recipe"]
+        product = step.get("product")
         if recipe and step["operation"] in ("PCR", "HI_FI_ASSEMBLY",
                                             "GIBSON_ASSEMBLY", "LIGATION",
-                                            "RE_DIGEST", "TRANSFORMATION"):
+                                            "RE_DIGEST", "DPNI_DIGEST",
+                                            "TRANSFORMATION"):
             doc.paragraph(recipe["title"], 8.4, font="F2", indent=22)
+            if product is not None:
+                doc.paragraph(product.label, 7.6, indent=22, gray=0.45)
             for item, amount in recipe["items"]:
                 doc.paragraph(f"{amount:<22} {item}", 8.2, indent=30,
                               font="F3", gray=0.2)
+            if product is not None and product.program:
+                doc.spacer(2)
+                for stage, condition in product.program:
+                    doc.paragraph(f"{stage:<22} {condition}", 8.2, indent=30,
+                                  font="F3", gray=0.2)
+            for note in (product.notes if product is not None else ()):
+                doc.bullet(note, 8.0, indent=24, gray=0.4)
             doc.spacer(2)
+
+    _kit_protocols(doc, p["steps"])
 
     # --- 8. everything else -----------------------------------------
     doc.page_break()
