@@ -5516,3 +5516,47 @@ class TestPickerGroupsByProtein(unittest.TestCase):
         conn = self._inventory()
         self.assertIsInstance(protein_families(conn, "", limit=3), list)
         conn.close()
+
+
+class TestShortFragmentInAnIsothermalAssembly(unittest.TestCase):
+    """A piece an isothermal assembly could digest entirely.
+
+    Addgene's cloning reference: "Anything shorter than 200 base pairs
+    has the potential to be completely degraded by the 5' exonuclease."
+    Genesis's own floor is 100 bp, which is about whether a PCR is worth
+    running rather than whether the product survives the reaction.
+    """
+
+    def test_the_floor_is_addgenes_number(self):
+        from genesis.planner import GIBSON_EXONUCLEASE_FLOOR
+        self.assertEqual(GIBSON_EXONUCLEASE_FLOOR, 200)
+
+    def test_a_short_fragment_is_called_out(self):
+        from genesis.planner import (plan_hifi_route, PlannedFragment,
+                                     GIBSON_EXONUCLEASE_FLOOR)
+        from genesis.construct import AssembledConstruct
+        cfg = Config()
+        short = orf(150, 701)[:150]          # above the PCR floor, below 200
+        self.assertTrue(cfg.min_pcr_length <= len(short)
+                        < GIBSON_EXONUCLEASE_FLOOR)
+        frag = PlannedFragment('tiny', short, None, '(synthesis)', 0,
+                               len(short), 1, False, [], needs_synthesis=True)
+        construct = AssembledConstruct(seq=short, layout=[], circular=True)
+        route = plan_hifi_route(connect(":memory:"), construct, [frag], None,
+                                cfg, kit="HI_FI_ASSEMBLY")
+        self.assertTrue(
+            any('exonuclease' in w for w in route.warnings),
+            route.warnings)
+
+    def test_a_long_fragment_is_not(self):
+        from genesis.planner import plan_hifi_route, PlannedFragment
+        from genesis.construct import AssembledConstruct
+        cfg = Config()
+        long_ = orf(900, 702)
+        frag = PlannedFragment('big', long_, None, '(synthesis)', 0,
+                               len(long_), 1, False, [], needs_synthesis=True)
+        construct = AssembledConstruct(seq=long_, layout=[], circular=True)
+        route = plan_hifi_route(connect(":memory:"), construct, [frag], None,
+                                cfg, kit="HI_FI_ASSEMBLY")
+        self.assertFalse(any('exonuclease' in w for w in route.warnings),
+                         route.warnings)

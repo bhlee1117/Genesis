@@ -388,6 +388,22 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     for i, frag in enumerate(fragments):
         if i in absorbed:
             continue            # amplified as part of the recipient's arc
+
+        # Addgene's reference: "Anything shorter than 200 base pairs has
+        # the potential to be completely degraded by the 5' exonuclease."
+        # Genesis would rather carry a short piece on a neighbouring
+        # primer tail than put it in the tube, and usually does - but a
+        # fragment that reaches the reaction on its own is at risk
+        # whether it was amplified or ordered, so this sits before the
+        # branch that separates the two.
+        if (cfg.min_pcr_length <= len(frag.seq) < GIBSON_EXONUCLEASE_FLOOR
+                and kit in ("HI_FI_ASSEMBLY", "GIBSON_ASSEMBLY")):
+            route.warnings.append(
+                f"{frag.name} is {len(frag.seq)} bp; a fragment under "
+                f"{GIBSON_EXONUCLEASE_FLOOR} bp can be chewed away entirely "
+                f"by the exonuclease in an isothermal assembly - carry it on "
+                f"a neighbouring primer tail, or order it as annealed oligos")
+
         piece_index = where.get(i, i)
         up = pieces[piece_index - 1][1]
         down = pieces[(piece_index + 1) % n][1]
@@ -426,18 +442,6 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             route.warnings.append(
                 f"{frag.name} amplicon is {len(frag.seq)} bp, above the "
                 f"{cfg.max_pcr_length} bp limit set in the configuration")
-        # Addgene's reference: "Anything shorter than 200 base pairs has
-        # the potential to be completely degraded by the 5' exonuclease."
-        # Genesis would rather carry a short piece on a primer tail than
-        # put it in the tube, but when it does end up as its own fragment
-        # of a Gibson-style assembly, that is worth saying.
-        if (cfg.min_pcr_length <= len(frag.seq) < GIBSON_EXONUCLEASE_FLOOR
-                and kit in ("HI_FI_ASSEMBLY", "GIBSON_ASSEMBLY")):
-            route.warnings.append(
-                f"{frag.name} is {len(frag.seq)} bp; a fragment under "
-                f"{GIBSON_EXONUCLEASE_FLOOR} bp can be chewed away entirely "
-                f"by the exonuclease in an isothermal assembly - carry it on "
-                f"a neighbouring primer tail, or order it as annealed oligos")
         if len(frag.seq) < cfg.min_pcr_length:
             # Short elements are cheaper and more reliable to carry on the
             # neighbouring primer's tail, or to order as annealed oligos,
