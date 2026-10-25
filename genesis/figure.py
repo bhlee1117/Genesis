@@ -236,6 +236,35 @@ def _bp(n) -> str:
 FIGURE_TYPES = ("CDS", "promoter", "resistance", "origin")
 
 
+def outermost(items: list, start="start", end="end") -> list:
+    """Drop anything that sits entirely inside something else kept.
+
+    Real inventory files carry nested annotations - the chicken beta-actin
+    promoter inside CAG - and auto-annotation leaves junk inside them
+    too: YD030 has a 609 bp reverse-strand "Voltron2" buried in its CAG
+    promoter that has nothing to do with the real Voltron-2 CDS further
+    round the plasmid. At figure scale a feature inside another feature
+    is not a part of the construct, it is a detail of one; whether it is
+    genuine or junk, promoting it over its container misdescribes the
+    molecule. The full map in the protocol still shows everything.
+    """
+    kept = []
+    for a in items:
+        s0, e0 = a.get(start), a.get(end)
+        if not isinstance(s0, int) or not isinstance(e0, int) or e0 <= s0:
+            kept.append(a)
+            continue
+        inside = any(
+            b is not a and isinstance(b.get(start), int)
+            and isinstance(b.get(end), int) and b[end] > b[start]
+            and b[start] <= s0 and e0 <= b[end]
+            and (b[end] - b[start]) > (e0 - s0)
+            for b in items)
+        if not inside:
+            kept.append(a)
+    return kept
+
+
 def figure_features(src: dict, limit: int = 3) -> list[dict]:
     """The handful of annotations that place a parent, biggest first."""
     span = src.get("template_length") or 1
@@ -244,5 +273,81 @@ def figure_features(src: dict, limit: int = 3) -> list[dict]:
             and a.get("end", 0) > a["start"]
             and (a["end"] - a["start"]) > span * 0.05
             and a.get("feature_type") in FIGURE_TYPES]
+    keep = outermost(keep)
     keep.sort(key=lambda a: a["end"] - a["start"], reverse=True)
     return keep[:limit]
+
+
+#: What the product circle names. A construct has one promoter and one
+#: payload worth labelling at this size; the full map in the protocol
+#: carries the rest.
+PRODUCT_TYPES = ("promoter", "CDS")
+
+
+def product_features(layout: list, span: int, limit: int = 4) -> list:
+    """The features worth naming on the assembled plasmid."""
+    span = span or 1
+    keep = [a for a in layout or []
+            if isinstance(a.get("start"), int)
+            and a.get("type") in PRODUCT_TYPES
+            and (a.get("end", 0) - a["start"]) > span * 0.03]
+    keep = outermost(keep)
+    keep.sort(key=lambda a: a["end"] - a["start"], reverse=True)
+    return keep[:limit]
+
+
+#: One colour per junction, so the two halves of a join match by eye.
+#: Deliberately away from LANE_COLOURS: a lane colour says "this piece",
+#: a junction colour says "these two ends meet".
+JUNCTION_COLOURS = [
+    (0.85, 0.65, 0.05),
+    (0.74, 0.20, 0.60),
+    (0.05, 0.62, 0.66),
+    (0.45, 0.45, 0.48),
+]
+JUNCTION_LETTERS = "ABCDEF"
+
+
+def junctions(lanes: list) -> list:
+    """Which end meets which, as (lane index, side, junction id) triples.
+
+    Sticky ends pair by enzyme - a HindIII end only goes into a HindIII
+    end - so the enzyme name is the junction's identity. Homology arms
+    have no name of their own, so they are numbered by the order the
+    pieces sit in the product: piece k's right end meets piece k+1's
+    left end, all the way round the circle.
+    """
+    out = []
+    sticky = [l for l in lanes if l.get("end_kind") == "sticky"]
+    if sticky and len(sticky) == len(lanes):
+        for i, lane in enumerate(lanes):
+            for side, name in zip(("left", "right"), lane.get("ends") or []):
+                out.append((i, side, name))
+        return out
+
+    placed = [(i, l) for i, l in enumerate(lanes)
+              if isinstance((l.get("src") or {}).get("at_start"), int)]
+    if len(placed) != len(lanes) or len(lanes) < 2:
+        return out
+    placed.sort(key=lambda t: t[1]["src"]["at_start"])
+    n = len(placed)
+    for k in range(n):
+        here = placed[k][0]
+        nxt = placed[(k + 1) % n][0]
+        label = JUNCTION_LETTERS[k % len(JUNCTION_LETTERS)]
+        out.append((here, "right", label))
+        out.append((nxt, "left", label))
+    return out
+
+
+def junction_colours(lanes: list) -> dict:
+    """{(lane index, side): (label, colour)} for every end that has a partner."""
+    ids = junctions(lanes)
+    order: list = []
+    for _i, _side, name in ids:
+        if name not in order:
+            order.append(name)
+    return {(i, side): (name,
+                        JUNCTION_COLOURS[order.index(name)
+                                         % len(JUNCTION_COLOURS)])
+            for i, side, name in ids}

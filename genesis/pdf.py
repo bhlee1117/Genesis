@@ -1071,18 +1071,28 @@ def _fig_arrow(doc, x, y, w, verb, sub):
                     centre=True)
 
 
-def _fig_fragment(doc, lane, x, y, w):
-    """The linear piece in the tube, with whatever its ends are."""
+def _fig_fragment(doc, lane, index, joins, x, y, w):
+    """The linear piece in the tube, with whatever its ends are.
+
+    Both halves of a join wear the same colour and the same letter, so
+    which end goes into which is something the reader sees rather than
+    works out; two grey caps both labelled "overlap" said only that an
+    overlap existed.
+    """
     doc.fill_rect(x, y - 3, w, 6, rgb=lane["colour"])
-    ends = lane.get("ends") or []
     sticky = lane.get("end_kind") == "sticky"
-    for i, end in enumerate(ends):
-        if not end:
+    for i, side in enumerate(("left", "right")):
+        pair = joins.get((index, side))
+        fallback = (lane.get("ends") or [None, None])[i] \
+            if len(lane.get("ends") or []) > i else None
+        if not pair and not fallback:
             continue
+        label = pair[0] if pair else fallback
+        colour = pair[1] if pair else (CUT_RED if sticky
+                                       else (0.62, 0.64, 0.67))
         ex = x if i == 0 else x + w
-        doc.fill_rect(ex - 1.8, y - 5.5, 3.6, 11,
-                      rgb=CUT_RED if sticky else (0.62, 0.64, 0.67))
-        doc.text_at(end, ex, y - 15, "F1", 5.8, rgb=_FIG_GREY, centre=True)
+        doc.fill_rect(ex - 1.8, y - 5.5, 3.6, 11, rgb=colour)
+        doc.text_at(label, ex, y - 15, "F1", 5.8, rgb=colour, centre=True)
     doc.text_at(str(lane.get("piece") or "")[:26], x + w / 2, y + 7, "F2", 7,
                 rgb=_FIG_INK, centre=True)
     bp = (lane.get("src") or {}).get("bp") or 0
@@ -1103,11 +1113,8 @@ def _fig_product(doc, lanes, construct, product_bp, cx, cy):
         _arc_path(doc, cx, cy, r, src["at_start"] / span,
                   src["at_end"] / span, 4.2, lane["colour"])
 
-    named = [a for a in ((construct or {}).get("layout") or [])
-             if isinstance(a.get("start"), int)
-             and a.get("type") in ("promoter", "CDS")
-             and (a["end"] - a["start"]) > span * 0.03]
-    named.sort(key=lambda a: a["end"] - a["start"], reverse=True)
+    from .figure import product_features
+    named = product_features((construct or {}).get("layout") or [], span)
     placed: list = [(cy - r - 16, True), (cy - r - 16, False),
                     (cy - r - 10, True), (cy - r - 10, False)]
     for a in named[:3]:
@@ -1150,6 +1157,8 @@ def cloning_figure(doc: "PDF", lanes: list, join: str,
     doc.y -= 10
     top_y = doc.y
 
+    from .figure import junction_colours
+    joins = junction_colours(lanes)
     centres = []
     for i, lane in enumerate(lanes):
         cy = top_y - _FIG["row"] / 2 - i * _FIG["row"]
@@ -1162,7 +1171,7 @@ def cloning_figure(doc: "PDF", lanes: list, join: str,
         for k, stage in enumerate(lane.get("stages") or []):
             _fig_arrow(doc, x_stage + k * _FIG["stage"], cy, _FIG["stage"],
                        stage.get("verb", ""), stage.get("sub", ""))
-        _fig_fragment(doc, lane, x_frag, cy, _FIG["frag"])
+        _fig_fragment(doc, lane, i, joins, x_frag, cy, _FIG["frag"])
 
     # One bracket gathering the pieces into the single reaction.
     if rows > 1:
@@ -1186,5 +1195,10 @@ def cloning_figure(doc: "PDF", lanes: list, join: str,
     if any(l.get("origin") == "order" for l in lanes):
         key.append("a dashed box is DNA nobody has, so it is ordered")
     key.append("each colour follows one piece into the product")
+    if joins:
+        key.append("matching end colours are compatible overhangs"
+                   if lanes[0].get("end_kind") == "sticky"
+                   else "the two ends sharing a colour and letter are one "
+                        "overlap")
     doc.text_at("; ".join(key), doc.ml, doc.y, "F1", 6.2, rgb=(0.45, 0.45, 0.48))
     doc.y -= 10

@@ -5519,6 +5519,79 @@ class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
         conn.close()
 
 
+class TestTheFigureShowsWhatMeetsWhat(unittest.TestCase):
+    """Two grey caps both labelled "overlap" said only that an overlap
+    existed, not which end goes into which."""
+
+    def _lanes(self, n, kind="homology", ends=None):
+        lanes = []
+        for i in range(n):
+            lanes.append({
+                "piece": f"p{i}", "end_kind": kind,
+                "ends": ends or ["overlap", "overlap"],
+                "src": {"at_start": i * 1000, "at_end": (i + 1) * 1000}})
+        return lanes
+
+    def test_both_halves_of_a_join_share_a_letter_and_a_colour(self):
+        from genesis.figure import junction_colours
+        m = junction_colours(self._lanes(2))
+        # piece 0's right end meets piece 1's left end
+        self.assertEqual(m[(0, "right")], m[(1, "left")])
+        self.assertEqual(m[(1, "right")], m[(0, "left")])
+        # ...and the two junctions are told apart
+        self.assertNotEqual(m[(0, "right")][0], m[(1, "right")][0])
+        self.assertNotEqual(m[(0, "right")][1], m[(1, "right")][1])
+
+    def test_three_pieces_close_the_circle(self):
+        from genesis.figure import junction_colours
+        m = junction_colours(self._lanes(3))
+        self.assertEqual(len({v[0] for v in m.values()}), 3)
+        # the last piece joins back to the first
+        self.assertEqual(m[(2, "right")], m[(0, "left")])
+
+    def test_sticky_ends_pair_by_enzyme(self):
+        """A HindIII end only goes into a HindIII end, and the figure
+        should say so without counting round the product."""
+        from genesis.figure import junction_colours
+        lanes = self._lanes(2, kind="sticky", ends=["HindIII", "EcoRV"])
+        m = junction_colours(lanes)
+        self.assertEqual(m[(0, "left")][0], "HindIII")
+        self.assertEqual(m[(1, "left")][0], "HindIII")
+        self.assertEqual(m[(0, "left")][1], m[(1, "left")][1])
+        self.assertNotEqual(m[(0, "left")][1], m[(0, "right")][1])
+
+    def test_an_unplaced_piece_gets_no_junction(self):
+        """Without a simulation there is no product order to count
+        round, and inventing one would pair the wrong ends."""
+        from genesis.figure import junction_colours
+        lanes = self._lanes(2)
+        lanes[1]["src"] = {}
+        self.assertEqual(junction_colours(lanes), {})
+
+    def test_a_feature_inside_a_feature_is_not_a_part(self):
+        from genesis.figure import outermost, figure_features
+        items = [{"name": "CAG", "start": 31, "end": 1776},
+                 {"name": "chicken", "start": 397, "end": 675},
+                 {"name": "Voltron2", "start": 758, "end": 1367},
+                 {"name": "ASAP7y", "start": 1782, "end": 3066}]
+        self.assertEqual([a["name"] for a in outermost(items)],
+                         ["CAG", "ASAP7y"])
+        # and the parent picker uses it
+        src = {"template_length": 7606, "features": [
+            dict(a, feature_type="promoter" if "CAG" in a["name"] else "CDS")
+            for a in items]}
+        self.assertNotIn("Voltron2",
+                         [a["name"] for a in figure_features(src)])
+
+    def test_identical_spans_do_not_delete_each_other(self):
+        """Two annotations over exactly the same bases contain each
+        other; dropping both would leave the figure blank."""
+        from genesis.figure import outermost
+        items = [{"name": "a", "start": 0, "end": 100},
+                 {"name": "b", "start": 0, "end": 100}]
+        self.assertEqual(len(outermost(items)), 2)
+
+
 class TestTheTwoFiguresAgree(unittest.TestCase):
     """One idea, two languages.
 
@@ -5572,17 +5645,42 @@ class TestTheTwoFiguresAgree(unittest.TestCase):
         {"id": "swap_re", "steps": [], "primers": []},
     ]
 
+    #: A real layout: CAG with the chicken beta-actin promoter nested in
+    #: it, plus the junk "Voltron2" that YD030's file buries in the same
+    #: promoter, and the CDS that is actually a part of the construct.
+    NESTED = [{"name": "CAG", "start": 31, "end": 1776},
+              {"name": "chicken b-actin promoter", "start": 397, "end": 675},
+              {"name": "Voltron2", "start": 758, "end": 1367},
+              {"name": "ASAP7y", "start": 1782, "end": 3066}]
+
+    #: The product layout YD030 produces, junk annotation included.
+    LAYOUT = [{"name": "CAG", "type": "promoter", "start": 31, "end": 1776},
+              {"name": "chicken b-actin promoter", "type": "promoter",
+               "start": 397, "end": 675},
+              {"name": "Voltron2", "type": "CDS", "start": 758, "end": 1367},
+              {"name": "ASAP7y", "type": "CDS", "start": 1782, "end": 3066},
+              {"name": "Factor Xa site", "type": "CDS",
+               "start": 3537, "end": 3549}]
+
     PLAN = {"templates": {
         "pHost": {"id": 1, "name": "pHost", "bp": 6539, "circular": True,
                   "features": []},
         "pDon": {"id": 2, "name": "pDon", "bp": 6880, "circular": True,
                  "features": []}}}
 
-    SIM = {"sources": [
+    SIM = {"product_bp": 7081, "sources": [
         {"name": "backbone2", "template": "pHost", "template_length": 6539,
-         "from_start": 23, "from_end": 5814, "bp": 5807, "features": []},
+         "from_start": 23, "from_end": 5814, "bp": 5807,
+         "at_start": 0, "at_end": 5807,
+         "features": [{"feature_type": "promoter", "name": "CAG",
+                       "start": 31, "end": 1776, "strand": 1},
+                      {"feature_type": "promoter", "name": "chicken",
+                       "start": 397, "end": 675, "strand": 1},
+                      {"feature_type": "CDS", "name": "Voltron2",
+                       "start": 758, "end": 1367, "strand": -1}]},
         {"name": "Kozak+ASAP7y", "template": "pDon", "template_length": 6880,
-         "from_start": 2218, "from_end": 3508, "bp": 1305, "features": []},
+         "from_start": 2218, "from_end": 3508, "bp": 1305,
+         "at_start": 5792, "at_end": 16, "features": []},
     ]}
 
     @staticmethod
@@ -5632,24 +5730,65 @@ class TestTheTwoFiguresAgree(unittest.TestCase):
                          piece: l.piece, ends: l.ends || [],
                          stages: (l.stages||[]).map(s => [s.verb, s.sub]),
                          primers: l.primers || [] })));
-          process.stdout.write(JSON.stringify(out));
+          const joins = input.routes.map(r => {
+            const m = junctionColours(routeLanes(r, input.sim, input.plan));
+            return Object.keys(m).sort().map(k => [k, m[k][0]]);
+          });
+          const nested = outermost(input.nested).map(a => a.name);
+          const feats = input.sim.sources.map(s => figFeatures(s).map(a => a.name));
+          const prod = productFeatures(input.layout, input.span).map(a => a.name);
+          process.stdout.write(JSON.stringify({out, joins, nested, feats, prod}));
         """
         with tempfile.TemporaryDirectory() as tmp:
             drv = Path(tmp) / "drive.js"
             inp = Path(tmp) / "in.json"
             drv.write_text(driver)
             inp.write_text(json.dumps({"routes": self.ROUTES, "sim": self.SIM,
-                                       "plan": self.PLAN}))
+                                       "plan": self.PLAN,
+                                       "nested": self.NESTED,
+                                       "layout": self.LAYOUT,
+                                       "span": 7081}))
             proc = subprocess.run(
                 [node, str(drv), str(app), str(inp)],
                 capture_output=True, text=True, cwd=str(app.parent.parent))
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        got = json.loads(proc.stdout)
+        payload = json.loads(proc.stdout)
+        got = payload["out"]
 
         self.assertEqual(len(got), len(want))
         for route, a, b in zip(self.ROUTES, got, want):
             self.assertEqual(a, b, f"route {route['id']} is walked "
                                    f"differently by the two ports")
+
+        # which end meets which, and under which letter
+        from genesis.figure import junction_colours, outermost
+        for route, a in zip(self.ROUTES, payload["joins"]):
+            lanes = route_lanes(route, self.SIM, self.PLAN)
+            mine = sorted([[f"{i}|{side}", label]
+                           for (i, side), (label, _rgb)
+                           in junction_colours(lanes).items()])
+            self.assertEqual(sorted(a), mine,
+                             f"route {route['id']} pairs its ends "
+                             f"differently in the two ports")
+
+        self.assertEqual(payload["nested"],
+                         [x["name"] for x in outermost(self.NESTED)])
+
+        # and which features each port keeps on a parent circle
+        from genesis.figure import figure_features
+        self.assertEqual(
+            payload["feats"],
+            [[a["name"] for a in figure_features(src)]
+             for src in self.SIM["sources"]])
+        self.assertNotIn("Voltron2", payload["feats"][0],
+                         "a CDS buried in the CAG promoter is not a part")
+
+        # ...and on the product circle
+        from genesis.figure import product_features
+        self.assertEqual(
+            payload["prod"],
+            [a["name"] for a in product_features(self.LAYOUT, 7081)])
+        self.assertEqual(payload["prod"], ["CAG", "ASAP7y"])
 
     def test_a_bare_digest_applies_to_the_amplicon_before_it(self):
         from genesis.figure import route_lanes

@@ -1628,7 +1628,7 @@ tr.row-bad td {
 /* A sticky end is a real overhang; a homology arm is shared sequence. */
 .fig-end-cut { fill: #e0574f; }
 .fig-end-hom { fill: var(--text-muted); opacity: 0.8; }
-.fig-end-label { font-size: 9px; fill: var(--text-muted); }
+.fig-end-label { font-size: 9px; font-weight: 600; fill: var(--text-muted); }
 .fig-legend { margin: 0.2rem 0 0; }
 
 /* --- routes: what each one actually does ------------------------------- */

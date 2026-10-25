@@ -3960,6 +3960,93 @@ var FIG = {
    by looking rather than by reading. */
 var LANE_COLOURS = ['#2f7bd4', '#d4572f', '#2f9e5e', '#8e4fc9', '#b58900'];
 
+/** Drop anything sitting entirely inside something else kept.
+
+   Real files carry nested annotations - the chicken beta-actin promoter
+   inside CAG - and auto-annotation leaves junk inside them too: YD030
+   has a 609 bp reverse-strand "Voltron2" buried in its CAG promoter
+   that has nothing to do with the real Voltron-2 further round the
+   plasmid. At figure scale a feature inside another feature is a detail
+   of that feature, not a part of the construct. The full map on the
+   Protocol step still shows everything. */
+function outermost(items, startKey, endKey) {
+  var sk = startKey || 'start', ek = endKey || 'end';
+  return items.filter(function (a) {
+    var s = a[sk], e = a[ek];
+    if (typeof s !== 'number' || typeof e !== 'number' || e <= s) return true;
+    return !items.some(function (b) {
+      return b !== a && typeof b[sk] === 'number' && typeof b[ek] === 'number'
+        && b[ek] > b[sk] && b[sk] <= s && e <= b[ek]
+        && (b[ek] - b[sk]) > (e - s);
+    });
+  });
+}
+
+/* One colour per junction, so the two halves of a join match by eye.
+   Deliberately away from LANE_COLOURS: a lane colour says "this piece",
+   a junction colour says "these two ends meet". */
+var JUNCTION_COLOURS = ['#d9a60d', '#bd339a', '#0d9ea8', '#73798a'];
+var JUNCTION_LETTERS = 'ABCDEF';
+
+/** {laneIndex|side: [label, colour]} for every end that has a partner.
+
+   Sticky ends pair by enzyme - a HindIII end only goes into a HindIII
+   end - so the enzyme name is the junction's identity. Homology arms
+   have no name of their own, so they are lettered by the order the
+   pieces sit in the product: piece k's right end meets piece k+1's
+   left end, all the way round the circle. */
+function junctionColours(lanes) {
+  var ids = [];
+  var sticky = lanes.filter(function (l) { return l.endKind === 'sticky'; });
+  if (sticky.length && sticky.length === lanes.length) {
+    lanes.forEach(function (lane, i) {
+      ['left', 'right'].forEach(function (side, k) {
+        var name = (lane.ends || [])[k];
+        if (name) ids.push([i, side, name]);
+      });
+    });
+  } else {
+    var placed = lanes.map(function (l, i) { return [i, l]; })
+      .filter(function (t) {
+        return typeof ((t[1].src || {}).at_start) === 'number';
+      });
+    if (placed.length !== lanes.length || lanes.length < 2) return {};
+    placed.sort(function (a, b) {
+      return a[1].src.at_start - b[1].src.at_start;
+    });
+    for (var k = 0; k < placed.length; k++) {
+      var label = JUNCTION_LETTERS[k % JUNCTION_LETTERS.length];
+      ids.push([placed[k][0], 'right', label]);
+      ids.push([placed[(k + 1) % placed.length][0], 'left', label]);
+    }
+  }
+  var order = [];
+  ids.forEach(function (t) {
+    if (order.indexOf(t[2]) < 0) order.push(t[2]);
+  });
+  var out = {};
+  ids.forEach(function (t) {
+    out[t[0] + '|' + t[1]] = [t[2],
+      JUNCTION_COLOURS[order.indexOf(t[2]) % JUNCTION_COLOURS.length]];
+  });
+  return out;
+}
+
+/** The features worth naming on the assembled plasmid. A construct has
+   one promoter and one payload worth labelling at this size; the full
+   map on the Protocol step carries the rest. */
+function productFeatures(layout, span, limit) {
+  span = span || 1;
+  var keep = (layout || []).filter(function (a) {
+    return a && typeof a.start === 'number'
+      && ['promoter', 'CDS'].indexOf(a.type) >= 0
+      && (a.end - a.start) > span * 0.03;
+  });
+  keep = outermost(keep);
+  keep.sort(function (a, b) { return (b.end - b.start) - (a.end - a.start); });
+  return keep.slice(0, limit || 4);
+}
+
 /** The handful of features worth naming on a parent. */
 function figFeatures(src) {
   var span = src.template_length || 1;
@@ -3968,6 +4055,7 @@ function figFeatures(src) {
       && (a.end - a.start) > span * 0.05
       && ['CDS', 'promoter', 'resistance', 'origin'].indexOf(a.feature_type) >= 0;
   });
+  keep = outermost(keep);
   keep.sort(function (a, b) { return (b.end - b.start) - (a.end - a.start); });
   return keep.slice(0, 3);
 }
@@ -4167,19 +4255,28 @@ function figStageArrow(x, y, w, verb, sub, colour) {
 }
 
 /** The linear piece in the tube, with whatever its ends are. */
-function figFragment(lane, x, y, w) {
+function figFragment(lane, index, joins, x, y, w) {
   var g = svg('g', null);
   g.appendChild(svg('rect', { x: x, y: y - 6, width: w, height: 12, rx: 2,
     fill: lane.colour }));
-  (lane.ends || []).forEach(function (e, i) {
-    if (!e) return;
+  /* Both halves of a join wear the same colour and the same letter, so
+     "which end goes into which" is a thing you see rather than work
+     out. Two grey caps both labelled "overlap" said only that an
+     overlap existed. */
+  ['left', 'right'].forEach(function (side, i) {
+    var pair = joins[index + '|' + side];
+    var fallback = (lane.ends || [])[i];
+    if (!pair && !fallback) return;
+    var label = pair ? pair[0] : fallback;
+    var colour = pair ? pair[1] : null;
     var ex = i === 0 ? x : x + w;
     g.appendChild(svg('rect', { x: ex - 3.5, y: y - 10, width: 7, height: 20,
-      rx: 1.5, class: lane.endKind === 'sticky' ? 'fig-end-cut'
-                                                : 'fig-end-hom' }));
+      rx: 1.5, fill: colour || null,
+      class: colour ? null : (lane.endKind === 'sticky' ? 'fig-end-cut'
+                                                        : 'fig-end-hom') }));
     var t = svg('text', { x: ex, y: y + 22, 'text-anchor': 'middle',
-      class: 'fig-end-label' });
-    t.textContent = e;
+      class: 'fig-end-label', fill: colour || null });
+    t.textContent = label;
     g.appendChild(t);
   });
   /* The piece is named here rather than beside its parent: around a
@@ -4218,13 +4315,7 @@ function figProduct(lanes, plan, sim, cx, cy) {
 
   /* The two things a reader checks on the product: the promoter and what
      it drives. Everything else is on the full map in the Protocol step. */
-  var named = (c.layout || []).filter(function (a) {
-    return a && typeof a.start === 'number'
-      && ['promoter', 'CDS'].indexOf(a.type) >= 0
-      && (a.end - a.start) > span * 0.03;
-  });
-  named.sort(function (a, b) { return (b.end - b.start) - (a.end - a.start); });
-  named.slice(0, 4).forEach(function (a) {
+  productFeatures(c.layout || [], span).forEach(function (a) {
     var from = (a.start % span) / span, to = (a.end % span) / span;
     g.appendChild(svg('path', {
       d: arcPath(cx, cy, r - 11, from, to), fill: 'none',
@@ -4435,6 +4526,7 @@ function cloningFigure(route, plan) {
   defs.appendChild(marker);
   root.appendChild(defs);
 
+  var joins = junctionColours(lanes);
   lanes.forEach(function (lane, i) {
     var cy = i * FIG.rowH + FIG.rowH / 2;
     var cx = xParent + FIG.colParent / 2;
@@ -4444,7 +4536,7 @@ function cloningFigure(route, plan) {
       root.appendChild(figStageArrow(xStage + k * FIG.colStage, cy,
                                      FIG.colStage, stage.verb, stage.sub));
     });
-    root.appendChild(figFragment(lane, xFrag, cy, FIG.colFrag));
+    root.appendChild(figFragment(lane, i, joins, xFrag, cy, FIG.colFrag));
   });
 
   /* One bracket gathering the pieces into the single reaction. */
@@ -4472,6 +4564,11 @@ function figLegend(route, lanes) {
     bits.push('a dashed box is DNA nobody has, so it is ordered');
   }
   bits.push('each colour follows one piece into the product');
+  if (Object.keys(junctionColours(lanes)).length) {
+    bits.push(lanes[0] && lanes[0].endKind === 'sticky'
+      ? 'matching end colours are compatible overhangs'
+      : 'the two ends sharing a colour and letter are one overlap');
+  }
   return bits.join(' · ');
 }
 
