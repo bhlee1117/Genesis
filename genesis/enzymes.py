@@ -275,6 +275,21 @@ def ends_compatible(a_overhang: str, a_type: str,
     return a_overhang.upper() == revcomp(b_overhang).upper()
 
 
+def dam_sites(seq: str, circular: bool = False) -> int:
+    """How many GATC sites a sequence has.
+
+    This is what decides whether DpnI can do its job. DpnI is not a rare
+    cutter being used to linearise something - it is a methylation
+    reader: it cuts Gm6ATC and ignores the same site unmethylated. A
+    plasmid grown in a dam+ strain carries a methyl group on every one of
+    these, so a template with thirty of them is cut into thirty pieces
+    and cannot transform, while the PCR product off it - built from
+    unmethylated dNTPs - is untouched. Many sites is the mechanism, not a
+    hazard. No sites, and the step does nothing at all.
+    """
+    return len(list(find_all(seq, "GATC", circular=circular)))
+
+
 def methylation_warnings(seq: str, enzyme: Enzyme, circular: bool = False) -> list[str]:
     """Flag dam/dcm overlap, which silently blocks digestion of plasmid DNA
     grown in standard E. coli."""

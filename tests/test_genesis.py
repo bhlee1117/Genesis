@@ -2852,11 +2852,15 @@ class TestDpnINecessity(unittest.TestCase):
     def setUp(self):
         self.conn = connect(":memory:")
 
-    def _plasmid(self, name, marker):
+    def _plasmid(self, name, marker, seq=None):
+        # Real plasmids carry a GATC every few hundred bases; a 4 bp stub
+        # carries none, which is now its own answer ("DpnI cannot cut
+        # this") and would mask what these tests are about.
+        seq = seq if seq is not None else ("GATC" + rand_seq(200, 77)) * 10
         pid = self.conn.execute(
             """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
-                    circular) VALUES (?,'t','ACGT',4,?,1)""",
-            (name, name)).lastrowid
+                    circular) VALUES (?,'t',?,?,?,1)""",
+            (name, seq, len(seq), name)).lastrowid
         if marker:
             self.conn.execute(
                 """INSERT INTO annotation(plasmid_id, feature_type, name,
@@ -2900,6 +2904,26 @@ class TestDpnINecessity(unittest.TestCase):
         template = self._plasmid("template", None)
         self.assertTrue(dpni_decision(self.conn, [template], product,
                                       gel_purified=False)["needed"])
+
+    def test_a_template_dpni_cannot_cut_is_a_risk_not_a_saving(self):
+        """Skipping the step because the plate removes the parent and
+        skipping it because the enzyme does nothing are different
+        answers; only one of them means the background is handled."""
+        from genesis.planner import dpni_decision, dpni_skipped_warning
+        product = self._plasmid("product", "AmpR")
+        template = self._plasmid("template", "AmpR", seq="ACGTACGT" * 300)
+        result = dpni_decision(self.conn, [template], product,
+                               gel_purified=False)
+        self.assertFalse(result["needed"])
+        self.assertTrue(result["blocked"])
+        self.assertIn("cannot be used", dpni_skipped_warning(result))
+        self.assertIn("false clones", dpni_skipped_warning(result))
+
+        # ...whereas a different marker is a genuine saving
+        other = self._plasmid("other", "KanR")
+        ok = dpni_decision(self.conn, [other], product, gel_purified=False)
+        self.assertFalse(ok["blocked"])
+        self.assertIn("not needed", dpni_skipped_warning(ok))
 
     def test_markers_are_recognised_by_their_usual_labels(self):
         from genesis.planner import resistance_marker
@@ -5300,6 +5324,115 @@ class TestEveryPieceInTheTubeIsDrawable(unittest.TestCase):
         d = result.to_dict()
         self.assertNotIn("seq", d["sources"][0])
         self.assertEqual(d["sources"][0]["name"], "a")
+
+
+class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
+    """DpnI reads methylation, not a rare sequence.
+
+    A plasmid grown in a dam+ strain carries a methyl group on every
+    GATC, so a template with thirty of them is cut into thirty pieces
+    and cannot transform, while the PCR product off it - built from
+    unmethylated dNTPs - is untouched. Many sites is the mechanism. No
+    sites and the step is theatre, which is the case nothing checked:
+    dpni_decision's docstring claimed to skip a template DpnI cannot
+    cut, and the code never looked.
+    """
+
+    def _db(self, template_seq, product_marker="AmpR",
+            template_marker="AmpR"):
+        conn = connect(":memory:")
+        tid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular) VALUES ('pTpl','t',?,?,'dp1',1)""",
+            (template_seq, len(template_seq))).lastrowid
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular) VALUES ('pProd','t',?,?,'dp2',1)""",
+            ("ACGT" * 500, 2000)).lastrowid
+        for plasmid, marker in ((tid, template_marker), (pid, product_marker)):
+            if marker:
+                conn.execute(
+                    """INSERT INTO annotation(plasmid_id, name, feature_type,
+                            start, end, strand) VALUES (?,?,'resistance',0,10,1)""",
+                    (plasmid, marker))
+        conn.commit()
+        return conn, tid, pid
+
+    def test_sites_are_counted_around_the_circle(self):
+        from genesis.enzymes import dam_sites
+        self.assertEqual(dam_sites("GATCAAAAGATC"), 2)
+        # a site split across the origin is still a site
+        self.assertEqual(dam_sites("TCAAAAAAGA", circular=True), 1)
+        self.assertEqual(dam_sites("TCAAAAAAGA", circular=False), 0)
+
+    def test_a_template_with_no_gatc_cannot_be_cut(self):
+        from genesis.planner import dpni_decision
+        conn, tid, pid = self._db("ACGTACGTAC" * 200)   # no GATC anywhere
+        d = dpni_decision(conn, [tid], pid, gel_purified=False)
+        self.assertFalse(d["needed"], d["reason"])
+        self.assertIn("GATC", d["reason"])
+        self.assertEqual(d["uncuttable"], ["pTpl"])
+        self.assertEqual(d["sites"], {"pTpl": 0})
+        conn.close()
+
+    def test_a_normal_plasmid_is_cut_many_times_and_dpni_stays(self):
+        from genesis.planner import dpni_decision, dpni_note
+        conn, tid, pid = self._db(("GATC" + rand_seq(250, 8)) * 20)
+        d = dpni_decision(conn, [tid], pid, gel_purified=False)
+        self.assertTrue(d["needed"], d["reason"])
+        self.assertGreaterEqual(d["sites"]["pTpl"], 20)
+        self.assertEqual(d["uncuttable"], [])
+        # the count is what answers "why is it cutting everywhere?"
+        note = dpni_note(d)
+        self.assertIn("GATC site", note)
+        self.assertIn("unmethylated", note)
+        conn.close()
+
+    def test_a_different_marker_still_skips_it(self):
+        """The GATC check must not override the cheaper reasons."""
+        from genesis.planner import dpni_decision
+        conn, tid, pid = self._db(("GATC" + rand_seq(250, 9)) * 20,
+                                  product_marker="KanR",
+                                  template_marker="AmpR")
+        d = dpni_decision(conn, [tid], pid, gel_purified=False)
+        self.assertFalse(d["needed"])
+        self.assertIn("antibiotic", d["reason"])
+        conn.close()
+
+    def test_the_step_carries_the_count_into_the_protocol(self):
+        """The question this answers - "my plasmid has dozens of DpnI
+        sites, why is that fine?" - needs the number on the page."""
+        import hashlib
+        from genesis.export import protocol_pdf
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'dpbb',1,'sequence_verified')""",
+            ("GAATTC" + ("GATC" + rand_seq(120, 320)) * 20,
+             6 + 124 * 20)).lastrowid
+        seq = orf(150, 321)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'dpd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 322), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("dpni test", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]), cfg)
+        drawn = pdf_text(protocol_pdf(plan, cfg))
+        self.assertIn(b"GATC site", drawn)
+        self.assertIn(b"unmethylated dNTPs", drawn)
+        conn.close()
 
 
 class TestTheTwoFiguresAgree(unittest.TestCase):

@@ -170,9 +170,13 @@ RECIPES = {
     "DPNI_DIGEST": {
         "title": "DpnI treatment",
         "items": [("completed PCR reaction", "all"), ("DpnI", "1 uL")],
-        "conditions": "37 C for 30-60 min, added directly to the PCR. Only "
-                      "cuts methylated (dam+) parental plasmid, not the "
-                      "amplicon.",
+        "conditions": "37 C for 30-60 min, added directly to the PCR. DpnI "
+                      "reads methylation rather than a rare sequence: it "
+                      "cuts GATC only where the A is dam-methylated, which "
+                      "is every GATC in a plasmid grown in a standard "
+                      "(dam+) strain and none in a PCR product, built from "
+                      "unmethylated dNTPs. Cutting the template at many "
+                      "sites is how the step works.",
     },
     "DNA_CLEANUP": {
         "title": "Column or bead clean-up",
@@ -336,6 +340,12 @@ def build_protocol(plan: dict, cfg: Config | None = None,
             if r:
                 detail = r.get("conditions", "")
                 recipe = r if r.get("items") else None
+        # A step may carry a fact about this plan rather than about the
+        # operation in general - how many sites DpnI has to cut here, for
+        # instance - and that belongs under the step, not in a table.
+        own = (step.get("details") or {}).get("note")
+        if own:
+            detail = (detail + " " + own).strip()
         steps.append({
             "index": step["index"], "operation": op,
             "description": step["description"], "detail": detail,
@@ -736,6 +746,13 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         doc.paragraph("The primers below were amplified off the named templates "
                  "and the products assembled, to check the steps build this "
                  "construct rather than merely describe it.", 8.6)
+        doc.paragraph(
+            "It replays the steps that change DNA - PCR, digestion, "
+            "synthesis and the join - against the real inventory "
+            "sequences. The steps that only change what else is in the "
+            "tube (DpnI, clean-up, transformation, screening) are not "
+            "replayed, so this says the intended molecule can form, not "
+            "what fraction of colonies will carry it.", 8.2, gray=0.45)
         doc.paragraph(f"Result: {sim.get('summary', '')}", 9.0)
         if sim.get("modules"):
             doc.table(["Part", "Length", "In the product"],

@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 
 from .config import Config
 from .construct import AssembledConstruct, ResolvedModule
-from .enzymes import CATALOG, digest, ends_compatible, find_sites, methylation_warnings
+from .enzymes import (CATALOG, dam_sites, digest, ends_compatible, find_sites,
+                      methylation_warnings)
 from .operations import Step, renumber
 from .primers import (Junction, Primer, analyse_junctions, check_overlap_uniqueness,
                       design_gibson_pair, design_re_pair)
@@ -349,6 +350,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
 
     n = len(pieces)
     templates_needing_dpni: list[str] = []
+    dpni_template_ids: list = []
 
     # --- backbone amplification ------------------------------------------
     for k, piece in enumerate(ordered):
@@ -381,6 +383,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             details={"length": len(bb_seq), "template": backbone["name"]}))
         if backbone["name"] not in templates_needing_dpni:
             templates_needing_dpni.append(backbone["name"])
+            dpni_template_ids.append(backbone["id"])
 
     # --- insert amplification ---------------------------------------------
     where = {o["index"]: k for k, o in enumerate(ordered)
@@ -463,17 +466,36 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             details={"length": len(frag.seq), "template": frag.source_name,
                      "gc": round(gc_fraction(frag.seq), 3)}))
         templates_needing_dpni.append(frag.source_name)
+        if frag.source_plasmid_id:
+            dpni_template_ids.append(frag.source_plasmid_id)
 
     # --- template removal and cleanup -------------------------------------
-    if templates_needing_dpni:
-        steps.append(Step(
-            0, "DPNI_DIGEST",
-            "Digest the PCR reactions with DpnI to remove the parental "
-            "plasmid templates (" + ", ".join(sorted(set(templates_needing_dpni))[:4]) + ")",
-            output="template-free amplicons"))
-
-    # Gel extraction only where it is actually warranted (Stage 8 rule).
+    # Gel extraction is decided first: an amplicon cut out of a gel is
+    # already separated from its template, which is one of the reasons
+    # DpnI can be skipped. The swap routes have always reasoned this way;
+    # here the step went in unconditionally.
     gel_needed = [f.name for f in fragments if _expects_extra_bands(f, cfg)]
+    if templates_needing_dpni:
+        dpni = dpni_decision(conn, dpni_template_ids,
+                             backbone["id"] if backbone else None,
+                             gel_purified=bool(gel_needed) and
+                             len(gel_needed) == len(fragments))
+        if dpni["needed"]:
+            note = dpni_note(dpni)
+            steps.append(Step(
+                0, "DPNI_DIGEST",
+                "Digest the PCR reactions with DpnI to remove the parental "
+                "plasmid templates ("
+                + ", ".join(sorted(set(templates_needing_dpni))[:4]) + ")",
+                output="template-free amplicons",
+                details={"note": note} if note else {}))
+            for name in dpni.get("uncuttable") or []:
+                route.warnings.append(
+                    f"{name} has no GATC site, so DpnI cannot cut it; gel "
+                    f"purify that amplicon or expect parental background")
+        else:
+            route.warnings.append(dpni_skipped_warning(dpni))
+
     if gel_needed:
         steps.append(Step(
             0, "GEL_EXTRACTION",
@@ -644,10 +666,20 @@ def plan_gblock_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         inputs=[backbone["name"], f"{bb_f.name}+{bb_r.name}"],
         output="linearised vector",
         details={"length": len(kept), "template": backbone["name"]}))
-    steps.append(Step(
-        0, "DPNI_DIGEST",
-        f"Digest the PCR with DpnI to remove the {backbone['name']} template",
-        inputs=["vector PCR"], output="template-free vector"))
+    dpni = (dpni_decision(conn, [backbone["id"]], backbone["id"],
+                          gel_purified=False) if conn is not None
+            else {"needed": True, "blocked": False, "sites": {},
+                  "uncuttable": []})
+    if dpni["needed"]:
+        note = dpni_note(dpni)
+        steps.append(Step(
+            0, "DPNI_DIGEST",
+            f"Digest the PCR with DpnI to remove the {backbone['name']} "
+            f"template",
+            inputs=["vector PCR"], output="template-free vector",
+            details={"note": note} if note else {}))
+    else:
+        route.warnings.append(dpni_skipped_warning(dpni))
     steps.append(Step(
         0, "DNA_CLEANUP", "Column purify the vector PCR",
         output="clean vector"))
@@ -1319,13 +1351,19 @@ def plan_swap_hifi_route(conn: sqlite3.Connection, analysis, cfg: Config,
                                 analysis.donor.plasmid_id],
                          analysis.recipient.plasmid_id, gel_purified=False)
     if dpni["needed"]:
+        note = dpni_note(dpni)
         steps.append(Step(
             0, "DPNI_DIGEST",
             f"Digest both PCR reactions with DpnI to remove the parental "
             f"{rec['name']} and {don['name']} templates",
-            output="template-free amplicons"))
+            output="template-free amplicons",
+            details={"note": note} if note else {}))
     else:
-        route.warnings.append("DpnI is not needed here: " + dpni["reason"])
+        route.warnings.append(dpni_skipped_warning(dpni))
+    for name in dpni.get("uncuttable") or []:
+        route.warnings.append(
+            f"{name} has no GATC site, so DpnI cannot cut it; gel purify "
+            f"that amplicon or expect parental background")
     steps.append(Step(0, "DNA_CLEANUP",
                       "Column purify both PCR products",
                       output="clean amplicons"))
@@ -1692,12 +1730,14 @@ def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
     dpni = dpni_decision(conn, [analysis.donor.plasmid_id],
                          analysis.recipient.plasmid_id, gel_purified=False)
     if dpni["needed"]:
+        note = dpni_note(dpni)
         steps.append(Step(
             0, "DPNI_DIGEST",
             f"Digest the PCR with DpnI to remove the parental {don['name']}",
-            output="template-free amplicon"))
+            output="template-free amplicon",
+            details={"note": note} if note else {}))
     else:
-        route.warnings.append("DpnI is not needed here: " + dpni["reason"])
+        route.warnings.append(dpni_skipped_warning(dpni))
     steps.append(Step(0, "DNA_CLEANUP", "Column purify the PCR product",
                       output="clean amplicon"))
     steps.append(Step(
@@ -1773,19 +1813,39 @@ def dpni_decision(conn: sqlite3.Connection, template_ids: list,
       template;
     * the template selects on a different antibiotic from the product, so
       the plate removes it;
-    * the template was not a plasmid grown in a dam+ strain, in which case
-      DpnI has nothing to cut.
+    * the template has no GATC sites at all, in which case DpnI has
+      nothing to cut whatever strain it came from.
+
+    The returned dict also carries ``sites``: how many times DpnI cuts
+    each template. That number is the whole mechanism - DpnI reads
+    methylation rather than a rare sequence, so a template cut thirty
+    times is a template destroyed - and printing it is what stops the
+    step reading as "an enzyme that cuts everywhere is being added to my
+    reaction".
     """
-    reasons: list[str] = []
+    sites = {}
+    uncuttable = []
+    for tid in template_ids:
+        row = conn.execute(
+            "SELECT name, seq, circular FROM plasmid WHERE id = ?",
+            (tid,)).fetchone()
+        if row is None:
+            continue
+        n = dam_sites(row["seq"], bool(row["circular"]))
+        sites[row["name"]] = n
+        if n == 0:
+            uncuttable.append(row["name"])
+
     if gel_purified:
-        return {"needed": False,
+        return {"needed": False, "blocked": False, "sites": sites,
+                "uncuttable": uncuttable,
                 "reason": "the amplicon is gel purified, which separates it "
                           "from the parental plasmid; DpnI would be "
                           "belt-and-braces"}
 
     product_marker = (resistance_marker(conn, product_id)
                       if product_id is not None else None)
-    same_selection = []
+    same_selection, reasons = [], []
     for tid in template_ids:
         marker = resistance_marker(conn, tid)
         if marker is None or product_marker is None or marker == product_marker:
@@ -1795,12 +1855,53 @@ def dpni_decision(conn: sqlite3.Connection, template_ids: list,
                            f"on {product_marker}")
 
     if not same_selection:
-        return {"needed": False,
+        return {"needed": False, "blocked": False, "sites": sites,
+                "uncuttable": uncuttable,
                 "reason": "every template selects on a different antibiotic "
                           "from the product, so the plate removes them: "
                           + "; ".join(dict.fromkeys(reasons))}
 
-    return {"needed": True,
+    # The docstring has always claimed this case; nothing ever tested it.
+    # A template with no GATC survives DpnI intact, and if it also
+    # selects like the product it transforms and grows as a false clone -
+    # the exact failure the step is there to prevent, reported as
+    # prevented.
+    if sites and all(n == 0 for n in sites.values()):
+        return {"needed": False, "blocked": True, "sites": sites,
+                "uncuttable": uncuttable,
+                "reason": "no template has a single GATC site, so DpnI "
+                          "cannot cut any of them; gel purify the amplicon "
+                          "instead"}
+
+    return {"needed": True, "blocked": False, "sites": sites,
+            "uncuttable": uncuttable,
             "reason": "a template carries the same selection marker as the "
                       "product, so parental plasmid surviving the reaction "
                       "would grow on the plate and look like a clone"}
+
+
+def dpni_skipped_warning(decision: dict) -> str:
+    """What to say when the step is not emitted.
+
+    "DpnI is not needed here" is the right phrase for a template the
+    plate or the gel already removes, and the wrong one for a template
+    DpnI simply cannot touch: that is parental background nobody is
+    dealing with, reported as a step saved.
+    """
+    if decision.get("blocked"):
+        return ("DpnI cannot be used here: " + decision["reason"]
+                + " - parental plasmid will otherwise transform and grow "
+                  "as false clones")
+    return "DpnI is not needed here: " + decision["reason"]
+
+
+def dpni_note(decision: dict) -> str:
+    """How hard DpnI cuts each template, for the step that runs it."""
+    sites = decision.get("sites") or {}
+    if not sites:
+        return ""
+    parts = [f"{name} has {n} GATC site{'' if n == 1 else 's'}"
+             for name, n in sites.items()]
+    return ("; ".join(parts)
+            + " - DpnI cuts every one of them in the methylated plasmid and "
+              "none in the PCR product, which is unmethylated.")
