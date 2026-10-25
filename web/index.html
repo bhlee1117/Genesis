@@ -141,17 +141,19 @@
         <textarea id="spec-yaml" spellcheck="false" rows="14"></textarea>
       </div>
 
+      <!-- One move out of this step. Designing and saving belong to the
+           steps that produce something worth saving, not to the one where
+           you are still describing what you want. -->
       <div class="card-foot">
         <button type="button" id="scan" class="primary">Move on to Scan source &rarr;</button>
-        <button type="button" id="generate" class="primary">Generate protocol</button>
-        <button type="button" id="clear-spec" class="secondary"
-                title="Reset the specification to an empty one and remove the plan on screen">Clear</button>
-        <span class="save-group">
-          <button type="button" id="save-version" class="secondary" disabled>Save</button>
-          <button type="button" id="save-overwrite" class="secondary" disabled>Overwrite</button>
-          <button type="button" id="save-as" class="secondary" disabled>Save as&hellip;</button>
-        </span>
         <span class="status" id="design-status"></span>
+        <span hidden>
+          <button type="button" id="generate"></button>
+          <button type="button" id="clear-spec"></button>
+          <button type="button" id="save-version" disabled></button>
+          <button type="button" id="save-overwrite" disabled></button>
+          <button type="button" id="save-as" disabled></button>
+        </span>
       </div>
       <p class="save-link muted small" id="save-link"></p>
     </div>

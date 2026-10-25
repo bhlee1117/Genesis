@@ -1353,7 +1353,8 @@ function partPicker(mod) {
     chip.appendChild(h('button', {
       type: 'button', class: 'pin-clear', title: 'Unpin — match this name loosely again',
       onclick: function () {
-        mod.part_id = null; mod.pin_note = ''; renderChip(); input.focus();
+        mod.part_id = null; mod.pin_note = ''; mod.part_bp = null;
+        renderChip(); renderSpecPreview(); input.focus();
       }
     }, '×'));
   }
@@ -1405,9 +1406,15 @@ function partPicker(mod) {
     mod.name = row.name || '';
     mod.part_id = row.id;
     mod.pin_note = row.note || '';
+    /* The sketch was drawn from typical lengths for each kind of element.
+       Once a real part is chosen its real length is known, so the drawing
+       stops being a guess for that module. */
+    var src = row.source || {};
+    mod.part_bp = Number(src.bp || src.seq_length) || null;
     input.value = mod.name;
     renderChip();
     close();
+    renderSpecPreview();
   }
 
   function show(node_) {
@@ -1713,7 +1720,11 @@ function partPicker(mod) {
 
   input.addEventListener('input', function () {
     mod.name = input.value;
-    if (mod.part_id) { mod.part_id = null; mod.pin_note = ''; renderChip(); }
+    if (mod.part_id) {
+      mod.part_id = null; mod.pin_note = ''; mod.part_bp = null; renderChip();
+    }
+    /* Redraw as it is typed, not only when the row list is rebuilt. */
+    renderSpecPreview();
     schedule();
   });
   input.addEventListener('focus', function () {
@@ -1933,6 +1944,7 @@ function specPreviewItems() {
   });
 
   state.modules.forEach(function (mod, i) {
+    if (!isCreLox(mod.type) && !(mod.name || '').trim() && !mod.part_id) return;
     if (isCreLox(mod.type)) {
       var pair = LOX_OF[(mod.mode || 'DIO').toUpperCase()] || LOX_OF.DIO;
       put('lox_site', pair[0], NOMINAL_BP.lox_site);
@@ -1963,8 +1975,10 @@ function renderSpecPreview() {
   var host = $('spec-preview');
   if (!host) return;
   clear(host);
+  /* An empty row is not a module yet: drawing a 4.6 kb plasmid from one
+     blank promoter box claimed more than the user had said. */
   var real = state.modules.filter(function (m) {
-    return m.type && !isCreLox(m.type);
+    return m.type && !isCreLox(m.type) && ((m.name || '').trim() || m.part_id);
   }).length;
   if (!real) {
     host.appendChild(h('p', { class: 'muted small' },
@@ -2448,10 +2462,23 @@ function resetSteps() {
   showStep('spec');
 }
 
+/** A fingerprint of the specification, to tell a stale plan from a live one. */
+function specSignature() {
+  return JSON.stringify((state.modules || []).map(function (m) {
+    return [m.type, m.name, m.part_id, m.mode];
+  })) + '|' + (($('spec-backbone') || {}).value || '');
+}
+
 function renderScan() {
-  resetSteps();
   var scan = state.scan;
   if (!scan) return;
+  /* Scanning used to clear the rail, so going back for another look at
+     the parents threw away the routes - six steps became three and the
+     way forward vanished. The plan only goes stale when the thing it was
+     built from changes. */
+  if (state.planSignature && state.planSignature !== specSignature()) {
+    resetSteps();
+  }
 
   var card = h('div', { class: 'card' },
     h('div', { class: 'card-head' },
@@ -2476,9 +2503,41 @@ function renderScan() {
       { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
     ], scan.modules));
   }
-  fillStep('scan', [card, renderCandidates(scan)]);
+  fillStep('scan', [card, renderCandidates(scan), nextFromScan()]);
   fillStep('select', selectionSummary(scan));
   showStep('scan');
+}
+
+/** The move out of Routes: the protocol for the route now chosen. */
+function nextFromRoutes() {
+  return h('div', { class: 'card step-next' },
+    h('button', {
+      type: 'button', class: 'primary',
+      onclick: function () { showStep('scheme'); }
+    }, 'Move on to Cloning scheme \u2192'),
+    h('span', { class: 'muted small' },
+      'The numbered protocol, the primers to order and the checks.'));
+}
+
+/** The move out of Scan source: straight to the routes. */
+function nextFromScan() {
+  var haveRoutes = !!(state.plan && (state.plan.routes || []).length);
+  return h('div', { class: 'card step-next' },
+    haveRoutes
+      ? h('button', {
+          type: 'button', class: 'primary',
+          onclick: function () { showStep('routes'); }
+        }, 'Move on to Routes \u2192')
+      : h('button', {
+          type: 'button', class: 'primary',
+          title: 'Design with the parents chosen here and rank the ways '
+               + 'to build it',
+          onclick: function () { generatePlan(); }
+        }, 'Move on to Routes \u2192'),
+    h('span', { class: 'muted small' },
+      haveRoutes
+        ? 'Already designed \u2014 this goes back to the ranked routes.'
+        : 'Runs the planner with whatever is chosen above.'));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2899,6 +2958,7 @@ function renderPlan() {
   resetSteps();
   var plan = state.plan;
   if (!plan) return;
+  var scanCards = [scanRecap(plan), renderCandidates(plan), nextFromScan()];
 
   var c = plan.construct || {};
 
@@ -2941,21 +3001,25 @@ function renderPlan() {
                       plan.vector ? renderVector(plan.vector, plan) : null]);
 
   /* --- 3. where the parts come from, and what to start from -------- */
-  fillStep('scan', [scanRecap(plan), renderCandidates(plan)]);
+  fillStep('scan', scanCards);
   fillStep('select', selectionSummary(plan));
 
   /* --- 6. how to build it ------------------------------------------ */
   var route = selectedRoute();
   fillStep('routes', [renderRoutes(plan.routes || []),
-                      route ? renderRouteDetail(route) : null]);
+                      renderCloningFlow(route, plan),
+                      nextFromRoutes()]);
 
   /* --- 7. the plan at the bench, and whether it holds up ------------ */
   fillStep('scheme', [schemeCard(plan),
+                      route ? renderRouteDetail(route) : null,
                       renderSimulation(route, plan),
                       plan.verification
                         ? renderVerification(plan.verification) : null,
                       renderValidation(plan.validation || {}),
                       renderExports()]);
+
+  state.planSignature = specSignature();
 
   /* Land on the routes: with a plan in hand that is the decision to
      make, and every earlier step stays one click away. */
@@ -3250,6 +3314,78 @@ function renderConstruct(c) {
  * one of these is on their own bench, or sequenced, or simply the one the
  * lab uses. Choosing here re-plans from that choice.
  */
+
+/* ------------------------------------------------------------------ */
+/* Scan source: the plasmid you are pointing at                        */
+/* ------------------------------------------------------------------ */
+/* Choosing a parent off a list of names is choosing blind. This draws
+   whichever one is selected, with the parts the request asked for picked
+   out of it, so "already has CAG" is something you can see rather than
+   something you take on trust. */
+
+var PLASMID_CACHE = {};
+
+function fetchPlasmid(id) {
+  if (!PLASMID_CACHE[id]) {
+    PLASMID_CACHE[id] = api('/api/plasmid/' + id)
+      .catch(function (e) { delete PLASMID_CACHE[id]; throw e; });
+  }
+  return PLASMID_CACHE[id];
+}
+
+/** Does this annotation answer one of the names the request asked for? */
+function wantedBy(ann, wants) {
+  var nm = String(ann.name || '').toLowerCase();
+  if (!nm) return false;
+  return wants.some(function (w) {
+    w = String(w || '').toLowerCase();
+    return w && (nm === w || nm.indexOf(w) >= 0 || w.indexOf(nm) >= 0);
+  });
+}
+
+function showCandidateMap(host, plasmidId, wants, role) {
+  clear(host);
+  if (!plasmidId) {
+    host.appendChild(h('p', { class: 'muted small' },
+      'Pick a plasmid to see what is in it.'));
+    return;
+  }
+  host.appendChild(h('p', { class: 'muted small' }, 'Loading\u2026'));
+  fetchPlasmid(plasmidId).then(function (p) {
+    clear(host);
+    var anns = (p.annotations || []).filter(function (a) {
+      return a && typeof a.start === 'number' && a.end > a.start;
+    });
+    var hits = anns.filter(function (a) { return wantedBy(a, wants); });
+    host.appendChild(h('div', { class: 'card-head' },
+      h('h4', null, p.name || ('plasmid #' + plasmidId)),
+      h('span', { class: 'muted small' },
+        bp(p.seq_length) + ' \u00b7 ' + (role || 'parent'))));
+    host.appendChild(mapWithToggle(p.seq_length, anns.map(function (a) {
+      return {
+        feature_type: a.feature_type, name: a.name,
+        start: a.start, end: a.end, strand: a.strand,
+        /* The thing being looked for, lit up against the rest. */
+        colour: wantedBy(a, wants) ? '#f0a32a' : null
+      };
+    }), { label: p.name, circular: !!p.circular }));
+    if (hits.length) {
+      host.appendChild(h('p', { class: 'muted small' },
+        'In amber: ' + hits.map(function (a) {
+          return a.name + ' (' + (a.start + 1) + '\u2013' + a.end + ')';
+        }).join(', ') + '.'));
+    } else {
+      host.appendChild(h('p', { class: 'muted small' },
+        'None of the requested parts is annotated in this plasmid by name '
+        + '\u2014 it may still carry them under another label.'));
+    }
+  }).catch(function (e) {
+    clear(host);
+    host.appendChild(h('p', { class: 'inline-warn' },
+      'could not load that plasmid: ' + e.message));
+  });
+}
+
 function renderCandidates(plan) {
   var cand = plan.candidates || {};
   var recipients = cand.recipients || [];
@@ -3266,9 +3402,17 @@ function renderCandidates(plan) {
   card.appendChild(h('p', { class: 'muted small' },
     'Read as an architecture: ' + (cand.modules || []).join(' – ') + '.'));
 
+  var wants = (cand.modules || []).slice();
+  var mapHost = h('aside', { class: 'cand-map card' });
+  var lists = h('div', { class: 'cand-lists' });
+  var split = h('div', { class: 'cand-split' }, lists, mapHost);
+  card.appendChild(split);
+  /* Start on whatever is already chosen, so the panel is never blank. */
+  showCandidateMap(mapHost, chosenBackbone, wants, 'recipient');
+
   if (recipients.length) {
-    card.appendChild(h('h4', null, 'Start from'));
-    card.appendChild(h('p', { class: 'muted small' },
+    lists.appendChild(h('h4', null, 'Start from'));
+    lists.appendChild(h('p', { class: 'muted small' },
       'The score counts how many of these a plasmid really carries, in ' +
       'order from the start: 2/2 has both and only the vector has to be ' +
       'opened, 1/2 has the first and the rest must be built. A plasmid ' +
@@ -3290,6 +3434,7 @@ function renderCandidates(plan) {
           checked: on ? 'checked' : null,
           onchange: function () {
             $('spec-backbone').value = String(r.plasmid_id);
+            showCandidateMap(mapHost, r.plasmid_id, wants, 'recipient');
             replan();
           }
         }),
@@ -3314,12 +3459,12 @@ function renderCandidates(plan) {
           'already has ' + (r.carries || []).join(', ')));
       list.appendChild(row);
     });
-    card.appendChild(list);
+    lists.appendChild(list);
   }
 
   if (donors.length) {
     var n = cand.n_donors || 0;
-    card.appendChild(h('h4', null,
+    lists.appendChild(h('h4', null,
       'Then take the rest from ' + n + ' donor' + (n === 1 ? '' : 's')));
     donors.forEach(function (d) {
       var box = h('div', { class: 'cand-donor' },
@@ -3338,6 +3483,9 @@ function renderCandidates(plan) {
             checked: on ? 'checked' : null,
             onchange: function () {
               ids.forEach(function (id) { pinnedSources[id] = o.plasmid_id; });
+              /* Show the donor being pointed at, with the part it is
+                 wanted for picked out of it. */
+              showCandidateMap(mapHost, o.plasmid_id, d.covers || [], 'donor');
               replan();
             }
           }),
@@ -3355,12 +3503,12 @@ function renderCandidates(plan) {
           h('span', { class: 'muted small cand-has' },
             'has ' + (o.carries || []).join(', '))));
       });
-      card.appendChild(box);
+      lists.appendChild(box);
     });
   }
 
   if (Object.keys(pinnedSources).length) {
-    card.appendChild(h('p', { class: 'muted small' },
+    lists.appendChild(h('p', { class: 'muted small' },
       h('button', {
         type: 'button', class: 'secondary',
         onclick: function () { pinnedSources = {}; replan(); }
@@ -3822,6 +3970,126 @@ function renderValidation(validation) {
           Array.isArray(i.location) ? i.location.join('–') : String(i.location)) : null);
     })));
   });
+  return card;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Routes: the cloning drawn as the steps it is                        */
+/* ------------------------------------------------------------------ */
+/* Choosing a route used to drop you straight into a protocol - reagent
+   volumes and cycling conditions - which answers "how do I run it"
+   before you have decided "is this the right way to build it". This is
+   the picture a cloning paper would draw: each parent, what comes out of
+   it, and the one reaction that joins them. */
+
+/** What the route does to get each piece out of its parent. */
+function takeVerb(route) {
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  if (ops.indexOf('RE_DIGEST') >= 0 && ops.indexOf('PCR') >= 0) {
+    return 'PCR, then digest';
+  }
+  if (ops.indexOf('RE_DIGEST') >= 0) return 'Digest';
+  if (ops.indexOf('SYNTHESIS') >= 0 && ops.indexOf('PCR') < 0) return 'Order';
+  return 'PCR';
+}
+
+/** The reaction that puts the pieces together. */
+function joinVerb(route) {
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  if (ops.indexOf('HI_FI_ASSEMBLY') >= 0) return 'NEBuilder HiFi';
+  if (ops.indexOf('GIBSON_ASSEMBLY') >= 0) return 'Gibson assembly';
+  if (ops.indexOf('LIGATION') >= 0) return 'Ligate';
+  return 'Assemble';
+}
+
+function flowArrow(label, sub) {
+  return h('div', { class: 'flow-arrow' },
+    h('span', { class: 'flow-verb' }, label),
+    sub ? h('span', { class: 'flow-sub muted small' }, sub) : null,
+    h('span', { class: 'flow-tick', 'aria-hidden': 'true' }, '\u2192'));
+}
+
+/** A small circle of one parent, with the stretch being taken lit up. */
+function flowParent(src) {
+  var feats = (src.features || []).filter(function (a) {
+    return a && typeof a.start === 'number' && a.end > a.start;
+  }).map(function (a) {
+    return { feature_type: a.feature_type, name: a.name, start: a.start,
+             end: a.end, strand: a.strand };
+  });
+  if (typeof src.from_start === 'number' && typeof src.from_end === 'number') {
+    feats.push({ feature_type: 'CDS', name: 'taken here',
+                 start: src.from_start, end: src.from_end, strand: 1,
+                 colour: '#f0a32a' });
+  }
+  return h('div', { class: 'flow-cell' },
+    h('div', { class: 'flow-title' }, src.template || 'template'),
+    h('div', { class: 'flow-sub muted small' },
+      bp(src.template_length) + (src.template_circular === false
+        ? ' · linear' : ' · circular')),
+    circularMap(src.template_length || 1, feats,
+      { label: src.template, compact: true }));
+}
+
+/** The linear piece that comes out of a reaction. */
+function flowFragment(src) {
+  return h('div', { class: 'flow-cell flow-frag' },
+    h('div', { class: 'flow-title' }, src.name),
+    h('div', { class: 'frag-bar' }, h('span', { class: 'frag-fill' }, '')),
+    h('div', { class: 'flow-sub muted small' },
+      bp(src.bp) + (typeof src.from_start === 'number'
+        ? ' · from ' + (src.from_start + 1) + '\u2013' + src.from_end : '')));
+}
+
+function renderCloningFlow(route, plan) {
+  if (!route) return null;
+  var sim = route.simulation || {};
+  var sources = (sim.sources || []).filter(Boolean);
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'How this route builds it'),
+      h('span', { class: 'muted small' }, route.title || '')));
+
+  if (!sources.length) {
+    card.appendChild(h('p', { class: 'muted' },
+      'This route was not simulated, so there is nothing to draw. The '
+      + 'numbered protocol is on the Cloning scheme step.'));
+    return card;
+  }
+
+  var take = takeVerb(route);
+  var flow = h('div', { class: 'flow' });
+  sources.forEach(function (src) {
+    flow.appendChild(h('div', { class: 'flow-row' },
+      flowParent(src),
+      flowArrow(take, bp(src.bp)),
+      flowFragment(src)));
+  });
+  card.appendChild(flow);
+
+  /* The one reaction that closes the circle. */
+  var c = plan.construct || {};
+  card.appendChild(h('div', { class: 'flow-join' },
+    h('span', { class: 'flow-verb' }, joinVerb(route)),
+    h('span', { class: 'muted small' },
+      sources.length + ' piece' + (sources.length === 1 ? '' : 's')
+      + ' \u2192 ' + bp(sim.product_bp || c.length))));
+
+  var layout = (c.layout || []).filter(function (f) {
+    return f && typeof f.start === 'number';
+  });
+  card.appendChild(h('div', { class: 'flow-cell flow-product' },
+    h('div', { class: 'flow-title' }, c.name || 'new plasmid'),
+    circularMap(c.length || 1, layout, { label: c.name, compact: true }),
+    h('div', { class: 'flow-sub muted small' },
+      bp(sim.product_bp || c.length) + ' \u00b7 '
+      + (sim.identical ? 'simulated and identical to the design'
+                       : 'see the Cloning scheme step for the checks'))));
+
+  card.appendChild(h('p', { class: 'muted small' },
+    'Amber marks the stretch taken out of each parent. The numbered '
+    + 'protocol, the primers and the checks are on the Cloning scheme step.'));
   return card;
 }
 

@@ -1527,3 +1527,91 @@ tr.row-bad td {
   max-width: 14rem;
 }
 @media (max-width: 860px) { .var-where { display: none; } }
+
+/* --- candidate parents beside the plasmid being pointed at ------------- */
+.cand-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 26rem);
+  gap: 1rem;
+  align-items: start;
+}
+.cand-lists { min-width: 0; }
+.cand-map {
+  position: sticky;
+  top: 0.5rem;
+  margin: 0;
+  padding: 0.75rem;
+}
+.cand-map h4 { margin: 0; font-size: 0.95rem; }
+@media (max-width: 1100px) {
+  .cand-split { grid-template-columns: minmax(0, 1fr); }
+  .cand-map { position: static; }
+}
+
+/* The move out of a step, sitting on its own under the content. */
+.step-next {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+/* --- routes: the cloning drawn as the steps it is ---------------------- */
+.flow { display: flex; flex-direction: column; gap: 0.5rem; }
+.flow-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.6rem;
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 8px;
+}
+.flow-cell { min-width: 0; text-align: center; }
+.flow-title {
+  font-weight: 600;
+  font-size: 0.88rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The circles are read side by side, so they stay small. */
+.flow-cell .map-circular svg { max-width: 190px; }
+.flow-cell .map-toggle { display: none; }
+.flow-arrow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+  padding: 0 0.5rem;
+  white-space: nowrap;
+}
+.flow-verb { font-weight: 700; font-size: 0.9rem; }
+.flow-tick { font-size: 1.5rem; line-height: 1; opacity: 0.55; }
+/* A fragment is linear; a bar says so where a circle would lie. */
+.frag-bar {
+  height: 12px;
+  margin: 0.6rem auto;
+  max-width: 190px;
+  border-radius: 3px;
+  background: var(--line, #2a2f3a);
+  overflow: hidden;
+}
+.frag-fill { display: block; height: 100%; width: 100%; background: #f0a32a; }
+.flow-join {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.6rem;
+  margin: 0.6rem 0 0.2rem;
+  padding: 0.5rem;
+  border-radius: 8px;
+  background: var(--accent-soft, rgba(90, 150, 255, 0.14));
+}
+.flow-product { margin-top: 0.4rem; }
+.flow-product .map-circular svg { max-width: 240px; }
+@media (max-width: 860px) {
+  .flow-row { grid-template-columns: minmax(0, 1fr); }
+  .flow-arrow { flex-direction: row; gap: 0.4rem; }
+  .flow-tick { transform: rotate(90deg); }
+}
