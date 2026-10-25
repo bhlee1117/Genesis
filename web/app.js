@@ -1461,8 +1461,10 @@ function partPicker(mod) {
     n = Number(n || 0);
     return h('span', {
       class: 'combo-sources' + (n ? '' : ' zero'),
-      title: n + ' plasmid' + (n === 1 ? '' : 's') + ' in the inventory carry this part'
-    }, n + ' src');
+      title: n + ' plasmid' + (n === 1 ? '' : 's') +
+             ' in the inventory carry this part — it is how many tubes you '
+             + 'could amplify it from, not how good it is'
+    }, n + (n === 1 ? ' plasmid' : ' plasmids'));
   }
 
   /** One /api/parts row. */
@@ -1508,12 +1510,25 @@ function partPicker(mod) {
     return {
       kind: 'head', id: null, name: fam.core.name,
       cells: function () {
+        var hosts = (fam.hosts || []).slice(0, 2).join(', ');
         return [
           h('span', { class: 'fam-core' }, fam.core.name),
           h('span', { class: 'fam-aa mono' }, fam.core.aa + ' aa'),
+          /* Several families can carry one name - QuasAr2 is four distinct
+             proteins here - so say how this one differs and where it is. */
+          fam.differs
+            ? h('span', { class: 'fam-differs', title:
+                'a different protein from the most-used one of this name' },
+                fam.differs)
+            : null,
+          hosts
+            ? h('span', { class: 'fam-hosts', title:
+                'plasmids carrying this exact protein: ' +
+                (fam.hosts || []).join(', ') }, 'in ' + hosts)
+            : null,
           h('span', {
             class: 'fam-count',
-            title: fam.n_rows + ' catalogued part(s) encode this protein, '
+            title: fam.n_rows + ' catalogued row(s) encode this protein, '
               + 'across ' + fam.sources + ' plasmid occurrence(s)'
           }, fam.n_variants + (fam.n_variants === 1 ? ' form' : ' forms'))
         ];
@@ -1845,13 +1860,118 @@ function moduleRow(mod, i, focus) {
  * list the server is sent, and the row numbers keep counting straight
  * through the group.
  */
+
+/* ------------------------------------------------------------------ */
+/* Specification: a live sketch of what is being described             */
+/* ------------------------------------------------------------------ */
+/* The module list says what goes in and in what order, but not what the
+   plasmid looks like, and you only found that out by designing. This
+   draws it while you type. It is a sketch: nothing has been resolved, so
+   the lengths are typical ones for each kind of element, and the vector
+   is whatever the backbone will bring. */
+
+var NOMINAL_BP = {
+  promoter: 800, enhancer: 400, CDS: 1000, p2A: 66, linker: 45,
+  tag: 30, trafficking_motif: 60, IRES: 580, polyA: 480, WPRE: 590,
+  lox_site: 34, AAV_ITR: 141, origin: 590, resistance: 860,
+  Kozak: 6, intron: 1000, terminator: 220
+};
+
+/* What a Cre-lox cassette puts around its payload. */
+var LOX_OF = { DIO: ['lox2272', 'loxP'], FLEX: ['lox2272', 'loxP'],
+               FAS: ['loxFAS', 'loxP'], DO: ['lox2272', 'loxP'] };
+
+function nominalBp(mod) {
+  if (mod.part_bp) return Number(mod.part_bp);
+  return NOMINAL_BP[mod.type] || 300;
+}
+
+/** Build the sketch's feature list from the modules as typed. */
+function specPreviewItems() {
+  var items = [];
+  var at = 0;
+  function put(type, name, bp_, strand) {
+    items.push({ feature_type: type, name: name, start: at,
+                 end: at + bp_, strand: strand || 1 });
+    at += bp_;
+  }
+
+  /* The vector the backbone brings, drawn muted so the payload reads as
+     the thing being designed. */
+  put('AAV_ITR', "5' ITR", NOMINAL_BP.AAV_ITR);
+
+  var groups = cassetteGroups(state.modules);
+  var inCassette = {};
+  var lastOf = {};
+  groups.forEach(function (g) {
+    (g.members || []).forEach(function (k) { inCassette[k] = g; });
+    if ((g.members || []).length) {
+      lastOf[g.members[g.members.length - 1]] = g;
+    }
+  });
+
+  state.modules.forEach(function (mod, i) {
+    if (isCreLox(mod.type)) {
+      var pair = LOX_OF[(mod.mode || 'DIO').toUpperCase()] || LOX_OF.DIO;
+      put('lox_site', pair[0], NOMINAL_BP.lox_site);
+      put('lox_site', pair[1], NOMINAL_BP.lox_site);
+      return;
+    }
+    var g = inCassette[i];
+    put(mod.type, mod.name || mod.type, nominalBp(mod), g ? -1 : 1);
+    /* Close the cassette after its last enclosed module. */
+    if (lastOf[i]) {
+      g = lastOf[i];
+      var pair2 = LOX_OF[((state.modules[g.head] || {}).mode || 'DIO')
+        .toUpperCase()] || LOX_OF.DIO;
+      put('lox_site', pair2[0], NOMINAL_BP.lox_site, -1);
+      put('lox_site', pair2[1], NOMINAL_BP.lox_site, -1);
+    }
+  });
+
+  put('WPRE', 'WPRE', NOMINAL_BP.WPRE);
+  put('polyA', 'polyA', NOMINAL_BP.polyA);
+  put('AAV_ITR', "3' ITR", NOMINAL_BP.AAV_ITR);
+  put('origin', 'ori', NOMINAL_BP.origin);
+  put('resistance', 'AmpR', NOMINAL_BP.resistance);
+  return { items: items, length: at };
+}
+
+function renderSpecPreview() {
+  var host = $('spec-preview');
+  if (!host) return;
+  clear(host);
+  var real = state.modules.filter(function (m) {
+    return m.type && !isCreLox(m.type);
+  }).length;
+  if (!real) {
+    host.appendChild(h('p', { class: 'muted small' },
+      'Add a module and the plasmid it describes will be sketched here.'));
+    return;
+  }
+  var built = specPreviewItems();
+  host.appendChild(h('div', { class: 'card-head' },
+    h('h3', null, 'Sketch'),
+    h('span', { class: 'muted small' },
+      '~' + bp(built.length) + ' · nothing resolved yet')));
+  host.appendChild(circularMap(built.length, built.items, {
+    label: ($('spec-name') && $('spec-name').value) || 'construct'
+  }));
+  host.appendChild(h('p', { class: 'muted small' },
+    'A sketch from the modules as typed: typical lengths for each kind of ' +
+    'element, and the vector parts a backbone would bring. Scan the source ' +
+    'to replace it with real parts.'));
+}
+
 function renderModules(focusIndex, focusWhat) {
   var host = $('modules');
   clear(host);
   if (!state.modules.length) {
     host.appendChild(h('p', { class: 'muted' }, 'No modules yet. Add one below.'));
+    renderSpecPreview();
     return;
   }
+  renderSpecPreview();
 
   var groups = cassetteGroups(state.modules);
   var headOf = {};
@@ -2257,22 +2377,24 @@ function paintSteps() {
   var nav = $('steps');
   if (!nav) return;
   clear(nav);
-  STEPS.forEach(function (st, i) {
-    var ready = !!stepState.ready[st.id];
+  /* A step with nothing to show is not a step. Greying them out left the
+     rail cluttered with places you cannot go; the sequence is clearer
+     when it only contains what exists. */
+  var live = STEPS.filter(function (st) { return !!stepState.ready[st.id]; });
+  live.forEach(function (st, i) {
     var active = stepState.current === st.id;
     var btn = h('button', {
       type: 'button',
-      class: 'step' + (active ? ' active' : '') + (ready ? '' : ' step-todo'),
-      disabled: ready ? null : 'disabled',
+      class: 'step' + (active ? ' active' : ''),
       'aria-current': active ? 'step' : null,
-      title: ready ? st.hint : 'Not available yet — ' + st.hint,
+      title: st.hint,
       onclick: function () { showStep(st.id); }
     },
       h('span', { class: 'step-n' }, String(st.n)),
       h('span', { class: 'step-label' }, st.label),
       h('span', { class: 'step-hint' }, st.hint));
     nav.appendChild(btn);
-    if (i < STEPS.length - 1) {
+    if (i < live.length - 1) {
       nav.appendChild(h('span', { class: 'step-sep', 'aria-hidden': 'true' }, ''));
     }
   });

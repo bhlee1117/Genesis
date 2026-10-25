@@ -1473,3 +1473,44 @@ tr.row-bad td {
 .sel-row:last-child { border-bottom: 0; }
 .sel-what { flex: 0 0 11rem; opacity: 0.7; font-size: 0.88rem; }
 .sel-name { flex: 1 1 auto; font-weight: 600; }
+
+/* --- specification: modules beside a live sketch ----------------------- */
+.spec-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 24rem);
+  gap: 1rem;
+  align-items: start;
+}
+.spec-modules { min-width: 0; }
+.spec-preview {
+  position: sticky;
+  top: 0.5rem;
+  padding: 0.75rem;
+  margin: 0;
+}
+.spec-preview .card-head { margin-bottom: 0.4rem; }
+.spec-preview h3 { margin: 0; font-size: 0.95rem; }
+/* Below a laptop the sketch goes under the modules rather than squeezing
+   them into a column too narrow to read. */
+@media (max-width: 980px) {
+  .spec-split { grid-template-columns: minmax(0, 1fr); }
+  .spec-preview { position: static; }
+}
+
+/* --- family headings: which protein, and which one of several ---------- */
+.fam-differs {
+  margin-left: 0.5rem;
+  font-size: 0.78rem;
+  padding: 0 0.35rem;
+  border-radius: 3px;
+  background: var(--warn-soft, rgba(220, 160, 60, 0.18));
+}
+.fam-hosts {
+  margin-left: 0.5rem;
+  font-size: 0.78rem;
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 18rem;
+}

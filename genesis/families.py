@@ -249,6 +249,17 @@ def protein_families(conn: sqlite3.Connection, term: str,
             taken.add(other["id"])
 
         members.sort(key=lambda r: (-r["n_sources"], len(r["protein"])))
+
+        # Which plasmids this protein is actually in. Four families can all
+        # be called "QuasAr2" and differ by a residue or two, and then the
+        # name tells you nothing - the plasmid it came out of does.
+        ids = [m["id"] for m in members[:12]]
+        marks = ",".join("?" * len(ids))
+        hosts = [r["name"] for r in conn.execute(
+            f"""SELECT DISTINCT pl.name FROM part_occurrence o
+                  JOIN plasmid pl ON pl.id = o.plasmid_id
+                 WHERE o.part_id IN ({marks})
+                 ORDER BY pl.seq_length LIMIT 6""", ids)] if ids else []
         # One entry per distinct protein. Four rows that are the same
         # molecule trimmed four ways are one thing to choose, not four,
         # and showing them separately is the whole complaint.
@@ -274,7 +285,9 @@ def protein_families(conn: sqlite3.Connection, term: str,
         families.append({
             "core": {"part_id": seed["id"], "name": seed["name"],
                      "aa": len(core), "bp": seed["bp"],
-                     "n_sources": seed["n_sources"]},
+                     "n_sources": seed["n_sources"],
+                     "protein": core},
+            "hosts": hosts,
             "n_variants": len(variants),
             "n_rows": len(members),
             "sources": sum(m["n_sources"] for m in members),
@@ -290,4 +303,30 @@ def protein_families(conn: sqlite3.Connection, term: str,
         not f["core"]["name"].lower().startswith(low),
         -f["sources"],
     ))
+
+    # Where several families carry the same name - and they do; QuasAr2 is
+    # four distinct proteins in this inventory - say how each differs from
+    # the most-used one. Identical sequences are already one family, so a
+    # second entry under one name always means the protein really differs.
+    first_by_name: dict = {}
+    for fam in families:
+        key = fam["core"]["name"].lower()
+        ref = first_by_name.setdefault(key, fam)
+        if ref is fam:
+            fam["differs"] = ""
+            continue
+        a, b = _trim_m(ref["core"]["protein"]), _trim_m(fam["core"]["protein"])
+        n = min(len(a), len(b))
+        subs = sum(1 for i in range(n) if a[i] != b[i])
+        gap = abs(len(a) - len(b))
+        bits = []
+        if subs:
+            bits.append(f"{subs} residue{'s' if subs != 1 else ''} different")
+        if gap:
+            bits.append(f"{gap} aa longer" if len(b) > len(a)
+                        else f"{gap} aa shorter")
+        fam["differs"] = " and ".join(bits) or "a different protein"
+
+    for fam in families:
+        fam["core"].pop("protein", None)
     return families

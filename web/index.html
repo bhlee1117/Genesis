@@ -125,8 +125,15 @@
           picture of what the server does; the modules stay one flat, ordered
           list.
         </p>
-        <div id="modules"></div>
-        <button type="button" id="add-module" class="secondary">Add module</button>
+        <div class="spec-split">
+          <div class="spec-modules">
+            <div id="modules"></div>
+            <button type="button" id="add-module" class="secondary">Add module</button>
+          </div>
+          <!-- Drawn from the modules as typed, so the shape of the plasmid
+               is visible before anything is designed. -->
+          <aside class="spec-preview card" id="spec-preview"></aside>
+        </div>
       </div>
 
       <div id="yaml-pane" hidden>
