@@ -250,16 +250,29 @@ def protein_families(conn: sqlite3.Connection, term: str,
 
         members.sort(key=lambda r: (-r["n_sources"], len(r["protein"])))
 
-        # Which plasmids this protein is actually in. Four families can all
-        # be called "QuasAr2" and differ by a residue or two, and then the
-        # name tells you nothing - the plasmid it came out of does.
-        ids = [m["id"] for m in members[:12]]
-        marks = ",".join("?" * len(ids))
-        hosts = [r["name"] for r in conn.execute(
-            f"""SELECT DISTINCT pl.name FROM part_occurrence o
-                  JOIN plasmid pl ON pl.id = o.plasmid_id
-                 WHERE o.part_id IN ({marks})
-                 ORDER BY pl.seq_length LIMIT 6""", ids)] if ids else []
+        # Which plasmids each of these parts is actually in. Four families
+        # can all be called "QuasAr2" and differ by a residue or two, and
+        # then the name tells you nothing - the plasmid it came out of
+        # does. Fetched once for the whole family rather than per row.
+        ids = [m["id"] for m in members]
+        by_part: dict = {}
+        if ids:
+            marks = ",".join("?" * len(ids))
+            for r in conn.execute(
+                    f"""SELECT o.part_id AS pid, pl.name AS nm,
+                               pl.seq_length AS bp
+                          FROM part_occurrence o
+                          JOIN plasmid pl ON pl.id = o.plasmid_id
+                         WHERE o.part_id IN ({marks})
+                         ORDER BY pl.seq_length""", ids):
+                by_part.setdefault(r["pid"], []).append(r["nm"])
+        hosts = []
+        for m in members[:12]:
+            for nm in by_part.get(m["id"], []):
+                if nm not in hosts:
+                    hosts.append(nm)
+            if len(hosts) >= 6:
+                break
         # One entry per distinct protein. Four rows that are the same
         # molecule trimmed four ways are one thing to choose, not four,
         # and showing them separately is the whole complaint.
@@ -279,6 +292,16 @@ def protein_families(conn: sqlite3.Connection, term: str,
             v["also"] = sorted({x["name"] for x in group["rows"]
                                 if x["name"] != v["name"]})[:4]
             v["part_ids"] = [x["id"] for x in group["rows"]][:8]
+            # The plasmids this exact protein sits in - the answer to
+            # "where would I get it from", which is the reason anybody is
+            # reading this list.
+            seen_h: list = []
+            for x in group["rows"]:
+                for nm in by_part.get(x["id"], []):
+                    if nm not in seen_h:
+                        seen_h.append(nm)
+            v["hosts"] = seen_h[:12]
+            v["n_hosts"] = len(seen_h)
             variants.append(v)
         # Plain first, then the decorated ones by how widely they are used.
         variants.sort(key=lambda v: (not v["is_core"], -v["n_sources"]))

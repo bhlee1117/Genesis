@@ -1429,6 +1429,7 @@ function partPicker(mod) {
                   ? ' combo-variant' : ''),
         role: r.kind === 'head' ? 'presentation' : 'option',
         id: listId + '-' + i, 'aria-selected': 'false',
+        title: r.title || null,
         // mousedown fires before blur, and preventDefault keeps focus in the
         // input, so the click always lands on a list that is still open.
         onmousedown: function (e) { e.preventDefault(); choose(i); },
@@ -1540,13 +1541,26 @@ function partPicker(mod) {
   function variantRow(fam, v) {
     var alsoTitle = v.also && v.also.length
       ? '\nalso catalogued as: ' + v.also.join(', ') : '';
+    /* Which tubes this exact protein is in. "20 plasmids" answers how
+       many; the only question after that is which, and the answer was
+       nowhere on the page. */
+    var hosts = v.hosts || [];
+    var more = Math.max(0, (v.n_hosts || hosts.length) - hosts.length);
+    var where = hosts.length
+      ? 'In ' + (v.n_hosts || hosts.length) + ' plasmid'
+        + ((v.n_hosts || hosts.length) === 1 ? '' : 's') + ':\n  '
+        + hosts.join('\n  ') + (more ? '\n  …and ' + more + ' more' : '')
+      : 'No plasmid in the inventory carries this.';
     return {
       kind: 'part', id: v.part_id, name: fam.core.name, source: v,
       note: v.label === 'plain' ? '' : v.label,
+      title: where + alsoTitle,
       cells: function () {
         return [
-          h('span', { class: 'var-label' + (v.is_core ? ' plain' : '') },
-            v.label === 'plain' ? fam.core.name : v.label),
+          h('span', {
+            class: 'var-label' + (v.is_core ? ' plain' : ''),
+            title: where
+          }, v.label === 'plain' ? fam.core.name : v.label),
           v.n_rows > 1
             ? h('span', {
                 class: 'var-rows',
@@ -1556,7 +1570,15 @@ function partPicker(mod) {
               }, '×' + v.n_rows)
             : null,
           h('span', { class: 'combo-len mono' }, bp(v.bp)),
-          sourcesCell(v.n_sources)
+          h('span', {
+            class: 'combo-sources' + (v.n_sources ? '' : ' zero'),
+            title: where
+          }, v.n_sources + (v.n_sources === 1 ? ' plasmid' : ' plasmids')),
+          /* A visible hint that there is something to hover. */
+          hosts.length
+            ? h('span', { class: 'var-where', title: where },
+                hosts[0].length > 22 ? hosts[0].slice(0, 21) + '…' : hosts[0])
+            : null
         ];
       }
     };

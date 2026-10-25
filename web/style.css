@@ -1514,3 +1514,16 @@ tr.row-bad td {
   white-space: nowrap;
   max-width: 18rem;
 }
+
+/* The first plasmid a variant lives in, shown inline so it is obvious
+   there is a list behind the hover. */
+.var-where {
+  margin-left: 0.5rem;
+  font-size: 0.78rem;
+  opacity: 0.55;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 14rem;
+}
+@media (max-width: 860px) { .var-where { display: none; } }
