@@ -898,8 +898,8 @@ function circularMap(length, items, opts) {
   else requestAnimationFrame(draw);
 
   var note = h('p', { class: 'map-note muted small' },
-    'Outer ring reads forward, inner ring reverse. Arrowheads point the way ' +
-    'a coding sequence is translated. Position 1 is at the top.');
+    'Outer ring forward, inner ring reverse; arrowheads show which way a '
+    + 'CDS is read. Position 1 at the top.');
   return h('div', null, host, captionHost, note);
 }
 
@@ -1994,9 +1994,7 @@ function renderSpecPreview() {
     label: ($('spec-name') && $('spec-name').value) || 'construct'
   }));
   host.appendChild(h('p', { class: 'muted small' },
-    'A sketch from the modules as typed: typical lengths for each kind of ' +
-    'element, and the vector parts a backbone would bring. Moving on to ' +
-    'Scan source replaces it with real parts.'));
+    'Typical lengths, not real parts \u2014 Scan source replaces them.'));
 }
 
 function renderModules(focusIndex, focusWhat) {
@@ -2378,11 +2376,12 @@ var STEPS = [
      splitting them meant clicking across to see what the click did. */
   { id: 'scan',    n: 3, label: 'Scan source',
     hint: 'what the inventory has' },
-  { id: 'select',  n: 4, label: 'Select',
-    hint: 'the choices in force' },
-  { id: 'routes',  n: 5, label: 'Routes',
+  /* "Select" was a step of its own, which put a click between choosing
+     a parent and seeing what you had chosen - on a page where the
+     choosing happens. It is a summary at the top of Scan source now. */
+  { id: 'routes',  n: 4, label: 'Routes',
     hint: 'how to build it' },
-  { id: 'scheme',  n: 6, label: 'Protocol',
+  { id: 'scheme',  n: 5, label: 'Protocol',
     hint: 'what to do at the bench' }
 ];
 
@@ -2503,8 +2502,8 @@ function renderScan() {
       { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
     ], scan.modules));
   }
-  fillStep('scan', [card, renderCandidates(scan), nextFromScan()]);
-  fillStep('select', selectionSummary(scan));
+  fillStep('scan', [selectionSummary(scan), card, renderCandidates(scan),
+                    nextFromScan()]);
   showStep('scan');
 }
 
@@ -2586,26 +2585,6 @@ function selectionSummary(data) {
     });
   }
 
-  /* Having chosen the parents, the next thing to choose is how to build
-     with them. Without this the step was a dead end: the only way on was
-     back to the specification for a button at the bottom of it. */
-  var haveRoutes = !!(state.plan && (state.plan.routes || []).length);
-  card.appendChild(h('div', { class: 'card-foot' },
-    haveRoutes
-      ? h('button', {
-          type: 'button', class: 'primary',
-          onclick: function () { showStep('routes'); }
-        }, 'Move on to Routes \u2192')
-      : h('button', {
-          type: 'button', class: 'primary',
-          title: 'Design with these parents and rank the ways to build it',
-          onclick: function () { generatePlan(); }
-        }, 'Generate routes with these parents \u2192'),
-    h('span', { class: 'muted small' },
-      haveRoutes
-        ? 'Routes are ranked best first; pick one to see its protocol.'
-        : 'Nothing is designed yet \u2014 this runs the planner and ranks '
-          + 'the ways to build it.')));
   return card;
 }
 
@@ -2891,7 +2870,8 @@ function renderPlan() {
   resetSteps();
   var plan = state.plan;
   if (!plan) return;
-  var scanCards = [scanRecap(plan), renderCandidates(plan), nextFromScan()];
+  var scanCards = [selectionSummary(plan), scanRecap(plan),
+                   renderCandidates(plan), nextFromScan()];
 
   var c = plan.construct || {};
 
@@ -2935,7 +2915,6 @@ function renderPlan() {
 
   /* --- 3. where the parts come from, and what to start from -------- */
   fillStep('scan', scanCards);
-  fillStep('select', selectionSummary(plan));
 
   /* --- 6. how to build it ------------------------------------------ */
   var route = selectedRoute();
@@ -3374,20 +3353,35 @@ function renderCandidates(plan) {
 
   if (recipients.length) {
     lists.appendChild(h('h4', null, 'Start from'));
-    lists.appendChild(h('p', { class: 'muted small' },
-      'The score counts how many of these a plasmid really carries, in ' +
-      'order from the start: 2/2 has both and only the vector has to be ' +
-      'opened, 1/2 has the first and the rest must be built. A plasmid ' +
-      'marked variant holds something close rather than the part itself, ' +
-      'which is a reason to start from it and not a reason to take the ' +
-      'part out of it.'));
-    var list = h('div', { class: 'cand-list' });
+    /* Four lines of prose explaining one column, above the table it
+       explains. The score itself already carries the explanation as a
+       tooltip on every cell; this is for whoever wants it spelled out. */
+    lists.appendChild(disclosure('how the score is read',
+      'The score counts how many of these a plasmid really carries, in '
+      + 'order from the start: 2/2 has both and only the vector has to be '
+      + 'opened, 1/2 has the first and the rest must be built. A plasmid '
+      + 'marked variant holds something close rather than the part itself, '
+      + 'which is a reason to start from it and not a reason to take the '
+      + 'part out of it.'));
+    /* When every candidate carries the same thing the column separates
+       nothing, and six identical cells read as data. */
+    var varies = recipients.some(function (r) {
+      return (r.carries || []).join(',')
+           !== (recipients[0].carries || []).join(',');
+    });
+    var list = h('div', { class: 'cand-list' + (varies ? '' : ' cand-nohas') });
     list.appendChild(h('div', { class: 'cand-row cand-head' },
       h('span', null, ''),
       h('span', { class: 'cand-score' }, 'has'),
       h('span', null, 'plasmid'),
       h('span', null, 'size · owner'),
-      h('span', null, 'already has')));
+      varies ? h('span', null, 'already has')
+             : h('span', { class: 'muted small cand-head-note',
+                           title: 'every candidate here already has '
+                                + ((recipients[0].carries || []).join(', ')
+                                   || 'none of the parts') },
+                 'all carry '
+                 + ((recipients[0].carries || []).join(', ') || 'nothing'))));
     recipients.forEach(function (r) {
       var on = r.plasmid_id === chosenBackbone;
       var row = h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
@@ -3418,8 +3412,9 @@ function renderCandidates(plan) {
         h('span', { class: 'muted small' },
           bp(r.length) + (r.owner ? ' · ' + r.owner : '') +
           (r.has_cassette ? ' · has lox cassette' : '')),
-        h('span', { class: 'muted small cand-has' },
-          'already has ' + (r.carries || []).join(', ')));
+        varies ? h('span', { class: 'muted small cand-has' },
+                     'already has ' + (r.carries || []).join(', '))
+               : h('span', { class: 'cand-has' }, ''));
       list.appendChild(row);
     });
     lists.appendChild(list);
@@ -3467,7 +3462,7 @@ function renderCandidates(plan) {
           h('span', { class: 'muted small' },
             bp(o.length) + (o.owner ? ' · ' + o.owner : '')),
           h('span', { class: 'muted small cand-has' },
-            'has ' + (o.carries || []).join(', '))));
+            (o.carries || []).length ? 'has ' + o.carries.join(', ') : '')));
       });
       lists.appendChild(box);
     });
@@ -3941,23 +3936,454 @@ function renderValidation(validation) {
 
 
 /* ------------------------------------------------------------------ */
-/* Routes: the cloning drawn as the steps it is                        */
+/* Routes: the cloning drawn the way a paper would draw it             */
 /* ------------------------------------------------------------------ */
-/* Choosing a route used to drop you straight into a protocol - reagent
-   volumes and cycling conditions - which answers "how do I run it"
-   before you have decided "is this the right way to build it". This is
-   the picture a cloning paper would draw: each parent, what comes out of
-   it, and the one reaction that joins them. */
+/* The first version put a full plasmid map next to every parent, which
+   draws every annotation the file happens to carry. The question a
+   cloning figure answers is narrower: which plasmid, which piece out of
+   it, by what reaction, and what joins to what. One lane per piece, one
+   column per bench stage, and nothing else on the page. */
 
-/** What the route does to get each piece out of its parent. */
-function takeVerb(route) {
-  var ops = (route.steps || []).map(function (s) { return s.operation; });
-  if (ops.indexOf('RE_DIGEST') >= 0 && ops.indexOf('PCR') >= 0) {
-    return 'PCR, then digest';
+var FIG = {
+  r: 56,               /* parent circle */
+  pr: 68,              /* product circle */
+  rowH: 196,
+  colParent: 250,      /* width of the parent column, labels included */
+  colStage: 96,
+  colFrag: 168,
+  bracket: 18,
+  pad: 14
+};
+
+/* One colour per lane, carried from the parent through to the arc it
+   becomes in the product, so "where did this part come from" is answered
+   by looking rather than by reading. */
+var LANE_COLOURS = ['#2f7bd4', '#d4572f', '#2f9e5e', '#8e4fc9', '#b58900'];
+
+/** The handful of features worth naming on a parent. */
+function figFeatures(src) {
+  var span = src.template_length || 1;
+  var keep = (src.features || []).filter(function (a) {
+    return a && typeof a.start === 'number' && a.end > a.start
+      && (a.end - a.start) > span * 0.05
+      && ['CDS', 'promoter', 'resistance', 'origin'].indexOf(a.feature_type) >= 0;
+  });
+  keep.sort(function (a, b) { return (b.end - b.start) - (a.end - a.start); });
+  return keep.slice(0, 3);
+}
+
+/** Text just outside a circle, on whichever side of it the angle is.
+ *
+ *  Two cut sites a few hundred bases apart sit at nearly the same angle,
+ *  and their names landed on top of each other - "HindIII" and "EcoRV"
+ *  overprinted into an unreadable smudge. Each circle keeps a list of
+ *  where it has already written, and a clashing label is nudged clear.
+ */
+function ringLabel(g, cx, cy, r, f, text, cls) {
+  if (!text) return;
+  var at = ((f % 1) + 1) % 1;
+  var p = polar(cx, cy, r + 9, at);
+  var right = at < 0.5;
+  var x = p[0] + (right ? 3 : -3), y = p[1] + 3;
+  /* Push a clashing label away from the circle, not across it: nudging
+     everything downwards wrote the second label over the ring whenever
+     both sat near twelve o'clock. */
+  var step = (at < 0.25 || at > 0.75) ? -11 : 11;
+  var used = g.__labels || (g.__labels = []);
+  for (var guard = 0; guard < 6; guard++) {
+    var clash = used.some(function (u) {
+      return u.right === right && Math.abs(u.y - y) < 11
+          && Math.abs(u.x - x) < 70;
+    });
+    if (!clash) break;
+    y += step;
   }
-  if (ops.indexOf('RE_DIGEST') >= 0) return 'Digest';
-  if (ops.indexOf('SYNTHESIS') >= 0 && ops.indexOf('PCR') < 0) return 'Order';
-  return 'PCR';
+  used.push({ x: x, y: y, right: right });
+  var t = svg('text', {
+    x: x, y: y, 'text-anchor': right ? 'start' : 'end',
+    class: cls || 'fig-tag'
+  });
+  t.textContent = text;
+  g.appendChild(t);
+}
+
+/** A primer, drawn as the little arrow a cloning figure uses. */
+function figPrimer(g, cx, cy, r, f, forward, name) {
+  var w = 0.022 * (forward ? 1 : -1);
+  var a = polar(cx, cy, r + 7, f), b = polar(cx, cy, r + 7, f + w * 0.6);
+  var tip = polar(cx, cy, r + 7, f + w);
+  var s1 = polar(cx, cy, r + 3.5, f + w * 0.6);
+  var s2 = polar(cx, cy, r + 10.5, f + w * 0.6);
+  g.appendChild(svg('path', {
+    d: 'M ' + a[0] + ' ' + a[1] + ' L ' + b[0] + ' ' + b[1],
+    class: 'fig-primer', 'stroke-width': 2.4
+  }));
+  var head = svg('path', {
+    d: 'M ' + s1[0] + ' ' + s1[1] + ' L ' + tip[0] + ' ' + tip[1]
+       + ' L ' + s2[0] + ' ' + s2[1] + ' Z', class: 'fig-primer-head'
+  });
+  if (name) {
+    var ti = svg('title', null);
+    ti.textContent = name;
+    head.appendChild(ti);
+  }
+  g.appendChild(head);
+  /* F and R, not the whole primer name: the name belongs on the protocol
+     and what the figure has to say is which end and which way. */
+  ringLabel(g, cx, cy, r + 4, f + w * 0.5, forward ? 'F' : 'R',
+            'fig-prim-tag');
+}
+
+/** An enzyme cut: a tick through the backbone with the enzyme named. */
+function figCut(g, cx, cy, r, f, name) {
+  var a = polar(cx, cy, r - 8, f), b = polar(cx, cy, r + 8, f);
+  g.appendChild(svg('line', { x1: a[0], y1: a[1], x2: b[0], y2: b[1],
+    class: 'fig-cut', 'stroke-width': 2.4 }));
+  if (name) ringLabel(g, cx, cy, r + 5, f, name, 'fig-enz');
+}
+
+/** One parent plasmid: what it is, what comes out, and how. */
+function figParent(lane, cx, cy) {
+  var src = lane.src || {};
+  var span = src.template_length || 1;
+  var r = FIG.r;
+  var g = svg('g', null);
+  g.appendChild(svg('circle', { cx: cx, cy: cy, r: r, fill: 'none',
+    class: 'fig-ring', 'stroke-width': 2.5 }));
+
+  figFeatures(src).forEach(function (a) {
+    var from = (a.start % span) / span, to = (a.end % span) / span;
+    g.appendChild(svg('path', {
+      d: arcPath(cx, cy, r, from, to), fill: 'none', 'stroke-width': 6,
+      stroke: colorFor(a.feature_type), opacity: 0.4
+    }));
+    /* Only the promoter earns a label; the rest are context. */
+    if (a.feature_type === 'promoter') {
+      var mid = from + (((to - from) + 1) % 1) / 2;
+      ringLabel(g, cx, cy, r, mid, shortName(a.name, 15));
+    }
+  });
+
+  if (typeof src.from_start !== 'number'
+      || typeof src.from_end !== 'number' || !src.template_length) {
+    figCaption(g, cx, cy, src.template,
+               src.template_length ? bp(src.template_length)
+                                   : 'size unknown');
+    return g;
+  }
+  var f0 = ((src.from_start || 0) % span) / span;
+  var f1 = ((src.from_end || 0) % span) / span;
+  g.appendChild(svg('path', {
+    d: arcPath(cx, cy, r, f0, f1), fill: 'none',
+    'stroke-width': 8, stroke: lane.colour
+  }));
+  var cuts = lane.cutsParent || [];
+  if (cuts.length) {
+    figCut(g, cx, cy, r, f0, cuts[0]);
+    figCut(g, cx, cy, r, f1, cuts[1] || cuts[0]);
+  } else {
+    var pn = lane.primers || [];
+    figPrimer(g, cx, cy, r, f0, true, pn[0]);
+    figPrimer(g, cx, cy, r, f1, false, pn[1]);
+  }
+
+  figCaption(g, cx, cy, src.template, bp(src.template_length));
+  return g;
+}
+
+/** The plasmid's name under its circle, its size inside it.
+ *
+ *  Real inventory names run to thirty characters - "paav-ef1a-dio-asap7y
+ *  -wpre" - and inside a 110 px circle they either overflowed the ring or
+ *  had to be cut so short they stopped identifying the plasmid. Under it
+ *  there is a whole column of room.
+ */
+function figCaption(g, cx, cy, name, size) {
+  var mid = svg('text', { x: cx, y: cy + 4, 'text-anchor': 'middle',
+    class: 'fig-sub' });
+  mid.textContent = size;
+  g.appendChild(mid);
+
+  var words = String(name || 'template');
+  var lines = words.length > 26
+    ? [words.slice(0, 26), words.slice(26, 52)] : [words];
+  lines.forEach(function (line, i) {
+    var t = svg('text', {
+      x: cx, y: cy + (g.__r || FIG.r) + 26 + i * 12,
+      'text-anchor': 'middle',
+      class: 'fig-name'
+    });
+    t.textContent = line;
+    if (i === 0) {
+      var ti = svg('title', null);
+      ti.textContent = words;
+      t.appendChild(ti);
+    }
+    g.appendChild(t);
+  });
+}
+
+/** A piece nobody has a plasmid for: it gets ordered. */
+function figOrder(lane, cx, cy) {
+  var g = svg('g', null);
+  var w = 96, hgt = 52;
+  g.appendChild(svg('rect', { x: cx - w / 2, y: cy - hgt / 2, width: w,
+    height: hgt, rx: 6, class: 'fig-order' }));
+  var t = svg('text', { x: cx, y: cy - 2, 'text-anchor': 'middle',
+    class: 'fig-name' });
+  t.textContent = 'synthesise';
+  g.appendChild(t);
+  var sub = svg('text', { x: cx, y: cy + 13, 'text-anchor': 'middle',
+    class: 'fig-sub' });
+  sub.textContent = bp(lane.src && lane.src.bp) + ' gBlock';
+  g.appendChild(sub);
+  return g;
+}
+
+function figStageArrow(x, y, w, verb, sub, colour) {
+  var g = svg('g', null);
+  var x1 = x + 10, x2 = x + w - 10;
+  g.appendChild(svg('line', { x1: x1, y1: y, x2: x2, y2: y,
+    class: 'fig-arrow', 'stroke-width': 1.8,
+    'marker-end': 'url(#figHead)' }));
+  var t = svg('text', { x: (x1 + x2) / 2, y: y - 8, 'text-anchor': 'middle',
+    class: 'fig-verb' });
+  t.textContent = verb;
+  g.appendChild(t);
+  if (sub) {
+    var s2 = svg('text', { x: (x1 + x2) / 2, y: y + 15,
+      'text-anchor': 'middle', class: 'fig-sub' });
+    s2.textContent = sub;
+    g.appendChild(s2);
+  }
+  return g;
+}
+
+/** The linear piece in the tube, with whatever its ends are. */
+function figFragment(lane, x, y, w) {
+  var g = svg('g', null);
+  g.appendChild(svg('rect', { x: x, y: y - 6, width: w, height: 12, rx: 2,
+    fill: lane.colour }));
+  (lane.ends || []).forEach(function (e, i) {
+    if (!e) return;
+    var ex = i === 0 ? x : x + w;
+    g.appendChild(svg('rect', { x: ex - 3.5, y: y - 10, width: 7, height: 20,
+      rx: 1.5, class: lane.endKind === 'sticky' ? 'fig-end-cut'
+                                                : 'fig-end-hom' }));
+    var t = svg('text', { x: ex, y: y + 22, 'text-anchor': 'middle',
+      class: 'fig-end-label' });
+    t.textContent = e;
+    g.appendChild(t);
+  });
+  /* The piece is named here rather than beside its parent: around a
+     circle the name of a near-whole-plasmid arc has no sensible angle
+     to sit at, and it collided with the plasmid's own name. */
+  var nm = svg('text', { x: x + w / 2, y: y - 14, 'text-anchor': 'middle',
+    class: 'fig-piece' });
+  nm.textContent = shortName(lane.piece, 24);
+  g.appendChild(nm);
+  var lab = svg('text', { x: x + w / 2, y: y + 22, 'text-anchor': 'middle',
+    class: 'fig-sub' });
+  lab.textContent = bp(lane.src && lane.src.bp);
+  /* The ends are named at the ends; the size sits between them. */
+  g.appendChild(lab);
+  return g;
+}
+
+/** The new plasmid, with each lane's contribution in that lane's colour. */
+function figProduct(lanes, plan, sim, cx, cy) {
+  var c = (plan && plan.construct) || {};
+  var span = sim.product_bp || c.length || 1;
+  var r = FIG.pr;
+  var g = svg('g', null);
+  g.__r = r;
+  g.appendChild(svg('circle', { cx: cx, cy: cy, r: r, fill: 'none',
+    class: 'fig-ring', 'stroke-width': 2 }));
+
+  lanes.forEach(function (lane) {
+    var src = lane.src || {};
+    if (typeof src.at_start !== 'number') return;
+    g.appendChild(svg('path', {
+      d: arcPath(cx, cy, r, src.at_start / span, src.at_end / span),
+      fill: 'none', 'stroke-width': 7, stroke: lane.colour, opacity: 0.85
+    }));
+  });
+
+  /* The two things a reader checks on the product: the promoter and what
+     it drives. Everything else is on the full map in the Protocol step. */
+  var named = (c.layout || []).filter(function (a) {
+    return a && typeof a.start === 'number'
+      && ['promoter', 'CDS'].indexOf(a.type) >= 0
+      && (a.end - a.start) > span * 0.03;
+  });
+  named.sort(function (a, b) { return (b.end - b.start) - (a.end - a.start); });
+  named.slice(0, 4).forEach(function (a) {
+    var from = (a.start % span) / span, to = (a.end % span) / span;
+    g.appendChild(svg('path', {
+      d: arcPath(cx, cy, r - 11, from, to), fill: 'none',
+      'stroke-width': 6, stroke: colorFor(a.type)
+    }));
+    ringLabel(g, cx, cy, r, from + ((((to - from) % 1) + 1) % 1) / 2,
+              shortName(a.name, 14));
+  });
+
+  figCaption(g, cx, cy, c.name || 'new plasmid', bp(span));
+  return g;
+}
+
+function shortName(name, n) {
+  name = String(name || '');
+  return name.length > n ? name.slice(0, n - 1) + '…' : name;
+}
+
+/* ------------------------------------------------------------------ */
+
+/** Every enzyme this route mentions anywhere. */
+function routeEnzymes(route) {
+  var all = [];
+  (route.steps || []).forEach(function (st) {
+    stepEnzymes(st).forEach(function (e) {
+      if (all.indexOf(e) < 0) all.push(e);
+    });
+  });
+  return all;
+}
+
+/** The enzyme list one RE_DIGEST step names, wherever it put it. */
+function stepEnzymes(st) {
+  var ez = ((st.details || {}).enzymes || []).slice();
+  if (ez.length) return ez;
+  /* Some steps carry them in the inputs instead, as "HindIII, EcoRV". */
+  (st.inputs || []).forEach(function (i) {
+    if (/^[A-Za-z]+[IVX0-9]+(\s*,\s*[A-Za-z]+[IVX0-9]+)*$/.test(i)) {
+      ez = String(i).split(/\s*,\s*/);
+    }
+  });
+  return ez;
+}
+
+/** Split "Kozak+ASAP7y-F+Kozak+ASAP7y-R" back into its two primers. */
+function stepPrimers(st, route) {
+  var names = (route.primers || []).map(function (p) { return p.name; });
+  var pair = (st.inputs || []).filter(function (i) {
+    return i.indexOf('+') >= 0;
+  })[0] || '';
+  for (var i = 0; i < names.length; i++) {
+    for (var j = 0; j < names.length; j++) {
+      if (i !== j && names[i] + '+' + names[j] === pair) {
+        return [names[i], names[j]];
+      }
+    }
+  }
+  var m = /^(.*-F)\+(.*-R)$/.exec(pair);
+  return m ? [m[1], m[2]] : [];
+}
+
+/** Where a primer sits on its template, when the plan printed it. */
+function primerSpan(route, names) {
+  var by = {};
+  (route.primers || []).forEach(function (p) { by[p.name] = p; });
+  var f = by[names[0]], r = by[names[1]];
+  if (!f || typeof f.target_start !== 'number') return null;
+  return { start: f.target_start,
+           end: typeof f.target_end === 'number' ? f.target_end : r
+                && r.target_end };
+}
+
+/** Walk the route's steps into one lane per piece that enters the tube. */
+function routeLanes(route, sim, plan) {
+  var pool = (sim.sources || []).filter(Boolean).slice();
+  var atlas = (plan && plan.templates) || {};
+  function takeSource(template) {
+    for (var i = 0; i < pool.length; i++) {
+      var s = pool[i];
+      var ok = template === null ? s.synthesised : s.template === template;
+      if (ok) { pool.splice(i, 1); return s; }
+    }
+    return null;
+  }
+  /* An unsimulated route still knows its plasmids and its primers, which
+     is everything the drawing needs. Refusing to draw it was how the
+     restriction route came up blank. */
+  function stand(template, span) {
+    var t = atlas[template] || {};
+    return { name: '', template: t.name || template, template_id: t.id,
+             template_length: t.bp, template_circular: t.circular !== false,
+             features: t.features || [],
+             from_start: span && span.start, from_end: span && span.end,
+             bp: span && span.end > span.start ? span.end - span.start : 0,
+             estimated: true };
+  }
+
+  var lanes = [], last = null;
+  (route.steps || []).forEach(function (st) {
+    var op = st.operation;
+    if (op === 'PCR') {
+      var tmpl = (st.details || {}).template || (st.inputs || [])[0] || '';
+      var names = stepPrimers(st, route);
+      var src = takeSource(tmpl) || stand(tmpl, primerSpan(route, names));
+      if (!src.bp) src.bp = (st.details || {}).length || src.bp;
+      last = { origin: 'plasmid', template: tmpl, src: src,
+               piece: pieceLabel(st.output), primers: names, colour: '',
+               stages: [{ verb: 'PCR', sub: bp(src.bp) }] };
+      lanes.push(last);
+    } else if (op === 'RE_DIGEST') {
+      var ez = stepEnzymes(st);
+      /* An input that is not an enzyme list is the plasmid being cut. */
+      var host = (st.inputs || []).filter(function (i) {
+        return ez.indexOf(i) < 0 && i !== ez.join(', ');
+      })[0];
+      if (!ez.length) ez = routeEnzymes(route);
+      if (host) {
+        var hsrc = takeSource(host) || stand(host, null);
+        last = { origin: 'plasmid', template: host, src: hsrc,
+                 piece: pieceLabel(st.output), colour: '', cutsParent: ez,
+                 stages: [{ verb: 'Digest', sub: ez.join(' + ') }] };
+        lanes.push(last);
+      } else if (last) {
+        /* A bare digest cuts whatever came off the bench last - almost
+           always the amplicon, which is how a hybrid route gets sticky
+           ends onto a PCR product. That is a second stage, not a
+           footnote, so it gets its own column. */
+        last.stages.push({ verb: 'Digest', sub: ez.join(' + ') });
+        last.cutsFragment = ez;
+      }
+    } else if (op === 'SYNTHESIS') {
+      var osrc = takeSource(null)
+              || { bp: (st.details || {}).length || 0, synthesised: true };
+      last = { origin: 'order', template: null, src: osrc,
+               piece: pieceLabel(st.output), colour: '',
+               stages: [{ verb: 'Order', sub: bp(osrc.bp) }] };
+      lanes.push(last);
+    }
+  });
+
+  /* What the ends of each piece are, which is what the join is made of. */
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  var homology = ops.indexOf('HI_FI_ASSEMBLY') >= 0
+               || ops.indexOf('GIBSON_ASSEMBLY') >= 0;
+  lanes.forEach(function (lane, i) {
+    lane.colour = LANE_COLOURS[i % LANE_COLOURS.length];
+    var ez = lane.cutsFragment || lane.cutsParent;
+    if (ez && ez.length) {
+      lane.ends = [ez[0], ez[1] || ez[0]];
+      lane.endKind = 'sticky';
+    } else if (homology) {
+      lane.ends = ['overlap', 'overlap'];
+      lane.endKind = 'homology';
+    } else {
+      lane.ends = [];
+    }
+    if (!lane.src) lane.src = { bp: 0, template: lane.template };
+  });
+  return lanes;
+}
+
+/** "EGFP amplicon with sites" -> "EGFP"; "linearised vector" stays. */
+function pieceLabel(out) {
+  return String(out || 'fragment')
+    .replace(/\s+(amplicon|fragment)(\s+with sites)?$/i, '')
+    .replace(/^(purified|clean|digested)\s+/i, '');
 }
 
 /** The reaction that puts the pieces together. */
@@ -3965,97 +4391,108 @@ function joinVerb(route) {
   var ops = (route.steps || []).map(function (s) { return s.operation; });
   if (ops.indexOf('HI_FI_ASSEMBLY') >= 0) return 'NEBuilder HiFi';
   if (ops.indexOf('GIBSON_ASSEMBLY') >= 0) return 'Gibson assembly';
-  if (ops.indexOf('LIGATION') >= 0) return 'Ligate';
+  if (ops.indexOf('LIGATION') >= 0) return 'T4 ligase';
   return 'Assemble';
 }
 
-function flowArrow(label, sub) {
-  return h('div', { class: 'flow-arrow' },
-    h('span', { class: 'flow-verb' }, label),
-    sub ? h('span', { class: 'flow-sub muted small' }, sub) : null,
-    h('span', { class: 'flow-tick', 'aria-hidden': 'true' }, '\u2192'));
-}
+function cloningFigure(route, plan) {
+  var sim = route.simulation || {};
+  var lanes = routeLanes(route, sim, plan);
+  if (!lanes.length) return null;
 
-/** A small circle of one parent, with the stretch being taken lit up. */
-function flowParent(src) {
-  var feats = (src.features || []).filter(function (a) {
-    return a && typeof a.start === 'number' && a.end > a.start;
-  }).map(function (a) {
-    return { feature_type: a.feature_type, name: a.name, start: a.start,
-             end: a.end, strand: a.strand };
+  var maxStages = lanes.reduce(function (n, l) {
+    return Math.max(n, l.stages.length);
+  }, 1);
+  var xParent = FIG.pad;
+  var xStage = xParent + FIG.colParent;
+  var xFrag = xStage + maxStages * FIG.colStage;
+  var xBracket = xFrag + FIG.colFrag + 10;
+  var xJoin = xBracket + FIG.bracket;
+  var xProd = xJoin + FIG.colStage + FIG.pr;
+  var W = xProd + FIG.pr + FIG.pad + 40;
+  var rows = lanes.length;
+  var H = Math.max(rows * FIG.rowH, 2 * FIG.pr + 56) + 24;
+
+  var root = svg('svg', {
+    viewBox: '0 0 ' + Math.round(W) + ' ' + Math.round(H),
+    class: 'fig-svg', role: 'img',
+    'aria-label': 'how ' + (route.title || 'this route')
+                  + ' builds the construct'
   });
-  if (typeof src.from_start === 'number' && typeof src.from_end === 'number') {
-    feats.push({ feature_type: 'CDS', name: 'taken here',
-                 start: src.from_start, end: src.from_end, strand: 1,
-                 colour: '#f0a32a' });
+  var defs = svg('defs', null);
+  var marker = svg('marker', { id: 'figHead', viewBox: '0 0 10 10',
+    refX: '9', refY: '5', markerWidth: '6', markerHeight: '6',
+    orient: 'auto-start-reverse' });
+  marker.appendChild(svg('path', { d: 'M 0 0 L 10 5 L 0 10 z',
+    class: 'fig-arrow-head' }));
+  defs.appendChild(marker);
+  root.appendChild(defs);
+
+  lanes.forEach(function (lane, i) {
+    var cy = i * FIG.rowH + FIG.rowH / 2;
+    var cx = xParent + FIG.colParent / 2;
+    root.appendChild(lane.origin === 'order' ? figOrder(lane, cx, cy)
+                                             : figParent(lane, cx, cy));
+    lane.stages.forEach(function (stage, k) {
+      root.appendChild(figStageArrow(xStage + k * FIG.colStage, cy,
+                                     FIG.colStage, stage.verb, stage.sub));
+    });
+    root.appendChild(figFragment(lane, xFrag, cy, FIG.colFrag));
+  });
+
+  /* One bracket gathering the pieces into the single reaction. */
+  var top = FIG.rowH / 2, bot = (rows - 1) * FIG.rowH + FIG.rowH / 2;
+  if (rows > 1) {
+    root.appendChild(svg('path', {
+      d: 'M ' + xBracket + ' ' + top + ' H ' + (xBracket + 10)
+         + ' V ' + bot + ' H ' + xBracket,
+      fill: 'none', class: 'fig-arrow', 'stroke-width': 1.8
+    }));
   }
-  return h('div', { class: 'flow-cell' },
-    h('div', { class: 'flow-title' }, src.template || 'template'),
-    h('div', { class: 'flow-sub muted small' },
-      bp(src.template_length) + (src.template_circular === false
-        ? ' · linear' : ' · circular')),
-    circularMap(src.template_length || 1, feats,
-      { label: src.template, compact: true }));
+  var mid = (top + bot) / 2;
+  root.appendChild(figStageArrow(xJoin, mid, FIG.colStage, joinVerb(route),
+                                 rows + ' pieces'));
+  root.appendChild(figProduct(lanes, plan, sim, xProd, mid));
+  return root;
 }
 
-/** The linear piece that comes out of a reaction. */
-function flowFragment(src) {
-  return h('div', { class: 'flow-cell flow-frag' },
-    h('div', { class: 'flow-title' }, src.name),
-    h('div', { class: 'frag-bar' }, h('span', { class: 'frag-fill' }, '')),
-    h('div', { class: 'flow-sub muted small' },
-      bp(src.bp) + (typeof src.from_start === 'number'
-        ? ' · from ' + (src.from_start + 1) + '\u2013' + src.from_end : '')));
+function figLegend(route, lanes) {
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  var bits = [];
+  if (ops.indexOf('PCR') >= 0) bits.push('arrows on a circle are primers');
+  if (ops.indexOf('RE_DIGEST') >= 0) bits.push('ticks are enzyme cuts');
+  if (lanes.some(function (l) { return l.origin === 'order'; })) {
+    bits.push('a dashed box is DNA nobody has, so it is ordered');
+  }
+  bits.push('each colour follows one piece into the product');
+  return bits.join(' · ');
 }
 
 function renderCloningFlow(route, plan) {
   if (!route) return null;
   var sim = route.simulation || {};
-  var sources = (sim.sources || []).filter(Boolean);
   var card = h('div', { class: 'card' },
     h('div', { class: 'card-head' },
       h('h2', null, 'How this route builds it'),
       h('span', { class: 'muted small' }, route.title || '')));
 
-  if (!sources.length) {
+  var lanes = routeLanes(route, sim, plan);
+  if (!lanes.length) {
     card.appendChild(h('p', { class: 'muted' },
-      'This route was not simulated, so there is nothing to draw. The '
-      + 'numbered protocol is on the Cloning scheme step.'));
+      'This route has no amplification, digest or synthesis step to draw. '
+      + 'The numbered protocol is on the Protocol step.'));
     return card;
   }
 
-  var take = takeVerb(route);
-  var flow = h('div', { class: 'flow' });
-  sources.forEach(function (src) {
-    flow.appendChild(h('div', { class: 'flow-row' },
-      flowParent(src),
-      flowArrow(take, bp(src.bp)),
-      flowFragment(src)));
-  });
-  card.appendChild(flow);
-
-  /* The one reaction that closes the circle. */
-  var c = plan.construct || {};
-  card.appendChild(h('div', { class: 'flow-join' },
-    h('span', { class: 'flow-verb' }, joinVerb(route)),
-    h('span', { class: 'muted small' },
-      sources.length + ' piece' + (sources.length === 1 ? '' : 's')
-      + ' \u2192 ' + bp(sim.product_bp || c.length))));
-
-  var layout = (c.layout || []).filter(function (f) {
-    return f && typeof f.start === 'number';
-  });
-  card.appendChild(h('div', { class: 'flow-cell flow-product' },
-    h('div', { class: 'flow-title' }, c.name || 'new plasmid'),
-    circularMap(c.length || 1, layout, { label: c.name, compact: true }),
-    h('div', { class: 'flow-sub muted small' },
-      bp(sim.product_bp || c.length) + ' \u00b7 '
-      + (sim.identical ? 'simulated and identical to the design'
-                       : 'see the Cloning scheme step for the checks'))));
-
-  card.appendChild(h('p', { class: 'muted small' },
-    'Amber marks the stretch taken out of each parent. The numbered '
-    + 'protocol, the primers and the checks are on the Cloning scheme step.'));
+  var figure = cloningFigure(route, plan);
+  if (figure) card.appendChild(h('div', { class: 'fig-wrap' }, figure));
+  card.appendChild(h('p', { class: 'fig-legend muted small' },
+    figLegend(route, lanes)));
+  if (!sim.simulated) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'Drawn from the planned steps; this route was not simulated, so the '
+      + 'product shown is the design rather than a checked molecule.'));
+  }
   return card;
 }
 
@@ -4089,14 +4526,19 @@ function routeMethods(route) {
   return m;
 }
 
-/** Ticked boxes are requirements: a route must use all of them. */
+/** Ticked boxes are the techniques on offer: a route need only use one.
+
+   Requiring all of them answered "which route does everything I ticked",
+   which is not a question anybody has. The question is "I am willing to
+   do PCR or enzymes - show me those".
+ */
 function routePassesFilter(route) {
   var want = Object.keys(routeFilter).filter(function (k) {
     return routeFilter[k];
   });
   if (!want.length) return true;
   var has = routeMethods(route);
-  return want.every(function (k) { return !!has[k]; });
+  return want.some(function (k) { return !!has[k]; });
 }
 
 function methodChips(route) {
@@ -4111,7 +4553,7 @@ function methodChips(route) {
 
 function methodFilterBar(routes) {
   var bar = h('div', { class: 'method-filter' },
-    h('span', { class: 'muted small' }, 'uses:'));
+    h('span', { class: 'muted small' }, 'show routes using:'));
   METHOD_FILTERS.forEach(function (f) {
     var n = routes.filter(function (r) { return routeMethods(r)[f.key]; }).length;
     var box = h('input', {
@@ -4125,7 +4567,7 @@ function methodFilterBar(routes) {
     bar.appendChild(h('label', {
       class: 'method-box' + (n ? '' : ' muted'),
       title: f.hint + ' \u2014 ' + n + ' of ' + routes.length + ' route(s)'
-    }, box, f.label, h('span', { class: 'muted small' }, '\u00a0' + n)));
+    }, box, h('span', null, f.label + ' (' + n + ')')));
   });
   var any = Object.keys(routeFilter).some(function (k) { return routeFilter[k]; });
   if (any) {
@@ -4153,13 +4595,13 @@ function renderRoutes(routes) {
   var shown = routes.filter(routePassesFilter);
   if (!shown.length) {
     card.appendChild(h('p', { class: 'muted' },
-      'No route uses every technique ticked above.'));
+      'No route uses any of the techniques ticked above.'));
     return card;
   }
   if (shown.length < routes.length) {
     card.appendChild(h('p', { class: 'muted small' },
       'Showing ' + shown.length + ' of ' + routes.length
-      + '; the rest do not use every technique ticked.'));
+      + '; the rest use none of the techniques ticked.'));
   }
 
   card.appendChild(h('div', { class: 'routes' }, shown.map(function (r, i) {
@@ -4177,25 +4619,64 @@ function renderRoutes(routes) {
         h('h3', null, r.title || r.id),
         r.feasible ? null : h('span', { class: 'pill pill-bad' }, 'not feasible'),
         methodChips(r)),
+      /* What actually decides between two routes at the bench: how many
+         reactions, how many oligos to order, how long it takes. "cost"
+         is a dimensionless ranking score that reads like dollars, and
+         an infeasible route carries a +1000 sort sentinel, so it is
+         named for what it is and the sentinel is not shown at all.
+         "steps" and "assemblies" were the same on every route. */
       h('dl', { class: 'route-stats' },
-        statPair('cost', num(r.cost, 2)),
-        statPair('steps', r.n_steps),
         statPair('PCRs', r.n_pcr),
-        statPair('assemblies', r.n_assembly),
+        statPair('primers', (r.primers || []).length),
         statPair('hands-on', hours(r.hands_on_minutes)),
-        statPair('primers', (r.primers || []).length)),
+        r.feasible ? statPair('effort', Math.round(r.cost)) : null),
       r.feasible
         ? ((r.warnings || []).length
-            ? h('p', { class: 'route-note inline-warn' }, plural(r.warnings.length, 'warning'))
+            ? h('p', { class: 'route-note inline-warn',
+                       title: r.warnings.join('\n') },
+                firstLine(r.warnings[0])
+                + (r.warnings.length > 1
+                    ? '  (+' + (r.warnings.length - 1) + ' more)' : ''))
             : h('p', { class: 'route-note muted' }, 'no warnings'))
-        : h('p', { class: 'route-note reason' },
-            (r.warnings && r.warnings.length) ? r.warnings[0] : 'no reason given'));
+        : h('p', { class: 'route-note reason',
+                    title: (r.warnings || []).join('\n') },
+            (r.warnings && r.warnings.length) ? r.warnings[0]
+                                              : 'no reason given'));
   })));
   return card;
 }
 
+/** A warning's first clause, for the one line a card has room for. */
+function firstLine(text) {
+  var t = String(text || '').replace(/^simulation:\s*/, '');
+  if (t.length > 72) t = t.slice(0, 71).replace(/[\s,;:]+\S*$/, '') + '\u2026';
+  return t;
+}
+
+var STAT_HINTS = {
+  effort: 'relative planning score \u2014 reactions, oligos and ordered '
+        + 'DNA weighted together; lower is cheaper',
+  'hands-on': 'active bench time, not counting overnight growth, '
+            + 'screening or sequencing'
+};
+
+/** A one-line link that opens a paragraph. Used wherever a long
+ *  explanation was being read out before anybody asked for it. */
+function disclosure(label, text) {
+  var body = h('p', { class: 'muted small', hidden: 'hidden' }, text);
+  var link = h('button', {
+    type: 'button', class: 'link-button',
+    onclick: function () {
+      body.hidden = !body.hidden;
+      link.textContent = body.hidden ? label : 'hide';
+    }
+  }, label);
+  return h('div', { class: 'disclosure' }, link, body);
+}
+
 function statPair(label, value) {
-  return [h('dt', null, label),
+  if (label === null) return [];
+  return [h('dt', { title: STAT_HINTS[label] || null }, label),
           h('dd', null, value === null || value === undefined ? '' : String(value))];
 }
 
@@ -4204,8 +4685,9 @@ function renderRouteDetail(route) {
     h('div', { class: 'card-head' },
       h('h2', null, route.title || route.id),
       h('span', { class: 'muted small' },
-        'strategy: ' + (route.strategy || '?') + ' · cost ' + num(route.cost, 2) +
-        ' · ' + hours(route.hands_on_minutes) + ' hands-on')));
+        (route.n_pcr || 0) + ' PCR · '
+        + plural((route.primers || []).length, 'primer') + ' · '
+        + hours(route.hands_on_minutes) + ' hands-on')));
 
   if (!route.feasible) {
     card.appendChild(h('div', { class: 'errorbox' },
@@ -4567,6 +5049,13 @@ async function init() {
     state.modules.push(newModule('CDS'));
     renderModules();
   });
+  var more = $('builder-more'), help = $('builder-help');
+  if (more && help) {
+    more.addEventListener('click', function () {
+      help.hidden = !help.hidden;
+      more.textContent = help.hidden ? 'what the markers mean' : 'hide';
+    });
+  }
   $('scan').addEventListener('click', scanSources);
   $('generate').addEventListener('click', generatePlan);
   $('clear-spec').addEventListener('click', clearSpecWithConfirm);

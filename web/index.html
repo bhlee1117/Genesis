@@ -93,7 +93,9 @@
           <label>Construct name
             <input type="text" id="spec-name" value="untitled" placeholder="pAAV-hSyn-DIO-...">
           </label>
-          <label>Backbone <span class="hint">plasmid id or name</span>
+          <!-- The placeholder already says "id or name"; the sub-label
+               said it twice. -->
+          <label>Backbone
             <input type="text" id="spec-backbone" placeholder="e.g. 42 or pAAV-hSyn">
           </label>
           <label>Owner
@@ -109,22 +111,38 @@
           </label>
           <label class="checkbox"><input type="checkbox" id="spec-circular" checked> Circular</label>
         </div>
+        <!-- Four paragraphs of rules before the user has typed anything
+             is a manual, not a hint. One line says what to do; the rest
+             is there for whoever wants it. -->
         <p class="hint builder-hint">
-          Type in a part box to search the inventory for that feature type.
-          Picking a suggestion pins that exact part by id (shown as a
-          <span class="pin-chip pin-chip-demo">pinned&nbsp;#</span> chip);
-          clear the box or the chip&rsquo;s &times; to let the planner choose.
-          A row marked <span class="seg-badge seg-badge-fusion">fusion</span> is a
-          multi-protein CDS: open it with <kbd>&rarr;</kbd> (or the
-          <span class="seg-open-demo">split</span> button) to pin one of its
-          proteins instead.
-          A <code>Cre-lox</code> row picks an arrangement (DIO, FLEX, FAS or DO)
-          and brackets the coding modules below it &mdash; the ones it encloses
-          &mdash; until the first module that is not one of CDS,
-          trafficking_motif, linker, p2A, tag or IRES. The bracket is only a
-          picture of what the server does; the modules stay one flat, ordered
-          list.
+          Type in a part box to search the inventory; leave it blank to let
+          the planner choose.
+          <button type="button" class="link-button" id="builder-more">
+            what the markers mean
+          </button>
         </p>
+        <div class="hint builder-hint" id="builder-help" hidden>
+          <p>
+            Picking a suggestion pins that exact part by id (shown as a
+            <span class="pin-chip pin-chip-demo">pinned&nbsp;#</span> chip);
+            clear the box or the chip&rsquo;s &times; to let the planner
+            choose again.
+          </p>
+          <p>
+            A row marked <span class="seg-badge seg-badge-fusion">fusion</span>
+            is a multi-protein CDS: open it with <kbd>&rarr;</kbd> (or the
+            <span class="seg-open-demo">split</span> button) to pin one of its
+            proteins instead.
+          </p>
+          <p>
+            A <code>Cre-lox</code> row picks an arrangement (DIO, FLEX, FAS or
+            DO) and brackets the coding modules below it &mdash; the ones it
+            encloses &mdash; until the first module that is not one of CDS,
+            trafficking_motif, linker, p2A, tag or IRES. The bracket is only a
+            picture of what the server does; the modules stay one flat,
+            ordered list.
+          </p>
+        </div>
         <div class="spec-split">
           <div class="spec-modules">
             <div id="modules"></div>
@@ -161,7 +179,6 @@
 
     <div class="step-pane" id="step-target" hidden></div>
     <div class="step-pane" id="step-scan" hidden></div>
-    <div class="step-pane" id="step-select" hidden></div>
     <div class="step-pane" id="step-routes" hidden></div>
     <div class="step-pane" id="step-scheme" hidden></div>
 

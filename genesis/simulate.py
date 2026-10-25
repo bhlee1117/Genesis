@@ -69,7 +69,10 @@ class SimulationResult:
             "product_bp": self.product_bp, "circular": self.circular,
             "products": [{"name": p.name, "bp": len(p.seq), "note": p.note}
                          for p in self.products],
-            "sources": self.sources,
+            # ``seq`` is only there to locate the piece in the product; it
+            # would double the size of every plan sent to the browser.
+            "sources": [{k: v for k, v in s.items() if k != "seq"}
+                        for s in self.sources],
             "steps": self.steps, "problems": self.problems,
             "warnings": self.warnings,
             "modules": self.modules, "summary": self.summary,
@@ -364,6 +367,29 @@ def _plasmid_features(conn: sqlite3.Connection, pid: int) -> list[dict]:
                     ORDER BY start""", (pid,))]
 
 
+def template_atlas(conn: sqlite3.Connection, plan: dict) -> dict:
+    """Size, shape and annotations of every plasmid the routes name.
+
+    A route that could not be simulated still has to be drawable: the
+    reader wants to see which plasmid is cut where even when the planner
+    has already said the route will not work.  The sequences themselves
+    stay out of it - only what a figure needs.
+    """
+    atlas: dict[str, dict] = {}
+    for route in plan.get("routes") or []:
+        for name, (seq, circular, real, pid) in _templates(
+                conn, plan, route).items():
+            if real in atlas:
+                atlas.setdefault(name, atlas[real])
+                continue
+            entry = {"id": pid, "name": real, "bp": len(seq),
+                     "circular": circular,
+                     "features": _plasmid_features(conn, pid)}
+            atlas[real] = entry
+            atlas.setdefault(name, entry)
+    return atlas
+
+
 def _templates(conn: sqlite3.Connection, plan: dict,
                route: dict | None = None) -> dict:
     """Map every template name a primer can cite onto its real sequence.
@@ -472,7 +498,7 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
             "template_length": len(seq), "template_circular": circular,
             "from_start": fwd.get("target_start"),
             "from_end": fwd.get("target_end"),
-            "bp": len(amplicon),
+            "bp": len(amplicon), "seq": amplicon,
             "features": _plasmid_features(conn, template_id),
         })
 
@@ -491,6 +517,11 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
             continue
         products.append(SimulatedProduct(
             frag["name"], frag.get("seq", ""), "synthesised"))
+        result.sources.append({
+            "name": frag["name"], "template": None, "synthesised": True,
+            "bp": len(frag.get("seq") or ""), "seq": frag.get("seq") or "",
+            "features": [],
+        })
 
     # A route may order a fragment of its own rather than one the module
     # grouping produced - the gene-block route orders the whole insert -
@@ -503,6 +534,11 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
             products.append(SimulatedProduct(
                 step.get("output") or "ordered fragment", ordered,
                 f"{len(ordered)} bp ordered"))
+            result.sources.append({
+                "name": step.get("output") or "ordered fragment",
+                "template": None, "synthesised": True,
+                "bp": len(ordered), "seq": ordered, "features": [],
+            })
             result.steps.append({"operation": "SYNTHESIS",
                                  "product": step.get("output") or "insert",
                                  "bp": len(ordered)})
@@ -552,8 +588,10 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
     # Where each amplicon ended up, so the assembly can be drawn rather than
     # only tabulated.
     doubled = (product + product).upper()
-    for src, made in zip(result.sources, products):
-        body = made.seq.upper()
+    for src in result.sources:
+        body = (src.get("seq") or "").upper()
+        if not body:
+            continue
         if len(body) < 60:
             anchor, offset = body, 0
         else:
@@ -779,7 +817,7 @@ def _simulate_digest_ligation(route: dict, templates: dict,
                 "template_id": _tid, "template_length": len(seq),
                 "template_circular": circular,
                 "from_start": piece.start, "from_end": piece.end,
-                "bp": len(piece.seq),
+                "bp": len(piece.seq), "seq": piece.seq,
                 "features": _plasmid_features(conn, _tid),
             })
         pieces += keep

@@ -1111,7 +1111,13 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # molecule back, which cannot catch a design that verifies perfectly
     # while the steps underneath it build something else; this amplifies the
     # primers as ordered off the templates as named and sees what comes out.
-    from .simulate import simulate_route
+    from .simulate import simulate_route, template_atlas
+    # What each named template is, for every route - a route the planner
+    # rejected still gets drawn, and a drawing needs the plasmid's size.
+    try:
+        plan["templates"] = template_atlas(conn, plan)
+    except Exception:                                 # drawing data only
+        plan["templates"] = {}
     for route in plan["routes"]:
         if not route.get("feasible"):
             continue

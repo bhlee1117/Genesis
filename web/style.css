@@ -163,6 +163,28 @@ label.checkbox {
 }
 
 .hint { color: var(--text-muted); font-weight: 400; }
+/* A button that only reveals or resets something is not a command; giving
+   it a chrome button's border put it on a level with "Add module". */
+.link-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.link-button:hover { text-decoration: none; }
+.disclosure { margin: 2px 0 6px; }
+.disclosure p { margin: 4px 0 0; }
+/* The column is still in the grid so the rows stay aligned; it is the
+   repeated text that goes, not the track. */
+.cand-nohas .cand-has { visibility: hidden; }
+/* A note in the header row is still a note, not a column name. */
+.cand-head-note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+/* The long form of the builder hint, shown only when it is asked for. */
+#builder-help { margin: 0 0 8px; }
+#builder-help p { margin: 4px 0; }
 
 input[type="text"], input[type="search"], select, textarea {
   font: inherit;
@@ -662,10 +684,10 @@ ul.issues .loc { flex: none; font-size: 10.5px; opacity: 0.8; }
   box-shadow: inset 3px 0 0 var(--accent);
   background: var(--row-selected);
 }
-.route.infeasible { opacity: 0.55; background: var(--surface); }
-.route.infeasible .route-head h3 { text-decoration: line-through; }
+.route.infeasible { opacity: 0.6; background: var(--surface); }
 
 .route-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.route-head h3 { font-size: 13.5px; font-weight: 600; margin: 0; }
 .route-head .rank {
   font-family: var(--mono);
   font-size: 11px;
@@ -688,12 +710,16 @@ dl.route-stats dd {
   font-size: 11px;
 }
 
-.route-note { margin: 7px 0 0; font-size: 11.5px; }
+.route-note { margin: 7px 0 0; font-size: 11.5px; line-height: 1.35; }
 .route-note.reason {
   color: var(--error-text);
   background: var(--error-bg);
   border-radius: var(--radius);
   padding: 4px 6px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 /* ---------------- steps ---------------- */
@@ -1299,7 +1325,7 @@ tr.row-bad td {
   margin: 12px 0 4px;
 }
 .sim-source {
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 12px 4px;
   background: var(--panel);
@@ -1339,7 +1365,7 @@ tr.row-bad td {
 .cand-name { font-weight: 600; overflow-wrap: anywhere; }
 .cand-has { overflow-wrap: anywhere; }
 .cand-donor {
-  border-left: 2px solid var(--line);
+  border-left: 2px solid var(--border);
   padding-left: 12px;
   margin: 8px 0 12px;
 }
@@ -1352,12 +1378,12 @@ tr.row-bad td {
   font-size: 0.78rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--text-muted);
   cursor: default;
 }
 .cand-head:hover { background: none; }
 .cand-name .pill { margin-left: 7px; font-size: 0.72rem; vertical-align: middle; }
-.pill-soft { background: var(--line); color: var(--muted); }
+.pill-soft { background: var(--border); color: var(--text-muted); }
 .cand-score-soft { opacity: 0.65; }
 
 /* --- part picker grouped by protein ------------------------------------ */
@@ -1366,7 +1392,7 @@ tr.row-bad td {
 .combo-item.combo-head {
   cursor: default;
   padding-top: 0.5rem;
-  border-top: 1px solid var(--line, #2a2f3a);
+  border-top: 1px solid var(--border);
   opacity: 0.95;
 }
 .combo-item.combo-head:hover { background: none; }
@@ -1398,7 +1424,7 @@ tr.row-bad td {
   gap: 0;
   margin: 0 0 1rem;
   padding: 0.25rem;
-  border: 1px solid var(--line, #2a2f3a);
+  border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--panel, rgba(255, 255, 255, 0.02));
 }
@@ -1420,7 +1446,7 @@ tr.row-bad td {
 }
 .steps .step:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); opacity: 1; }
 .steps .step.active {
-  background: var(--accent-soft, rgba(90, 150, 255, 0.16));
+  background: var(--row-selected));
   opacity: 1;
   box-shadow: inset 0 0 0 1px var(--accent, #5a96ff);
 }
@@ -1451,7 +1477,7 @@ tr.row-bad td {
   align-self: center;
   width: 1px;
   height: 1.4rem;
-  background: var(--line, #2a2f3a);
+  background: var(--border);
 }
 /* Below a tablet the hints are the first thing to go, then the rail wraps. */
 @media (max-width: 1100px) {
@@ -1468,7 +1494,7 @@ tr.row-bad td {
   align-items: baseline;
   gap: 0.6rem;
   padding: 0.4rem 0;
-  border-bottom: 1px solid var(--line, #2a2f3a);
+  border-bottom: 1px solid var(--border);
 }
 .sel-row:last-child { border-bottom: 0; }
 .sel-what { flex: 0 0 11rem; opacity: 0.7; font-size: 0.88rem; }
@@ -1558,65 +1584,52 @@ tr.row-bad td {
   margin-top: 1rem;
 }
 
-/* --- routes: the cloning drawn as the steps it is ---------------------- */
-.flow { display: flex; flex-direction: column; gap: 0.5rem; }
-.flow-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  gap: 0.75rem;
-  align-items: center;
-  padding: 0.6rem;
-  border: 1px solid var(--line, #2a2f3a);
-  border-radius: 8px;
+/* --- routes: the cloning figure --------------------------------------- */
+/* One drawing, not a grid of widgets: the browser only has to scroll it. */
+.fig-wrap {
+  overflow-x: auto;
+  padding: 0.25rem 0 0.5rem;
 }
-.flow-cell { min-width: 0; text-align: center; }
-.flow-title {
+.fig-svg {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+  height: auto;
+}
+.fig-ring { stroke: var(--text-muted); opacity: 0.55; }
+.fig-name {
+  font-size: 11px;
   font-weight: 600;
-  font-size: 0.88rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  fill: var(--text);
 }
-/* The circles are read side by side, so they stay small. */
-.flow-cell .map-circular svg { max-width: 190px; }
-.flow-cell .map-toggle { display: none; }
-.flow-arrow {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.1rem;
-  padding: 0 0.5rem;
-  white-space: nowrap;
+.fig-sub { font-size: 9.5px; fill: var(--text-muted); }
+.fig-verb {
+  font-size: 10.5px;
+  font-weight: 700;
+  fill: var(--text);
+  letter-spacing: 0.01em;
 }
-.flow-verb { font-weight: 700; font-size: 0.9rem; }
-.flow-tick { font-size: 1.5rem; line-height: 1; opacity: 0.55; }
-/* A fragment is linear; a bar says so where a circle would lie. */
-.frag-bar {
-  height: 12px;
-  margin: 0.6rem auto;
-  max-width: 190px;
-  border-radius: 3px;
-  background: var(--line, #2a2f3a);
-  overflow: hidden;
+.fig-tag { font-size: 9.5px; fill: var(--text-muted); }
+.fig-tag-strong { font-weight: 600; fill: var(--text); }
+.fig-enz { font-size: 9.5px; font-weight: 600; fill: #e0574f; }
+.fig-prim-tag { font-size: 9px; font-weight: 600; fill: #2f9e5e; }
+.fig-piece { font-size: 10.5px; font-weight: 600; fill: var(--text); }
+.fig-arrow { stroke: var(--text-muted); fill: none; }
+.fig-arrow-head { fill: var(--text-muted); }
+.fig-primer { stroke: #2f9e5e; fill: none; stroke-linecap: round; }
+.fig-primer-head { fill: #2f9e5e; }
+.fig-cut { stroke: #e0574f; stroke-linecap: round; }
+.fig-order {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 3;
 }
-.frag-fill { display: block; height: 100%; width: 100%; background: #f0a32a; }
-.flow-join {
-  display: flex;
-  align-items: baseline;
-  justify-content: center;
-  gap: 0.6rem;
-  margin: 0.6rem 0 0.2rem;
-  padding: 0.5rem;
-  border-radius: 8px;
-  background: var(--accent-soft, rgba(90, 150, 255, 0.14));
-}
-.flow-product { margin-top: 0.4rem; }
-.flow-product .map-circular svg { max-width: 240px; }
-@media (max-width: 860px) {
-  .flow-row { grid-template-columns: minmax(0, 1fr); }
-  .flow-arrow { flex-direction: row; gap: 0.4rem; }
-  .flow-tick { transform: rotate(90deg); }
-}
+/* A sticky end is a real overhang; a homology arm is shared sequence. */
+.fig-end-cut { fill: #e0574f; }
+.fig-end-hom { fill: var(--text-muted); opacity: 0.8; }
+.fig-end-label { font-size: 9px; fill: var(--text-muted); }
+.fig-legend { margin: 0.2rem 0 0; }
 
 /* --- routes: what each one actually does ------------------------------- */
 .method-filter {
@@ -1626,14 +1639,16 @@ tr.row-bad td {
   gap: 0.75rem;
   margin: 0 0 0.75rem;
   padding: 0.5rem 0.65rem;
-  border: 1px solid var(--line, #2a2f3a);
+  border: 1px solid var(--border);
   border-radius: 8px;
 }
 .method-box {
   display: inline-flex;
+  flex-direction: row;
   align-items: center;
   gap: 0.35rem;
-  font-size: 0.88rem;
+  font-size: 12px;
+  color: var(--text);
   cursor: pointer;
 }
 .method-box input:disabled { cursor: default; }

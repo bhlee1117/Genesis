@@ -41,6 +41,11 @@ def rand_seq(n, seed=None):
     return "".join(r.choice("ACGT") for _ in range(n))
 
 
+def _rc(seq):
+    from genesis.seqtools import revcomp
+    return revcomp(seq)
+
+
 def orf(n_codons, seed=0):
     r = random.Random(seed)
     cods = ["GCT", "TGC", "GAT", "GAA", "TTT", "GGT", "CAT", "ATT", "AAA", "CTG"]
@@ -5143,6 +5148,139 @@ class TestPrimerSiteMovesToBetterBases(unittest.TestCase):
     def test_moving_the_site_is_said_out_loud(self):
         (f, _), _ = self._pair(15)
         self.assertTrue(any("moved" in w for w in f.warnings), f.warnings)
+
+
+class TestEveryPieceInTheTubeIsDrawable(unittest.TestCase):
+    """Where each piece came from, and where it ended up.
+
+    ``sources`` is what the Routes figure draws from. It was zipped
+    against ``products`` by position, and the two lists stop running in
+    parallel the moment a route orders a fragment or cuts a plasmid: an
+    ordered gBlock produced a molecule with no source at all - so
+    synthesis was simply missing from the drawing - and the entries that
+    were left got paired with somebody else's sequence and placed in the
+    wrong arc of the product.
+    """
+
+    def test_a_cut_band_knows_where_it_lands(self):
+        """A two-plasmid digest runs no PCR, so ``products`` is empty and
+        zipping the sources against it placed neither band."""
+        from genesis import simulate
+        rng = random.Random(77)
+        filler = lambda n: "".join(rng.choice("ACGT") for _ in range(n))
+        # GGATCC = BamHI, AAGCTT = HindIII
+        vector = filler(200) + "GGATCC" + filler(2400) + "AAGCTT" + filler(200)
+        donor = filler(150) + "GGATCC" + filler(800) + "AAGCTT" + filler(150)
+        conn = connect(":memory:")
+        for i, (name, seq) in enumerate((("pVec", vector), ("pDon", donor))):
+            conn.execute("INSERT INTO plasmid (name, seq, seq_length, "
+                         "circular, seq_checksum) VALUES (?,?,?,1,?)",
+                         (name, seq, len(seq), "ck-band-%d" % i))
+        vid = conn.execute("SELECT id FROM plasmid WHERE name='pVec'"
+                           ).fetchone()["id"]
+        did = conn.execute("SELECT id FROM plasmid WHERE name='pDon'"
+                           ).fetchone()["id"]
+        plan = {"backbone": {"id": vid}, "modules": [], "fragments": [],
+                "swap": {"recipient": {"id": vid}, "donor": {"id": did}},
+                "construct": {"length": 0}}
+        route = {"id": "restriction", "primers": [], "steps": [
+            {"operation": "RE_DIGEST", "inputs": ["pVec"],
+             "details": {"enzymes": ["BamHI", "HindIII"]}},
+            {"operation": "RE_DIGEST", "inputs": ["pDon"],
+             "details": {"enzymes": ["BamHI", "HindIII"]}},
+            {"operation": "LIGATION", "inputs": ["pVec", "pDon"]}]}
+        result = simulate.simulate_route(conn, plan, route)
+        self.assertTrue(result.product_bp, result.problems)
+        self.assertEqual(len(result.sources), 2, result.sources)
+        for src in result.sources:
+            self.assertIn("at_start", src,
+                          "%s was never located in the product" % src["name"])
+        # and they land in different places, which is the point of drawing them
+        self.assertNotEqual(result.sources[0]["at_start"],
+                            result.sources[1]["at_start"])
+        conn.close()
+
+    def test_an_ordered_fragment_is_a_source(self):
+        """Nothing drew the synthesis step, because it had no source."""
+        from genesis import simulate
+        conn = connect(":memory:")
+        vector, insert = rand_seq(2000, 23), rand_seq(900, 24)
+        # a vector amplified end to end, closed by an ordered insert that
+        # shares 25 bp with each of its ends
+        arm_l, arm_r = vector[-25:], vector[:25]
+        ordered = arm_l + insert + arm_r
+        conn.execute("INSERT INTO plasmid (name, seq, seq_length, circular, "
+                     "seq_checksum) VALUES (?,?,?,1,?)",
+                     ("host", vector, len(vector), "ck-order-1"))
+        pid = conn.execute("SELECT id FROM plasmid").fetchone()["id"]
+        plan = {"backbone": {"id": pid}, "modules": [], "fragments": [],
+                "construct": {"length": len(vector) + len(insert)}}
+        route = {
+            "id": "gblock",
+            "steps": [
+                {"operation": "SYNTHESIS", "output": "synthetic insert",
+                 "details": {"sequence": ordered, "length": len(ordered)}},
+                {"operation": "PCR", "output": "vector amplicon",
+                 "inputs": ["host", "v-F+v-R"],
+                 "details": {"template": "host"}},
+                {"operation": "HI_FI_ASSEMBLY",
+                 "inputs": ["vector amplicon", "synthetic insert"]},
+            ],
+            "primers": [
+                {"name": "v-F", "direction": "F", "template": "backbone",
+                 "tail": "", "anneal": vector[:20],
+                 "target_start": 0, "target_end": len(vector)},
+                {"name": "v-R", "direction": "R", "template": "backbone",
+                 "tail": "", "anneal": _rc(vector[-20:])},
+            ],
+        }
+        result = simulate.simulate_route(conn, plan, route)
+        names = [s["name"] for s in result.sources]
+        self.assertIn("synthetic insert", names,
+                      "the ordered fragment has to be drawable too")
+        ordered_src = [s for s in result.sources
+                       if s["name"] == "synthetic insert"][0]
+        self.assertTrue(ordered_src.get("synthesised"))
+        self.assertEqual(ordered_src["bp"], len(ordered))
+        self.assertIn("at_start", ordered_src,
+                      "a source with no place in the product cannot be drawn")
+        conn.close()
+
+    def test_the_locating_sequence_does_not_reach_the_browser(self):
+        """A plan carries a dozen sources; shipping each one's bases
+        would roughly double the size of every response."""
+        from genesis.simulate import SimulationResult
+        result = SimulationResult()
+        result.sources = [{"name": "a", "bp": 3, "seq": "ACGT" * 500}]
+        d = result.to_dict()
+        self.assertNotIn("seq", d["sources"][0])
+        self.assertEqual(d["sources"][0]["name"], "a")
+
+
+class TestTemplateAtlas(unittest.TestCase):
+    """A route the planner rejected still has to be drawable."""
+
+    def test_the_atlas_names_sizes_without_sequences(self):
+        from genesis import simulate
+        conn = connect(":memory:")
+        seq = rand_seq(1500, 31)
+        conn.execute("INSERT INTO plasmid (name, seq, seq_length, circular, "
+                     "seq_checksum) VALUES (?,?,?,1,?)",
+                     ("pHost", seq, len(seq), "ck-atlas-1"))
+        pid = conn.execute("SELECT id FROM plasmid").fetchone()["id"]
+        conn.execute("INSERT INTO annotation (plasmid_id, name, feature_type,"
+                     " start, end, strand) VALUES (?,?,?,?,?,1)",
+                     (pid, "CAG", "promoter", 10, 700))
+        plan = {"backbone": {"id": pid},
+                "routes": [{"id": "re", "steps": [
+                    {"operation": "RE_DIGEST", "inputs": ["pHost"]}]}]}
+        atlas = simulate.template_atlas(conn, plan)
+        self.assertIn("pHost", atlas)
+        self.assertEqual(atlas["pHost"]["bp"], len(seq))
+        self.assertNotIn("seq", atlas["pHost"])
+        self.assertEqual([f["name"] for f in atlas["pHost"]["features"]],
+                         ["CAG"])
+        conn.close()
 
 
 class TestStickyEndLigationIsSimulated(unittest.TestCase):
