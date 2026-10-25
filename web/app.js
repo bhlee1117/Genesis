@@ -3403,12 +3403,38 @@ function renderCandidates(plan) {
     'Read as an architecture: ' + (cand.modules || []).join(' – ') + '.'));
 
   var wants = (cand.modules || []).slice();
-  var mapHost = h('aside', { class: 'cand-map card' });
+  /* One panel per parent rather than one shared one. A two-donor plan
+     has three plasmids in it, and a single panel could only ever show
+     the last thing clicked - which is the one you are least likely to
+     be comparing against. */
+  var maps = h('aside', { class: 'cand-maps' });
+  var panels = {};
+  function panelFor(key, role) {
+    if (!panels[key]) {
+      panels[key] = h('div', { class: 'cand-map card' });
+      maps.appendChild(panels[key]);
+    }
+    return panels[key];
+  }
   var lists = h('div', { class: 'cand-lists' });
-  var split = h('div', { class: 'cand-split' }, lists, mapHost);
-  card.appendChild(split);
-  /* Start on whatever is already chosen, so the panel is never blank. */
-  showCandidateMap(mapHost, chosenBackbone, wants, 'recipient');
+  card.appendChild(h('div', { class: 'cand-split' }, lists, maps));
+
+  /* Draw what is already chosen, so nothing is blank before a click. */
+  showCandidateMap(panelFor('recipient'), chosenBackbone, wants, 'recipient');
+  (cand.donors || []).forEach(function (d, di) {
+    var ids = partIdsFor(plan, d.covers || []);
+    var picked = (d.options || []).filter(function (o) {
+      return ids.length && ids.every(function (id) {
+        return pinnedSources[id] === o.plasmid_id;
+      });
+    })[0] || (d.options || [])[0];
+    if (picked) {
+      showCandidateMap(panelFor('donor' + di), picked.plasmid_id,
+                       d.covers || [],
+                       'donor ' + (di + 1) + ' \u2014 ' +
+                       (d.covers || []).join(' + '));
+    }
+  });
 
   if (recipients.length) {
     lists.appendChild(h('h4', null, 'Start from'));
@@ -3434,7 +3460,8 @@ function renderCandidates(plan) {
           checked: on ? 'checked' : null,
           onchange: function () {
             $('spec-backbone').value = String(r.plasmid_id);
-            showCandidateMap(mapHost, r.plasmid_id, wants, 'recipient');
+            showCandidateMap(panelFor('recipient'), r.plasmid_id, wants,
+                             'recipient');
             replan();
           }
         }),
@@ -3466,7 +3493,7 @@ function renderCandidates(plan) {
     var n = cand.n_donors || 0;
     lists.appendChild(h('h4', null,
       'Then take the rest from ' + n + ' donor' + (n === 1 ? '' : 's')));
-    donors.forEach(function (d) {
+    donors.forEach(function (d, di) {
       var box = h('div', { class: 'cand-donor' },
         h('div', null, h('strong', null, (d.covers || []).join(' – '))));
       if (d.note) {
@@ -3485,7 +3512,10 @@ function renderCandidates(plan) {
               ids.forEach(function (id) { pinnedSources[id] = o.plasmid_id; });
               /* Show the donor being pointed at, with the part it is
                  wanted for picked out of it. */
-              showCandidateMap(mapHost, o.plasmid_id, d.covers || [], 'donor');
+              showCandidateMap(panelFor('donor' + di), o.plasmid_id,
+                               d.covers || [],
+                               'donor ' + (di + 1) + ' \u2014 ' +
+                               (d.covers || []).join(' + '));
               replan();
             }
           }),
@@ -4093,6 +4123,84 @@ function renderCloningFlow(route, plan) {
   return card;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Routes: filter by technique                                         */
+/* ------------------------------------------------------------------ */
+/* Which way a construct gets built is a lab preference before it is an
+   optimisation - some benches have no HiFi master mix, some would rather
+   not design primers - so the ranked list is filterable by what the
+   route actually does. */
+
+var METHOD_FILTERS = [
+  { key: 'pcr',      label: 'PCR',        hint: 'amplifies at least one piece' },
+  { key: 'enzyme',   label: 'Enzyme',     hint: 'cuts with restriction enzymes' },
+  { key: 'assembly', label: 'Homology',   hint: 'HiFi or Gibson assembly' },
+  { key: 'order',    label: 'Synthesis',  hint: 'orders a fragment' }
+];
+
+var routeFilter = {};   // key -> true when that technique is required
+
+/** The set of techniques a route uses. */
+function routeMethods(route) {
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  var m = {};
+  if (ops.indexOf('PCR') >= 0) m.pcr = true;
+  if (ops.indexOf('RE_DIGEST') >= 0) m.enzyme = true;
+  if (ops.indexOf('HI_FI_ASSEMBLY') >= 0 ||
+      ops.indexOf('GIBSON_ASSEMBLY') >= 0) m.assembly = true;
+  if (ops.indexOf('SYNTHESIS') >= 0) m.order = true;
+  return m;
+}
+
+/** Ticked boxes are requirements: a route must use all of them. */
+function routePassesFilter(route) {
+  var want = Object.keys(routeFilter).filter(function (k) {
+    return routeFilter[k];
+  });
+  if (!want.length) return true;
+  var has = routeMethods(route);
+  return want.every(function (k) { return !!has[k]; });
+}
+
+function methodChips(route) {
+  var has = routeMethods(route);
+  var on = METHOD_FILTERS.filter(function (f) { return has[f.key]; });
+  if (!on.length) return null;
+  return h('div', { class: 'route-methods' }, on.map(function (f) {
+    return h('span', { class: 'method-chip method-' + f.key, title: f.hint },
+      f.label);
+  }));
+}
+
+function methodFilterBar(routes) {
+  var bar = h('div', { class: 'method-filter' },
+    h('span', { class: 'muted small' }, 'uses:'));
+  METHOD_FILTERS.forEach(function (f) {
+    var n = routes.filter(function (r) { return routeMethods(r)[f.key]; }).length;
+    var box = h('input', {
+      type: 'checkbox', checked: routeFilter[f.key] ? 'checked' : null,
+      disabled: n ? null : 'disabled',
+      onchange: function (e) {
+        routeFilter[f.key] = e.target.checked;
+        renderPlan();
+      }
+    });
+    bar.appendChild(h('label', {
+      class: 'method-box' + (n ? '' : ' muted'),
+      title: f.hint + ' \u2014 ' + n + ' of ' + routes.length + ' route(s)'
+    }, box, f.label, h('span', { class: 'muted small' }, '\u00a0' + n)));
+  });
+  var any = Object.keys(routeFilter).some(function (k) { return routeFilter[k]; });
+  if (any) {
+    bar.appendChild(h('button', {
+      type: 'button', class: 'link-button',
+      onclick: function () { routeFilter = {}; renderPlan(); }
+    }, 'clear'));
+  }
+  return bar;
+}
+
 function renderRoutes(routes) {
   var card = h('div', { class: 'card' },
     h('div', { class: 'card-head' },
@@ -4105,7 +4213,20 @@ function renderRoutes(routes) {
     return card;
   }
 
-  card.appendChild(h('div', { class: 'routes' }, routes.map(function (r, i) {
+  card.appendChild(methodFilterBar(routes));
+  var shown = routes.filter(routePassesFilter);
+  if (!shown.length) {
+    card.appendChild(h('p', { class: 'muted' },
+      'No route uses every technique ticked above.'));
+    return card;
+  }
+  if (shown.length < routes.length) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'Showing ' + shown.length + ' of ' + routes.length
+      + '; the rest do not use every technique ticked.'));
+  }
+
+  card.appendChild(h('div', { class: 'routes' }, shown.map(function (r, i) {
     var selected = r.id === state.routeId;
     var cls = 'route' + (selected ? ' selected' : '') + (r.feasible ? '' : ' infeasible');
     return h('div', {
@@ -4118,7 +4239,8 @@ function renderRoutes(routes) {
       h('div', { class: 'route-head' },
         h('span', { class: 'rank' }, '#' + (i + 1)),
         h('h3', null, r.title || r.id),
-        r.feasible ? null : h('span', { class: 'pill pill-bad' }, 'not feasible')),
+        r.feasible ? null : h('span', { class: 'pill pill-bad' }, 'not feasible'),
+        methodChips(r)),
       h('dl', { class: 'route-stats' },
         statPair('cost', num(r.cost, 2)),
         statPair('steps', r.n_steps),

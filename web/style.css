@@ -1536,16 +1536,18 @@ tr.row-bad td {
   align-items: start;
 }
 .cand-lists { min-width: 0; }
-.cand-map {
+.cand-maps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
   position: sticky;
   top: 0.5rem;
-  margin: 0;
-  padding: 0.75rem;
 }
+.cand-map { margin: 0; padding: 0.75rem; }
 .cand-map h4 { margin: 0; font-size: 0.95rem; }
 @media (max-width: 1100px) {
   .cand-split { grid-template-columns: minmax(0, 1fr); }
-  .cand-map { position: static; }
+  .cand-maps { position: static; }
 }
 
 /* The move out of a step, sitting on its own under the content. */
@@ -1615,3 +1617,36 @@ tr.row-bad td {
   .flow-arrow { flex-direction: row; gap: 0.4rem; }
   .flow-tick { transform: rotate(90deg); }
 }
+
+/* --- routes: what each one actually does ------------------------------- */
+.method-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 8px;
+}
+.method-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+.method-box input:disabled { cursor: default; }
+.route-methods { display: inline-flex; gap: 0.3rem; margin-left: auto; }
+/* Each technique keeps one colour wherever it appears. */
+.method-chip {
+  font-size: 0.72rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  opacity: 0.85;
+}
+.method-pcr { color: #5a96ff; }
+.method-enzyme { color: #e0574f; }
+.method-assembly { color: #46b48c; }
+.method-order { color: #d8a33c; }

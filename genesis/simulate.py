@@ -215,10 +215,14 @@ class CutFragment:
     That one rule covers 5' overhangs, 3' overhangs and blunt ends alike.
     """
 
-    __slots__ = ("seq", "left", "right")
+    __slots__ = ("seq", "left", "right", "start", "end", "parent")
 
-    def __init__(self, seq: str, left: str, right: str):
+    def __init__(self, seq: str, left: str, right: str,
+                 start: int = 0, end: int = 0, parent: str = ""):
         self.seq, self.left, self.right = seq, left, right
+        #: Where this piece sat in the molecule it was cut out of, so a
+        #: digest can be drawn on its parent the way a PCR is.
+        self.start, self.end, self.parent = start, end, parent
 
     def flipped(self) -> "CutFragment":
         """The same molecule the other way round.
@@ -226,7 +230,8 @@ class CutFragment:
         Turning a fragment over does not change its overhangs - they are
         the same single strands - it only swaps which end they are at.
         """
-        return CutFragment(revcomp(self.seq), self.right, self.left)
+        return CutFragment(revcomp(self.seq), self.right, self.left,
+                           self.start, self.end, self.parent)
 
 
 def _overhangs(seq: str, top: int, bottom: int) -> tuple[str, str]:
@@ -267,7 +272,7 @@ def digest(seq: str, circular: bool, enzymes: list) -> list:
                     else seq[top:] + seq[:nxt_top])
             left = _overhangs(seq, top, bottom)[0]
             right = _overhangs(seq, nxt_top, nxt_bottom)[1]
-            pieces.append(CutFragment(body, left, right))
+            pieces.append(CutFragment(body, left, right, top, nxt_top))
     else:
         bounds = [(0, 0)] + cuts + [(len(seq), len(seq))]
         for i in range(len(bounds) - 1):
@@ -279,7 +284,7 @@ def digest(seq: str, circular: bool, enzymes: list) -> list:
             left = _overhangs(seq, top, bottom)[0] if i else ""
             right = (_overhangs(seq, nxt_top, nxt_bottom)[1]
                      if i + 2 < len(bounds) else "")
-            pieces.append(CutFragment(body, left, right))
+            pieces.append(CutFragment(body, left, right, top, nxt_top))
     return pieces
 
 
@@ -478,7 +483,11 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
                                  "product": step.get("output") or "insert",
                                  "bp": len(ordered)})
 
-    if not products:
+    # A digest-and-ligate route of two plasmids runs no PCR at all: both
+    # pieces come straight out of enzymes. Bailing on an empty amplicon
+    # list left that route unsimulated, and an unsimulated route reports
+    # "no warnings" - which reads as clean rather than as unchecked.
+    if not products and "RE_DIGEST" not in operations:
         result.simulated = False
         result.summary = "nothing to simulate for this route"
         return result
@@ -488,7 +497,10 @@ def simulate_route(conn: sqlite3.Connection, plan: dict, route: dict
     if "RE_DIGEST" in operations:
         # Sticky ends, not homology. Checking this route for shared end
         # sequence asks it a question it was never going to answer.
-        product, notes = _simulate_digest_ligation(route, templates, products)
+        cut_sources: list = []
+        product, notes = _simulate_digest_ligation(
+            route, templates, products, conn, cut_sources)
+        result.sources.extend(cut_sources)
         for n in notes:
             result.steps.append({"operation": "DIGEST", "note": n})
         if product is None:
@@ -649,7 +661,8 @@ def _check_leftovers(result: "SimulationResult", product: str, plan: dict,
 
 
 def _simulate_digest_ligation(route: dict, templates: dict,
-                              products: list) -> tuple:
+                              products: list, conn=None,
+                              cut_sources: list | None = None) -> tuple:
     """Work out what a digest-and-ligate route actually produces.
 
     This had never been simulated. The simulator amplified whatever the
@@ -686,21 +699,41 @@ def _simulate_digest_ligation(route: dict, templates: dict,
         for step in route.get("steps") or []
         if step.get("operation") == "GEL_EXTRACTION") if sz]
 
+    claimed: set = set()
+
     def choose(pieces: list, note: str) -> list:
-        """The band the protocol says to keep, or the biggest if it is silent."""
+        """The band the protocol says to keep, or the biggest if it is silent.
+
+        A size is claimed once: two plasmids cut with the same pair can
+        both contain a band of the vector's length, and without this they
+        would both be read as the vector.
+        """
         for size in wanted:
+            if size in claimed:
+                continue
             for piece in pieces:
                 if abs(len(piece.seq) - size) <= 4:
+                    claimed.add(size)
                     return [piece]
-        return [max(pieces, key=lambda f: len(f.seq))] if pieces else []
+        rest = [p for p in pieces if id(p) not in claimed]
+        return [max(rest or pieces, key=lambda f: len(f.seq))] if pieces else []
 
     notes: list[str] = []
     pieces: list = []
+    cut_sources = cut_sources if cut_sources is not None else []
 
-    # The vector: whichever named plasmid this route cuts.
-    cut_names = {str(i) for step in route.get("steps") or []
-                 if step.get("operation") == "RE_DIGEST"
-                 for i in (step.get("inputs") or [])}
+    # Every named plasmid this route cuts, not just the first. A
+    # two-plasmid digest-and-ligate runs no PCR at all - the backbone and
+    # the insert both come straight out of enzymes - and stopping after
+    # one of them left a single piece and the report "only one piece to
+    # ligate" for a route that is perfectly well formed.
+    cut_names = []
+    for step in route.get("steps") or []:
+        if step.get("operation") != "RE_DIGEST":
+            continue
+        for item in step.get("inputs") or []:
+            if str(item) not in cut_names:
+                cut_names.append(str(item))
     for name in cut_names:
         entry = templates.get(name)
         if entry is None:
@@ -715,8 +748,17 @@ def _simulate_digest_ligation(route: dict, templates: dict,
         notes.append(f"{real_name} cut into "
                      + ", ".join(f"{len(f.seq):,} bp" for f in cut)
                      + f"; kept {len(keep[0].seq):,} bp")
+        for piece in keep:
+            piece.parent = real_name
+            cut_sources.append({
+                "name": f"{real_name} band", "template": real_name,
+                "template_id": _tid, "template_length": len(seq),
+                "template_circular": circular,
+                "from_start": piece.start, "from_end": piece.end,
+                "bp": len(piece.seq),
+                "features": _plasmid_features(conn, _tid),
+            })
         pieces += keep
-        break
 
     # The insert. A route may cut it too, or may give it homology arms and
     # join it to the cut vector with HiFi - the hybrid route does exactly
