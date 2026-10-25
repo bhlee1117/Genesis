@@ -5519,6 +5519,140 @@ class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
         conn.close()
 
 
+class TestAPayloadTakenOutOfACreLoxDonorComesOutForwards(unittest.TestCase):
+    """A DIO donor stores its payload inverted - that is what DIO is.
+
+    Amplify it with the donor's own coordinates and the amplicon is the
+    reverse complement of what the construct wants, and the assembly
+    puts it in backwards. The all-PCR swap has always gone through
+    _amplification_frame for this; the hybrid swap passed the donor
+    sequence straight to the primer designer, so ASAP7y went into
+    pAAV-CAG-ASAP7y the wrong way round.
+
+    Every part was reported present, because presence is tested on both
+    strands - it has to be, or a legitimately inverted Cre-lox payload
+    would read as missing. So nothing caught it.
+    """
+
+    def _db(self):
+        """A recipient with a payload to replace, and a DIO donor whose
+        own payload is stored on the minus strand."""
+        import hashlib
+        conn = connect(":memory:")
+        payload = orf(300, 61)                     # what the donor carries
+        old = orf(260, 62)                         # what the recipient has
+        prom = rand_seq(500, 63)
+        rec = (rand_seq(400, 64) + prom + old + rand_seq(1500, 65))
+        rid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular, verified)
+               VALUES ('pRec','t',?,?,'orient-r',1,'sequence_verified')""",
+            (rec, len(rec))).lastrowid
+        # the donor keeps the payload reverse-complemented, between lox
+        # sites, exactly as a DIO cassette does
+        flipped = _rc(payload)
+        don = (rand_seq(600, 66) + LOX2272 + rand_seq(40, 67) + LOXP
+               + flipped + _rc(LOX2272) + _rc(LOXP) + rand_seq(900, 68))
+        did = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular, verified)
+               VALUES ('pDonDIO','t',?,?,'orient-d',1,'sequence_verified')""",
+            (don, len(don))).lastrowid
+        at = don.index(flipped)
+        for pid, name, ftype, start, end, strand in (
+                (rid, "prom", "promoter", 400, 400 + len(prom), 1),
+                (rid, "old", "CDS", 400 + len(prom),
+                 400 + len(prom) + len(old), 1),
+                (did, "payload", "CDS", at, at + len(flipped), -1)):
+            conn.execute(
+                """INSERT INTO annotation(plasmid_id, name, feature_type,
+                        start, end, strand) VALUES (?,?,?,?,?,?)""",
+                (pid, name, ftype, start, end, strand))
+        for name, seq in (("prom", prom), ("payload", payload)):
+            ck = hashlib.sha256(seq.encode()).hexdigest()
+            part = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                ("promoter" if name == "prom" else "CDS", name, seq, ck,
+                 len(seq))).lastrowid
+            host, lo = ((rid, 400) if name == "prom" else (did, at))
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,?)""",
+                (part, host, lo, lo + len(seq), 1 if name == "prom" else -1))
+        conn.commit()
+        return conn, rid, did, payload
+
+    def test_the_amplification_frame_flips_a_minus_strand_part(self):
+        from genesis.planner import _amplification_frame
+        from genesis.seqtools import slice_region
+        template = rand_seq(300, 71) + orf(100, 72) + rand_seq(300, 73)
+        want = _rc(template[300:300 + len(orf(100, 72))])
+        tpl, lo, hi = _amplification_frame(
+            template, 300, 300 + len(orf(100, 72)), -1, wanted=want)
+        self.assertEqual(slice_region(tpl, lo, hi), want,
+                         "a minus-strand part must be amplified in the "
+                         "orientation the construct reads")
+
+    def test_an_inverted_insert_fails_the_simulation(self):
+        """The check that was missing: present on either strand is not
+        the same question as present the right way round."""
+        from genesis.simulate import _check_orientation, SimulationResult
+        body = orf(300, 81)
+        designed = rand_seq(200, 82) + body + rand_seq(200, 83)
+        built = rand_seq(200, 82) + _rc(body) + rand_seq(200, 83)
+        plan = {"construct": {"sequence": designed, "circular": True},
+                "modules": [{"part_name": "payload", "seq": body}]}
+        ok = SimulationResult()
+        _check_orientation(ok, designed, plan)
+        self.assertTrue(ok.passed, ok.problems)
+
+        bad = SimulationResult()
+        _check_orientation(bad, built, plan)
+        self.assertFalse(bad.passed)
+        self.assertFalse(bad.identical)
+        self.assertTrue(any("reversed" in p for p in bad.problems),
+                        bad.problems)
+
+    def test_a_part_the_design_itself_inverts_is_not_flagged(self):
+        """A Cre-lox payload is meant to sit backwards. The design says
+        so, and the check compares against the design rather than
+        against an assumption."""
+        from genesis.simulate import _check_orientation, SimulationResult
+        body = orf(300, 84)
+        designed = rand_seq(200, 85) + _rc(body) + rand_seq(200, 86)
+        plan = {"construct": {"sequence": designed, "circular": True},
+                "modules": [{"part_name": "payload", "seq": body}]}
+        result = SimulationResult()
+        _check_orientation(result, designed, plan)
+        self.assertTrue(result.passed, result.problems)
+
+    def test_the_hybrid_swap_builds_it_forwards(self):
+        """End to end, on a donor that stores the payload inverted."""
+        from genesis.seqtools import revcomp
+        conn, rid, did, payload = self._db()
+        plan = design(conn, ConstructSpec(
+            "flip test", backbone_plasmid_id=rid,
+            modules=[Module("promoter", "prom"), Module("CDS", "payload")]),
+            Config())
+        seen = 0
+        for route in plan["routes"]:
+            sim = route.get("simulation") or {}
+            if not sim.get("simulated") or not route.get("feasible"):
+                continue
+            seen += 1
+            self.assertFalse(
+                any("reversed" in p for p in sim.get("problems") or []),
+                f"{route['id']} builds the payload backwards")
+        self.assertTrue(seen, "no route was simulated, so nothing was tested")
+        # the design itself must read the payload forward
+        built = plan["construct"]["sequence"].upper()
+        doubled = (built + built)
+        self.assertIn(payload[:60].upper(), doubled)
+        self.assertNotIn(revcomp(payload)[:60].upper(), doubled)
+        conn.close()
+
+
 class TestTheProtocolNamesWhatTheLabBuys(unittest.TestCase):
     """A generic recipe is right for every kit and exact for none.
 

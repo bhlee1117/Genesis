@@ -938,6 +938,65 @@ def _simulate_digest_ligation(route: dict, templates: dict,
     return joined, notes
 
 
+#: Enough of a part to find it unambiguously, and short enough that a
+#: trimmed boundary does not stop it matching.
+_ORIENT_PROBE = 60
+
+
+def _check_orientation(result: SimulationResult, product: str, plan: dict,
+                       conn: sqlite3.Connection | None = None) -> None:
+    """Is each part the right way round, and not merely present?
+
+    Presence is tested on both strands, and it has to be: a Cre-lox
+    payload is stored inverted on purpose, and a part taken from a donor
+    sits on whichever strand that donor used. The cost of that tolerance
+    is that an insert assembled backwards looks exactly like one
+    assembled forwards - which is how a hybrid swap off a DIO donor
+    shipped ASAP7y reversed, with every part reported present.
+
+    The design already says which way round each part is meant to be.
+    Comparing the two answers asks the right question without having to
+    know anything about recombinases.
+    """
+    designed = (plan.get("construct") or {}).get("sequence") or ""
+    if not designed or not product:
+        return
+    design_doubled = (designed + designed).upper()
+    product_doubled = (product + product).upper()
+
+    backwards = []
+    for m in plan.get("modules") or []:
+        seq = (m.get("seq") or "").upper()
+        if not seq and conn is not None and m.get("part_id"):
+            row = conn.execute("SELECT seq FROM part WHERE id = ?",
+                               (m["part_id"],)).fetchone()
+            seq = (row["seq"] or "").upper() if row else ""
+        if len(seq) < _ORIENT_PROBE:
+            continue
+        probe = seq[:_ORIENT_PROBE]
+        rc_probe = revcomp(probe)
+
+        def orientation(hay):
+            fwd = hay.find(probe) >= 0
+            rev = hay.find(rc_probe) >= 0
+            return None if fwd == rev else ("+" if fwd else "-")
+
+        want = orientation(design_doubled)
+        got = orientation(product_doubled)
+        if want is not None and got is not None and want != got:
+            backwards.append(m.get("part_name") or m.get("name") or "a part")
+
+    if backwards:
+        result.passed = False
+        result.identical = False
+        result.problems.append(
+            f"{', '.join(backwards)} ends up reversed in the product: the "
+            f"design reads it one way and the steps build it the other. A "
+            f"part taken out of a Cre-lox donor is stored inverted, and the "
+            f"amplicon has to be designed in the orientation the construct "
+            f"reads, not the one the donor stores")
+
+
 def _check_contents(result: SimulationResult, product: str, plan: dict,
                     conn: sqlite3.Connection | None = None,
                     templates: dict | None = None) -> None:
@@ -969,6 +1028,8 @@ def _check_contents(result: SimulationResult, product: str, plan: dict,
             f"product; {'they are' if len(missing) > 1 else 'it is'} in the "
             f"design but no step supplies "
             f"{'them' if len(missing) > 1 else 'it'}")
+
+    _check_orientation(result, product, plan, conn)
 
     # A length difference is worth saying out loud, but it is not the same
     # failure as a missing part: a swap keeps the recipient's own copies of

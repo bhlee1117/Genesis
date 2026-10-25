@@ -36,6 +36,18 @@ class Enzyme:
     cpg_sensitive: bool = False
     star_activity: bool = False
     buffer: str = "rCutSmart"
+    #: Incubation temperature. 37 C for almost everything; the few that
+    #: differ are what makes a double digest need two stages rather than
+    #: one tube at one temperature, which is the thing a protocol has to
+    #: say out loud. Checked against the NEB product pages 2026-10-25;
+    #: NEB has moved several of these (ApaI and SmaI both went to 37 C
+    #: in 2022), so the figure is printed with a link rather than
+    #: asserted on its own.
+    incubate_c: int = 37
+    #: What stops the reaction, as NEB lists it, or "" for none.
+    heat_kill: str = "65 C, 20 min"
+    #: Time-Saver qualified: cuts in 5-15 min, and tolerates overnight.
+    time_saver: bool = True
     notes: str = ""
 
     @property
@@ -91,26 +103,26 @@ CATALOG: dict[str, Enzyme] = {e.name: e for e in [
     _e("BsiWI", "CGTACG", 1, 5),
     _e("XmaI", "CCCGGG", 1, 5),
     _e("AscI", "GGCGCGCC", 2, 6, cpg_sensitive=True),
-    _e("NotI", "GCGGCCGC", 2, 6, cpg_sensitive=True),
+    _e("NotI", "GCGGCCGC", 2, 6, heat_kill="80 C, 20 min", cpg_sensitive=True),
     _e("ClaI", "ATCGAT", 2, 4, dam_sensitive=True),
     _e("NdeI", "CATATG", 2, 4),
-    _e("BstBI", "TTCGAA", 2, 4),
+    _e("BstBI", "TTCGAA", 2, 4, incubate_c=65, heat_kill="80 C, 20 min"),
     _e("FseI", "GGCCGGCC", 6, 2),
     # --- 3' overhang ---------------------------------------------------
     _e("KpnI", "GGTACC", 5, 1),
     _e("SacI", "GAGCTC", 5, 1),
     _e("PstI", "CTGCAG", 5, 1),
-    _e("ApaI", "GGGCCC", 5, 1),
+    _e("ApaI", "GGGCCC", 5, 1, incubate_c=37, heat_kill="65 C, 20 min", notes="half-life at 37 C is 30 min, so do not over-digest"),
     _e("SphI", "GCATGC", 5, 1),
     _e("AatII", "GACGTC", 5, 1),
     _e("NsiI", "ATGCAT", 5, 1),
     _e("SbfI", "CCTGCAGG", 6, 2),
-    _e("PacI", "TTAATTAA", 5, 3),
+    _e("PacI", "TTAATTAA", 5, 3, heat_kill="65 C, 20 min"),
     _e("SacII", "CCGCGG", 4, 2, cpg_sensitive=True),
     _e("PvuI", "CGATCG", 4, 2),
     # --- blunt ---------------------------------------------------------
     _e("EcoRV", "GATATC", 3, 3),
-    _e("SmaI", "CCCGGG", 3, 3),
+    _e("SmaI", "CCCGGG", 3, 3, incubate_c=37, heat_kill="65 C, 20 min", notes="25 C for digests over 1 h; NEB moved it to 37 C in 2022"),
     _e("HpaI", "GTTAAC", 3, 3),
     _e("StuI", "AGGCCT", 3, 3, dcm_sensitive=True),
     _e("NruI", "TCGCGA", 3, 3),
@@ -119,13 +131,13 @@ CATALOG: dict[str, Enzyme] = {e.name: e for e in [
     _e("DraI", "TTTAAA", 3, 3),
     _e("SnaBI", "TACGTA", 3, 3),
     _e("PmeI", "GTTTAAAC", 4, 4),
-    _e("SwaI", "ATTTAAAT", 4, 4),
+    _e("SwaI", "ATTTAAAT", 4, 4, incubate_c=25, heat_kill="65 C, 20 min"),
     # --- Type IIS (cut outside the recognition site) --------------------
-    _e("BsaI", "GGTCTC", 7, 11, notes="Golden Gate; 4 nt 5' overhang"),
-    _e("BsmBI", "CGTCTC", 7, 11, notes="Golden Gate; 4 nt 5' overhang"),
-    _e("BbsI", "GAAGAC", 8, 12),
-    _e("SapI", "GCTCTTC", 8, 11),
-    _e("BspQI", "GCTCTTC", 8, 11),
+    _e("BsaI", "GGTCTC", 7, 11, heat_kill="80 C, 20 min", notes="Golden Gate; 4 nt 5' overhang"),
+    _e("BsmBI", "CGTCTC", 7, 11, incubate_c=55, heat_kill="80 C, 20 min", notes="Golden Gate; 4 nt 5' overhang"),
+    _e("BbsI", "GAAGAC", 8, 12, heat_kill="65 C, 20 min"),
+    _e("SapI", "GCTCTTC", 8, 11, heat_kill="65 C, 20 min"),
+    _e("BspQI", "GCTCTTC", 8, 11, incubate_c=50, heat_kill="80 C, 20 min"),
 ]}
 
 
@@ -295,6 +307,62 @@ def ends_compatible(a_overhang: str, a_type: str,
     if len(a_overhang) != len(b_overhang):
         return False
     return a_overhang.upper() == revcomp(b_overhang).upper()
+
+
+def digest_plan(names: list) -> dict:
+    """Whether these enzymes can share one tube, and what to do if not.
+
+    A double digest is usually one reaction at 37 C, and a protocol that
+    always says so is wrong the moment the pair does not share a
+    temperature: BsmBI wants 55 C, BspQI 50 C, BstBI 65 C. NEB's rule is
+    to run the cooler enzyme first, stop it, then add the second and
+    raise the block - and if the first enzyme has no heat kill, to
+    column purify in between instead.
+    """
+    enzymes = [CATALOG[n] for n in names if n in CATALOG]
+    if not enzymes:
+        return {"sequential": False, "stages": [], "warnings": []}
+
+    temps = sorted({e.incubate_c for e in enzymes})
+    time_saver = all(e.time_saver for e in enzymes)
+    minutes = "15 min" if time_saver else "1 h"
+
+    if len(temps) == 1:
+        return {
+            "sequential": False,
+            "stages": [{"enzymes": [e.name for e in enzymes],
+                        "temperature": temps[0], "minutes": minutes,
+                        "heat_kill": _shared_kill(enzymes)}],
+            "warnings": [],
+        }
+
+    stages, warnings = [], []
+    for temp in temps:
+        here = [e for e in enzymes if e.incubate_c == temp]
+        stages.append({"enzymes": [e.name for e in here], "temperature": temp,
+                       "minutes": "15 min" if all(e.time_saver for e in here)
+                                  else "1 h",
+                       "heat_kill": _shared_kill(here)})
+    warnings.append(
+        "these enzymes do not share an incubation temperature ("
+        + ", ".join(f"{e.name} at {e.incubate_c} C" for e in enzymes)
+        + "), so the digest runs in two stages - the cooler enzyme "
+          "first, stopped, then the second with the block raised")
+    first = stages[0]
+    if not first["heat_kill"]:
+        warnings.append(
+            f"{', '.join(first['enzymes'])} cannot be heat inactivated, so "
+            f"column purify between the two stages instead of raising the "
+            f"block on the same tube")
+    return {"sequential": True, "stages": stages, "warnings": warnings}
+
+
+def _shared_kill(enzymes: list) -> str:
+    """The heat step that stops all of them, when there is one."""
+    kills = {e.heat_kill for e in enzymes}
+    if "" in kills or not kills:
+        return ""
+    return max(kills) if len(kills) > 1 else kills.pop()
 
 
 def dam_sites(seq: str, circular: bool = False) -> int:

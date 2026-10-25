@@ -1,6 +1,6 @@
 """A small PDF writer, so protocol export needs no third-party package.
 
-Only the base-14 PDF fonts are used (Helvetica, Helvetica-Bold, Courier),
+Only the base-14 PDF fonts are used (Helvetica, Courier, Times),
 which every reader provides, so nothing has to be embedded. The widths
 tables below are the standard AFM metrics; they are what makes line
 wrapping and column alignment come out right rather than ragged.
@@ -37,11 +37,45 @@ _HELV_BOLD = [
     500, 389, 280, 389, 584,
 ]
 
+_TIMES = [
+    250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250,
+    278, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564,
+    564, 444, 921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611,
+    889, 722, 722, 556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333,
+    278, 333, 469, 500, 333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278,
+    500, 278, 778, 500, 500, 500, 500, 333, 389, 278, 500, 500, 722, 500, 500,
+    444, 480, 200, 480, 541,
+]
+_TIMES_BOLD = [
+    250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250,
+    278, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570,
+    570, 500, 930, 722, 667, 722, 722, 667, 611, 778, 778, 389, 500, 778, 667,
+    944, 722, 778, 611, 778, 722, 556, 667, 722, 722, 1000, 722, 722, 667, 333,
+    278, 333, 581, 500, 333, 500, 556, 444, 556, 444, 333, 500, 556, 278, 333,
+    556, 278, 833, 556, 500, 556, 556, 444, 389, 333, 556, 500, 722, 500, 500,
+    444, 394, 220, 394, 520,
+]
+_TIMES_ITALIC = [
+    250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250,
+    278, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675,
+    675, 500, 920, 611, 611, 667, 722, 611, 611, 722, 722, 333, 444, 667, 556,
+    833, 667, 722, 611, 722, 611, 500, 556, 722, 611, 833, 611, 556, 556, 389,
+    278, 389, 422, 500, 333, 500, 500, 444, 500, 444, 278, 500, 500, 278, 278,
+    444, 278, 722, 500, 500, 500, 500, 389, 389, 278, 500, 444, 667, 444, 444,
+    389, 400, 275, 400, 541,
+]
+
 FONTS = {
     "F1": ("Helvetica", _HELV),
     "F2": ("Helvetica-Bold", _HELV_BOLD),
     "F3": ("Courier", None),          # monospace: every glyph is 600
     "F4": ("Courier-Bold", None),
+    # A vendor protocol is quoted material in a document otherwise set in
+    # a UI face, and setting it in a serif marks it as such - as well as
+    # fitting more of a reagent name on a line than Courier can.
+    "F5": ("Times-Roman", _TIMES),
+    "F6": ("Times-Bold", _TIMES_BOLD),
+    "F7": ("Times-Italic", _TIMES_ITALIC),
 }
 
 
@@ -131,6 +165,8 @@ def _escape(s: str) -> bytes:
 @dataclass
 class _Page:
     ops: list = field(default_factory=list)
+    #: (x0, y0, x1, y1, uri) rectangles that open a URL when clicked.
+    links: list = field(default_factory=list)
 
 
 class PDF:
@@ -227,6 +263,56 @@ class PDF:
         if rgb:
             ops.append("Q")
 
+    def link(self, label: str, uri: str, size: float = 8,
+             indent: float = 0, font: str = "F1"):
+        """A line of text that opens a URL.
+
+        A protocol that cites a vendor page should be able to go there:
+        printing the address and leaving the reader to type it is the
+        kind of friction that stops anybody checking the source.
+        """
+        lead = size * 1.32
+        self._ensure(lead)
+        self.y -= lead
+        x = self.ml + indent
+        self._draw(label, x, self.y, font, size, gray=None)
+        w = text_width(label, font, size)
+        self.pages[-1].ops.append(
+            f"q 0.12 0.35 0.65 RG 0.5 w {x:.2f} {self.y - 1.5:.2f} m "
+            f"{x + w:.2f} {self.y - 1.5:.2f} l S Q")
+        self.pages[-1].links.append(
+            (x, self.y - 3, x + w, self.y + size * 0.78, uri))
+        self.y -= 2
+
+    def boxed(self, draw, pad: float = 7, rgb=(0.80, 0.82, 0.85),
+              fill=None):
+        """Run `draw` and put a rule around whatever it printed.
+
+        The border has to go underneath the text, and content operators
+        are appended in order, so the rectangle is spliced in at the
+        position the block started from rather than drawn after it.
+        """
+        self.y -= pad
+        page = self.pages[-1]
+        at = len(page.ops)
+        top = self.y
+        draw()
+        if self.pages[-1] is not page:
+            # the block paginated; a box around half of it would be a lie
+            self.y -= pad
+            return
+        self.y -= pad
+        h = top - self.y
+        x0, x1 = self.ml - pad + 2, self.width - self.mr + pad - 2
+        box = []
+        if fill:
+            box.append(f"q {fill[0]:.3f} {fill[1]:.3f} {fill[2]:.3f} rg "
+                       f"{x0:.2f} {self.y:.2f} {x1 - x0:.2f} {h:.2f} re f Q")
+        box.append(f"q {rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} RG 0.7 w "
+                   f"{x0:.2f} {self.y:.2f} {x1 - x0:.2f} {h:.2f} re S Q")
+        page.ops[at:at] = box
+        self.y -= 4
+
     def spacer(self, h: float = 8):
         self._ensure(h)
         self.y -= h
@@ -251,27 +337,37 @@ class PDF:
             self.y -= 3
 
     def paragraph(self, text: str, size: float = 9.5, gray: float | None = None,
-                  font: str = "F1", indent: float = 0, lead_factor: float = 1.32):
+                  font: str = "F1", indent: float = 0,
+                  lead_factor: float = 1.32, rgb=None):
         lead = size * lead_factor
         for line in wrap(text, font, size, self.content_width - indent):
             self._ensure(lead)
             self.y -= lead
-            self._draw(line, self.ml + indent, self.y, font, size, gray)
+            self._mark(line, self.ml + indent, self.y, font, size, gray, rgb)
         self.y -= 2
 
     def bullet(self, text: str, size: float = 9.5, marker: str = "•",
-               indent: float = 12, gray: float | None = None):
+               indent: float = 12, gray: float | None = None,
+               font: str = "F1", rgb=None):
         lead = size * 1.32
         body = self.content_width - indent - 10
-        lines = wrap(text, "F1", size, body)
+        lines = wrap(text, font, size, body)
         for i, line in enumerate(lines):
             self._ensure(lead)
             self.y -= lead
             if i == 0:
-                self._draw("-" if marker == "•" else marker,
-                           self.ml + indent, self.y, "F1", size, gray)
-            self._draw(line, self.ml + indent + 10, self.y, "F1", size, gray)
+                self._mark("-" if marker == "•" else marker,
+                           self.ml + indent, self.y, font, size, gray, rgb)
+            self._mark(line, self.ml + indent + 10, self.y, font, size,
+                       gray, rgb)
         self.y -= 1
+
+    def _mark(self, s, x, y, font, size, gray, rgb):
+        """Draw in a colour when one is given, else in grey."""
+        if rgb is None:
+            self._draw(s, x, y, font, size, gray)
+        else:
+            self.text_at(s, x, y, font, size, rgb=rgb)
 
     def mono(self, text: str, size: float = 8.2, indent: float = 12,
              gray: float | None = None):
@@ -417,10 +513,22 @@ class PDF:
                 stream = raw
                 meta = f"<< /Length {len(stream)} >>"
             content_id = add(meta.encode() + b"\nstream\n" + stream + b"\nendstream")
+            annots = ""
+            if page.links:
+                ids = []
+                for x0, y0, x1, y1, uri in page.links:
+                    ids.append(add(
+                        f"<< /Type /Annot /Subtype /Link "
+                        f"/Rect [{x0:.2f} {y0:.2f} {x1:.2f} {y1:.2f}] "
+                        f"/Border [0 0 0] /A << /S /URI /URI ("
+                        .encode("latin-1") + _escape(uri) + b") >> >>"))
+                annots = ("/Annots [" +
+                          " ".join(f"{i} 0 R" for i in ids) + "] ")
             page_ids.append(add(
                 f"<< /Type /Page /Parent {pages_obj} 0 R "
                 f"/MediaBox [0 0 {self.width:.2f} {self.height:.2f}] "
-                f"/Resources {resources} /Contents {content_id} 0 R >>".encode()))
+                f"/Resources {resources} {annots}"
+                f"/Contents {content_id} 0 R >>".encode()))
 
         kids = " ".join(f"{pid} 0 R" for pid in page_ids)
         objects[pages_obj - 1] = (
@@ -467,6 +575,8 @@ FEATURE_COLOURS = {
     "resistance": (0.50, 0.52, 0.55),
 }
 CUT_RED = (0.80, 0.14, 0.14)
+#: For the one or two lines in a protocol that cost a week when missed.
+WARN_RED = (0.72, 0.10, 0.10)
 TAKE_GREEN = (0.13, 0.55, 0.25)
 
 #: Colours for translation landmarks drawn above a track.

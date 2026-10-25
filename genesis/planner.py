@@ -1714,10 +1714,25 @@ def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
     upstream = slice_region(rec_seq, max(cut_lo - 60, 0), cut_lo, circular=rec_circ)
     downstream = slice_region(rec_seq, cut_hi, cut_hi + 60, circular=rec_circ)
 
+    # Amplify in the orientation the construct reads, not the one the
+    # donor happens to store. A Cre-lox donor keeps its payload
+    # inverted - that is what DIO is - so taking ASAP7y off a DIO
+    # plasmid with the raw coordinates gives an amplicon that is the
+    # reverse complement of what the design wants, and HiFi puts it in
+    # backwards. The all-PCR swap has always gone through
+    # _amplification_frame for this; this route was passing the donor
+    # sequence straight in.
+    ins_tpl, ins_start, ins_end = _amplification_frame(
+        don["seq"], analysis.insert.start, analysis.insert.end,
+        analysis.insert.strand, wanted=insert_seq,
+        circular=bool(don["circular"]))
     fwd, rev = design_gibson_pair(
-        0, analysis.insert.label or "insert", don["seq"],
-        analysis.insert.start, analysis.insert.end, upstream, downstream,
+        0, analysis.insert.label or "insert", ins_tpl,
+        ins_start, ins_end, upstream, downstream,
         cfg, circular_template=bool(don["circular"]))
+    for pr in (fwd, rev):
+        pr.target_start, pr.target_end = (analysis.insert.start,
+                                          analysis.insert.end)
     steps.append(Step(
         0, "PCR",
         f"Amplify {analysis.insert.label} ({len(insert_seq):,} bp) from "

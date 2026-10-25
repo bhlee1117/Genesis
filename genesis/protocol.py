@@ -365,11 +365,32 @@ def build_protocol(plan: dict, cfg: Config | None = None,
             recipe = {"title": product.title,
                       "items": [(item, amount)
                                 for amount, item in product.setup]}
+        # A double digest is one tube at 37 C until the pair does not
+        # share a temperature, and then it is two stages. Which it is
+        # depends on the enzymes this route chose, not on the operation.
+        digest_stages, red = [], []
+        if op == "RE_DIGEST":
+            from .enzymes import digest_plan
+            from .figure import step_enzymes
+            # Routes put the pair in details on some steps and in the
+            # inputs on others; figure.step_enzymes already knows both.
+            names = step_enzymes(step) or route_enzyme_names(route)
+            plan_d = digest_plan(list(names))
+            for i, stage in enumerate(plan_d["stages"], start=1):
+                label = (f"stage {i}: {' + '.join(stage['enzymes'])}"
+                         if plan_d["sequential"]
+                         else " + ".join(stage["enzymes"]))
+                digest_stages.append(
+                    (label, f"{stage['temperature']} C, {stage['minutes']}"))
+                if stage["heat_kill"]:
+                    digest_stages.append(("stop", stage["heat_kill"]))
+            red = list(plan_d["warnings"])
         steps.append({
             "index": step["index"], "operation": op,
             "description": step["description"], "detail": detail,
             "recipe": recipe, "notes": step.get("notes", ""),
-            "product": product,
+            "product": product, "digest_stages": digest_stages,
+            "red_notes": red,
         })
 
     return {
@@ -451,6 +472,60 @@ def _primer_marks(route: dict, template_name: str) -> list[dict]:
         marks.append({"name": pr.get("name", ""), "start": lo, "end": hi,
                       "strand": strand})
     return marks
+
+
+#: Phrases that cost a week of cloning when they are skimmed past.
+_RED = ("not 37 C", "do not heat inactivate", "Do not heat inactivate",
+        "not to substitute SOC", "two stages", "column purify between",
+        "star activity", "exactly 30 s", "cannot be heat inactivated")
+
+
+def route_enzyme_names(route: dict) -> list:
+    """Every enzyme the route mentions, for a step that names none."""
+    from .figure import route_enzymes
+    return route_enzymes(route)
+
+
+def _vendor_box(doc, recipe: dict, product, step: dict) -> None:
+    """One kit's own setup, ruled off and set in a serif.
+
+    Reagent names in a monospace column had to be squeezed to fit; a
+    serif at the same point size fits them and reads as what it is - a
+    quotation of somebody else's protocol inside a document otherwise
+    set in the interface's own face.
+    """
+    from .pdf import WARN_RED
+
+    def body():
+        doc.paragraph(recipe["title"], 9, font="F6", indent=4)
+        if product is not None:
+            doc.paragraph(product.label, 8, font="F7", indent=4, gray=0.4)
+        width = max((len(a) for a, _ in
+                     [(x[1], x[0]) for x in recipe["items"]]), default=0)
+        for item, amount in recipe["items"]:
+            doc.paragraph(f"{amount}   {item}", 8.8, indent=14, font="F5",
+                          gray=0.1)
+        stages = (step.get("digest_stages") or
+                  (list(product.program) if product is not None else []))
+        if stages:
+            doc.spacer(2)
+            for stage, condition in stages:
+                doc.paragraph(f"{stage}   {condition}", 8.8, indent=14,
+                              font="F5", gray=0.1)
+        notes = list(step.get("red_notes") or ())
+        rest = [n for n in (product.notes if product is not None else ())]
+        for note in notes:
+            doc.bullet(note, 8.4, indent=10, marker="!", font="F5",
+                       rgb=WARN_RED)
+        for note in rest:
+            red = any(k in note for k in _RED)
+            doc.bullet(note, 8.4, indent=10, font="F5",
+                       rgb=WARN_RED if red else None,
+                       gray=None if red else 0.35)
+        if product is not None and product.url:
+            doc.link(product.url, product.url, 7.6, indent=4, font="F7")
+
+    doc.boxed(body, pad=7, fill=(0.985, 0.985, 0.99))
 
 
 def _kit_protocols(doc, steps: list) -> None:
@@ -627,64 +702,13 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                 "simulated, so the product shown is the design rather "
                 "than a checked molecule.", 8.2, gray=0.45)
 
-    # --- 4. the scheme ----------------------------------------------
-    scheme = route.get("scheme") or {}
-    if scheme.get("recipient"):
-        doc.heading("Cloning scheme", 2)
-        doc.paragraph("Two parent plasmids. Cut the marked region out of the "
-                      "recipient, take the marked region from the donor, and "
-                      "join them.", 8.8, gray=0.4)
-
-        rec = scheme["recipient"]
-        if rec.get("circular"):
-            circular_map(doc, "RECIPIENT  " + rec["name"],
-                         f"{rec['length']:,} bp, {rec['owner']}",
-                         rec["length"], rec["features"],
-                         highlight=rec.get("highlight"), highlight_kind="cut",
-                         primer_marks=_primer_marks(route, rec["name"]))
-        else:
-            plasmid_track(
-                doc, "RECIPIENT  " + rec["name"],
-                f"{rec['length']:,} bp, {rec['owner']} - cut here, keep the rest",
-                rec["length"], rec["features"], rec.get("highlight"), "cut")
-
-        don = scheme.get("donor")
-        if don:
-            if don.get("circular"):
-                circular_map(doc, "DONOR  " + don["name"],
-                             f"{don['length']:,} bp, {don['owner']}",
-                             don["length"], don["features"],
-                             highlight=don.get("highlight"),
-                             highlight_kind="take",
-                             primer_marks=_primer_marks(route, don["name"]))
-            else:
-                plasmid_track(
-                    doc, "DONOR  " + don["name"],
-                    f"{don['length']:,} bp, {don['owner']} - take the marked region",
-                    don["length"], don["features"], don.get("highlight"), "take")
-
-        options = scheme.get("donor_options") or []
-        if len(options) > 1:
-            doc.paragraph(
-                "Other plasmids carrying this part: " + ", ".join(
-                    f"{o['name']} ({o['length']:,} bp)" for o in options[1:5]
-                ) + ". Which to use is a lab preference; pin one with "
-                    "backbone_plasmid_id or by naming it.", 8.2, gray=0.4)
-
-        anchors = []
-        if scheme.get("left_anchor"):
-            anchors.append(f"{scheme['left_anchor']['name']} (ends at "
-                           f"{scheme['left_anchor']['end']:,})")
-        if scheme.get("right_anchor"):
-            anchors.append(f"{scheme['right_anchor']['name']} (starts at "
-                           f"{scheme['right_anchor']['start']:,})")
-        if anchors:
-            verb = "which is kept and is" if len(anchors) == 1 else \
-                   "which are kept and are"
-            doc.paragraph("The cut is bounded by " + " and ".join(anchors) +
-                          f", {verb} what the primers anneal to or the "
-                          f"enzymes cut between.", 8.6, gray=0.35)
-        doc.spacer(4)
+    # The "Cloning scheme" drawing used to sit here: two parent maps
+    # with the swapped regions marked. "How this route builds it" above
+    # draws the same parents and more besides - which piece, by what
+    # reaction, joined where - and the old one was built for the swap
+    # routes only, so on a restriction route it still marked primers
+    # that route never designs. Two figures of one thing, one of them
+    # stale.
 
     # --- 5. reagents ------------------------------------------------
     doc.heading("Reagents and consumables", 2)
@@ -730,20 +754,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                                             "GIBSON_ASSEMBLY", "LIGATION",
                                             "RE_DIGEST", "DPNI_DIGEST",
                                             "TRANSFORMATION"):
-            doc.paragraph(recipe["title"], 8.4, font="F2", indent=22)
-            if product is not None:
-                doc.paragraph(product.label, 7.6, indent=22, gray=0.45)
-            for item, amount in recipe["items"]:
-                doc.paragraph(f"{amount:<22} {item}", 8.2, indent=30,
-                              font="F3", gray=0.2)
-            if product is not None and product.program:
-                doc.spacer(2)
-                for stage, condition in product.program:
-                    doc.paragraph(f"{stage:<22} {condition}", 8.2, indent=30,
-                                  font="F3", gray=0.2)
-            for note in (product.notes if product is not None else ()):
-                doc.bullet(note, 8.0, indent=24, gray=0.4)
-            doc.spacer(2)
+            _vendor_box(doc, recipe, product, step)
 
     _kit_protocols(doc, p["steps"])
 
