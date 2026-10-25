@@ -1981,8 +1981,8 @@ function renderSpecPreview() {
   }));
   host.appendChild(h('p', { class: 'muted small' },
     'A sketch from the modules as typed: typical lengths for each kind of ' +
-    'element, and the vector parts a backbone would bring. Scan the source ' +
-    'to replace it with real parts.'));
+    'element, and the vector parts a backbone would bring. Moving on to ' +
+    'Scan source replaces it with real parts.'));
 }
 
 function renderModules(focusIndex, focusWhat) {
@@ -2359,15 +2359,16 @@ var STEPS = [
     hint: 'what to build' },
   { id: 'target',  n: 2, label: 'Target construct',
     hint: 'the molecule asked for' },
+  /* Scanning the source and reading the parents it turned up are one
+     act, not two: the candidates ARE the result of the scan, and
+     splitting them meant clicking across to see what the click did. */
   { id: 'scan',    n: 3, label: 'Scan source',
     hint: 'what the inventory has' },
-  { id: 'parents', n: 4, label: 'Candidate parents',
-    hint: 'what to start from' },
-  { id: 'select',  n: 5, label: 'Select',
+  { id: 'select',  n: 4, label: 'Select',
     hint: 'the choices in force' },
-  { id: 'routes',  n: 6, label: 'Routes',
+  { id: 'routes',  n: 5, label: 'Routes',
     hint: 'how to build it' },
-  { id: 'scheme',  n: 7, label: 'Cloning scheme',
+  { id: 'scheme',  n: 6, label: 'Cloning scheme',
     hint: 'the plan at the bench' }
 ];
 
@@ -2403,6 +2404,8 @@ function paintSteps() {
      rail cluttered with places you cannot go; the sequence is clearer
      when it only contains what exists. */
   var live = STEPS.filter(function (st) { return !!stepState.ready[st.id]; });
+  /* Numbered by where they are in the rail, not by their place in the
+     full sequence: hiding the empty ones left it reading 1, 3, 4, 5. */
   live.forEach(function (st, i) {
     var active = stepState.current === st.id;
     var btn = h('button', {
@@ -2412,7 +2415,7 @@ function paintSteps() {
       title: st.hint,
       onclick: function () { showStep(st.id); }
     },
-      h('span', { class: 'step-n' }, String(st.n)),
+      h('span', { class: 'step-n' }, String(i + 1)),
       h('span', { class: 'step-label' }, st.label),
       h('span', { class: 'step-hint' }, st.hint));
     nav.appendChild(btn);
@@ -2473,10 +2476,7 @@ function renderScan() {
       { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
     ], scan.modules));
   }
-  fillStep('scan', card);
-
-  var cands = renderCandidates(scan);
-  fillStep('parents', cands);
+  fillStep('scan', [card, renderCandidates(scan)]);
   fillStep('select', selectionSummary(scan));
   showStep('scan');
 }
@@ -2919,9 +2919,8 @@ function renderPlan() {
   fillStep('target', [summary, renderConstruct(c),
                       plan.vector ? renderVector(plan.vector, plan) : null]);
 
-  /* --- 3 and 4. where the parts would come from -------------------- */
-  fillStep('scan', scanRecap(plan));
-  fillStep('parents', renderCandidates(plan));
+  /* --- 3. where the parts come from, and what to start from -------- */
+  fillStep('scan', [scanRecap(plan), renderCandidates(plan)]);
   fillStep('select', selectionSummary(plan));
 
   /* --- 6. how to build it ------------------------------------------ */
