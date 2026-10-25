@@ -2526,6 +2526,27 @@ function selectionSummary(data) {
         h('span', { class: 'pill pill-ok' }, 'pinned')));
     });
   }
+
+  /* Having chosen the parents, the next thing to choose is how to build
+     with them. Without this the step was a dead end: the only way on was
+     back to the specification for a button at the bottom of it. */
+  var haveRoutes = !!(state.plan && (state.plan.routes || []).length);
+  card.appendChild(h('div', { class: 'card-foot' },
+    haveRoutes
+      ? h('button', {
+          type: 'button', class: 'primary',
+          onclick: function () { showStep('routes'); }
+        }, 'Move on to Routes \u2192')
+      : h('button', {
+          type: 'button', class: 'primary',
+          title: 'Design with these parents and rank the ways to build it',
+          onclick: function () { generatePlan(); }
+        }, 'Generate routes with these parents \u2192'),
+    h('span', { class: 'muted small' },
+      haveRoutes
+        ? 'Routes are ranked best first; pick one to see its protocol.'
+        : 'Nothing is designed yet \u2014 this runs the planner and ranks '
+          + 'the ways to build it.')));
   return card;
 }
 
@@ -3808,7 +3829,8 @@ function renderRoutes(routes) {
   var card = h('div', { class: 'card' },
     h('div', { class: 'card-head' },
       h('h2', null, 'Routes'),
-      h('span', { class: 'muted small' }, 'ranked best first')));
+      h('span', { class: 'muted small' },
+        'ranked best first \u2014 click one to choose it')));
 
   if (!routes.length) {
     card.appendChild(h('p', { class: 'muted' }, 'No routes were generated.'));
