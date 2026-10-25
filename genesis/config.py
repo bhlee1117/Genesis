@@ -115,6 +115,9 @@ class Config:
     #: `overlap_tm_min` is taken, because every base of overlap is a base of
     #: oligo somebody pays for and synthesises with some error rate.
     overlap_length: int = 25
+    #: A floor under whatever the kit itself asks for, not a replacement
+    #: for it: homology_range() already holds NEBuilder HiFi at 15-25 and
+    #: Gibson at 20-40, which is what each supplier specifies.
     overlap_min_length: int = 15
     overlap_tm_min: float = 48.0
     primer_conc_nm: float = 500.0

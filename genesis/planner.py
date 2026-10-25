@@ -426,6 +426,18 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             route.warnings.append(
                 f"{frag.name} amplicon is {len(frag.seq)} bp, above the "
                 f"{cfg.max_pcr_length} bp limit set in the configuration")
+        # Addgene's reference: "Anything shorter than 200 base pairs has
+        # the potential to be completely degraded by the 5' exonuclease."
+        # Genesis would rather carry a short piece on a primer tail than
+        # put it in the tube, but when it does end up as its own fragment
+        # of a Gibson-style assembly, that is worth saying.
+        if (cfg.min_pcr_length <= len(frag.seq) < GIBSON_EXONUCLEASE_FLOOR
+                and kit in ("HI_FI_ASSEMBLY", "GIBSON_ASSEMBLY")):
+            route.warnings.append(
+                f"{frag.name} is {len(frag.seq)} bp; a fragment under "
+                f"{GIBSON_EXONUCLEASE_FLOOR} bp can be chewed away entirely "
+                f"by the exonuclease in an isothermal assembly - carry it on "
+                f"a neighbouring primer tail, or order it as annealed oligos")
         if len(frag.seq) < cfg.min_pcr_length:
             # Short elements are cheaper and more reliable to carry on the
             # neighbouring primer's tail, or to order as annealed oligos,
@@ -1076,6 +1088,12 @@ def _merge_contiguous(ordered: list[dict], template_length: int
             changed = True
             break
     return pieces, absorbed
+
+
+#: Below this an isothermal assembly can digest a fragment completely:
+#: the 5' exonuclease chews both ends, and a short piece has no middle
+#: left. Addgene's cloning reference gives 200 bp.
+GIBSON_EXONUCLEASE_FLOOR = 200
 
 
 def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
