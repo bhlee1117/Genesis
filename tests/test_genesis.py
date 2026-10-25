@@ -5189,12 +5189,22 @@ class TestStickyEndLigationIsSimulated(unittest.TestCase):
         joined, note = ligate([vector, wrong])
         self.assertIsNone(joined, note)
 
-    def test_blunt_ends_are_not_treated_as_a_join(self):
+    def test_blunt_ends_ligate_but_fix_no_orientation(self):
+        """Blunt ligation is routine; refusing it made ordinary plans
+        - a HindIII/EcoRV cloning, say - look impossible."""
         from genesis.simulate import CutFragment, ligate
         a = CutFragment("ACGT" * 40, "", "")
         b = CutFragment("TTGA" * 40, "", "")
-        joined, _ = ligate([a, b])
-        self.assertIsNone(joined)
+        joined, note = ligate([a, b])
+        self.assertIsNotNone(joined, note)
+        self.assertIn('orientation', note)
+
+    def test_a_sticky_end_does_not_ligate_to_a_blunt_one(self):
+        """What makes a one-sticky-one-blunt digest directional."""
+        from genesis.simulate import CutFragment, ligate
+        a = CutFragment("ACGT" * 40, "GATC", "GATC")
+        b = CutFragment("TTGA" * 40, "", "")
+        self.assertIsNone(ligate([a, b])[0])
 
 
 class TestProteinEndsAreLabelled(unittest.TestCase):

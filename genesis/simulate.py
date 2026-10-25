@@ -289,12 +289,18 @@ def digest(seq: str, circular: bool, enzymes: list) -> list:
 
 
 def _joins(left: CutFragment, right: CutFragment) -> bool:
-    """Whether these two ends anneal. Blunt ends never count here.
+    """Whether these two ends can be ligated together.
 
-    A blunt ligation closes on anything, which would let the simulation
-    agree with a plan that cannot actually be directional, so only
-    matching sticky ends are accepted.
+    Matching sticky ends anneal. Two blunt ends also ligate - less
+    efficiently, and without fixing which way round the piece goes in,
+    but they do, and a HindIII/EcoRV cloning is an ordinary thing to do.
+    Refusing them made every such plan look impossible.
+
+    A sticky end and a blunt one do not join, which is what makes a
+    one-sticky-one-blunt digest directional.
     """
+    if not left.right and not right.left:
+        return True                      # blunt to blunt
     return bool(left.right) and left.right == revcomp(right.left)
 
 
@@ -325,9 +331,16 @@ def ligate(pieces: list) -> tuple:
     if not _joins(chain[-1], chain[0]):
         return None, ("the ends of the ligated chain do not match each "
                       "other, so it stays linear")
-    return "".join(piece.seq for piece in chain), (
-        f"{len(chain)} piece(s) ligated on "
-        + " + ".join(sorted({p.right for p in chain if p.right})) + " ends")
+    sticky = sorted({p.right for p in chain if p.right})
+    blunt = sum(1 for p in chain if not p.right)
+    how = " + ".join(sticky) + " ends" if sticky else "blunt ends"
+    if sticky and blunt:
+        how += f", and {blunt} blunt"
+    note = f"{len(chain)} piece(s) ligated on {how}"
+    if blunt:
+        note += ("; a blunt junction does not fix which way round the piece "
+                 "goes in, so screen for orientation")
+    return "".join(piece.seq for piece in chain), note
 
 
 # --------------------------------------------------------------------------
@@ -392,6 +405,17 @@ def _templates(conn: sqlite3.Connection, plan: dict,
             entry = (row["seq"], bool(row["circular"]), row["name"], row["id"])
             out[frag["name"]] = entry
             out.setdefault(row["name"], entry)
+
+    # A swap names its insert after the module - "ASAP7y" - while the
+    # fragment list holds whatever the grouping merged it into, such as
+    # "Kozak+ASAP7y". The primer cites the first and the map only held
+    # the second, so three of six routes reported that their own primer
+    # pair pointed at a template the plan did not contain, and could not
+    # be checked at all.
+    insert = (plan.get("swap") or {}).get("insert") or {}
+    donor_entry = out.get("donor")
+    if insert.get("label") and donor_entry is not None:
+        out.setdefault(insert["label"], donor_entry)
     return out
 
 
@@ -769,7 +793,11 @@ def _simulate_digest_ligation(route: dict, templates: dict,
     homology_pieces = []
     for product in products:
         cut = digest(product.seq, False, enzymes)
-        inner = [f for f in cut if f.left and f.right]
+        # A linear molecule cut twice gives three pieces and the middle
+        # one is the insert. Testing "has an overhang at both ends" looks
+        # equivalent and is not: EcoRV is blunt, its overhang string is
+        # empty, and a HindIII/EcoRV amplicon was reported as uncut.
+        inner = cut[1:-1] if len(cut) >= 3 else []
         if not inner:
             if by_homology:
                 homology_pieces.append(product)

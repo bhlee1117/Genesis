@@ -723,6 +723,8 @@ def plan_restriction_route(conn: sqlite3.Connection, construct: AssembledConstru
 
     candidates = _find_enzyme_pairs(bb_seq, insert_seq, construct, protected, cfg,
                                     bb_circ)
+    candidates = _native_pairs_that_work(conn, candidates, fragments,
+                                         insert_seq)
     if not single_donor_contiguous:
         # Without a single contiguous donor the sites have to be added by PCR.
         candidates = [c for c in candidates if c["mode"] == "add_by_pcr"] or [
@@ -814,6 +816,61 @@ def plan_restriction_route(conn: sqlite3.Connection, construct: AssembledConstru
         route.warnings += [f"primer {p.name}: {w}" for w in p.warnings]
     route.cost_breakdown["enzymes"] = [e1, e2]
     return route
+
+
+def _native_pairs_that_work(conn: sqlite3.Connection, candidates: list,
+                            fragments: list, insert_seq: str) -> list:
+    """Drop "cut it straight out of the donor" pairs that cannot do that.
+
+    A pair qualifies by cutting the backbone once each and not cutting
+    inside the insert. Neither of those says the pair cuts the DONOR at
+    the insert's edges, and the native mode assumes it does. So a plan
+    went out saying "digest the donor with HindIII + EcoRV to release the
+    insert" when those two sites sit four bases apart in the backbone and
+    nowhere near the insert's boundaries in the donor - the digest yields
+    2,846, 4 and 4,030 bp and not one of them is the 1,290 bp the step
+    claims to gel-purify.
+
+    Rather than reason about where the sites fall, cut the donor and look
+    for the band.
+    """
+    from .simulate import digest
+
+    if not candidates or not fragments:
+        return candidates
+    source_id = getattr(fragments[0], "source_plasmid_id", None)
+    if not source_id:
+        return candidates
+    row = conn.execute("SELECT seq, circular FROM plasmid WHERE id = ?",
+                       (source_id,)).fetchone()
+    if row is None or not row["seq"]:
+        return candidates
+    donor_seq, donor_circ = row["seq"].upper(), bool(row["circular"])
+    want = len(insert_seq)
+
+    kept = []
+    for cand in candidates:
+        if cand.get("mode") != "native":
+            kept.append(cand)
+            continue
+        bands = digest(donor_seq, donor_circ, list(cand["enzymes"]))
+        # The band has to be the insert: the right size, and actually
+        # containing it rather than merely measuring the same.
+        ok = any(abs(len(b.seq) - want) <= 12
+                 and (insert_seq.upper() in b.seq
+                      or revcomp(insert_seq.upper()) in b.seq)
+                 for b in bands)
+        if ok:
+            kept.append(cand)
+        else:
+            # Still usable if the sites are added by PCR instead.
+            kept.append(dict(
+                cand, mode="add_by_pcr",
+                warnings=cand.get("warnings", []) + [
+                    f"{' + '.join(cand['enzymes'])} do not cut the donor at "
+                    f"the insert's edges, so the sites are added by PCR "
+                    f"rather than cutting it straight out"]))
+    return kept
 
 
 def _find_enzyme_pairs(bb_seq: str, insert_seq: str,

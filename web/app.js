@@ -2382,8 +2382,8 @@ var STEPS = [
     hint: 'the choices in force' },
   { id: 'routes',  n: 5, label: 'Routes',
     hint: 'how to build it' },
-  { id: 'scheme',  n: 6, label: 'Cloning scheme',
-    hint: 'the plan at the bench' }
+  { id: 'scheme',  n: 6, label: 'Protocol',
+    hint: 'what to do at the bench' }
 ];
 
 var stepState = { current: 'spec', ready: { spec: true } };
@@ -2514,7 +2514,7 @@ function nextFromRoutes() {
     h('button', {
       type: 'button', class: 'primary',
       onclick: function () { showStep('scheme'); }
-    }, 'Move on to Cloning scheme \u2192'),
+    }, 'Move on to Protocol \u2192'),
     h('span', { class: 'muted small' },
       'The numbered protocol, the primers to order and the checks.'));
 }
@@ -2887,73 +2887,6 @@ function parentPicker(role, options, chosenId) {
   return box;
 }
 
-function parentCard(role, parent, kind, options) {
-  if (!parent) {
-    if (!(options || []).length) return null;
-    var empty = h('div', { class: 'parent-card' },
-      h('div', { class: 'parent-head' },
-        h('span', { class: 'parent-role ' + role }, role.toUpperCase()),
-        h('span', { class: 'muted' }, 'none chosen')));
-    var pickEmpty = parentPicker(role, options, null);
-    if (pickEmpty) empty.appendChild(pickEmpty);
-    return empty;
-  }
-  var head = h('div', { class: 'parent-head' },
-    h('span', { class: 'parent-role ' + role }, role.toUpperCase()),
-    h('strong', null, parent.name),
-    h('span', { class: 'muted small' },
-      bp(parent.length) + (parent.owner ? ' · ' + parent.owner : '')));
-  var card = h('div', { class: 'parent-card' }, head);
-  card.appendChild(circularMap(parent.length, (parent.features || []).map(
-    function (f) {
-      return { type: f.feature_type, name: f.name, start: f.start,
-               end: f.end, strand: f.strand };
-    }), {
-      label: parent.name, highlight: parent.highlight, highlightKind: kind
-    }));
-  var picker = parentPicker(role, options, parent.id);
-  if (picker) card.appendChild(picker);
-  return card;
-}
-
-function schemeCard(plan) {
-  var scheme = plan.scheme || {};
-  if (!scheme.recipient) return null;
-
-  var card = h('div', { class: 'card scheme-card' },
-    h('div', { class: 'card-head' },
-      h('h2', null, 'Cloning scheme'),
-      h('span', { class: 'muted small' },
-        'two parents: cut a region out of the recipient, put a region from ' +
-        'the donor in its place')));
-
-  var grid = h('div', { class: 'parent-grid' });
-  var rec = parentCard('recipient', scheme.recipient, 'cut',
-                       scheme.recipient_options);
-  var don = parentCard('donor', scheme.donor, 'take', scheme.donor_options);
-  if (rec) grid.appendChild(rec);
-  if (don) grid.appendChild(don);
-  card.appendChild(grid);
-
-  var anchors = [];
-  if (scheme.left_anchor) {
-    anchors.push(scheme.left_anchor.name + ' (ends ' +
-                 bp(scheme.left_anchor.end) + ')');
-  }
-  if (scheme.right_anchor) {
-    anchors.push(scheme.right_anchor.name + ' (starts ' +
-                 bp(scheme.right_anchor.start) + ')');
-  }
-  if (anchors.length) {
-    card.appendChild(h('p', { class: 'muted small' },
-      'The cut is bounded by ' + anchors.join(' and ') +
-      (anchors.length === 1 ? ', which is kept' : ', which are kept') +
-      ' and is what the primers anneal to or the enzymes cut between.'));
-  }
-
-  return card;
-}
-
 function renderPlan() {
   resetSteps();
   var plan = state.plan;
@@ -3011,8 +2944,11 @@ function renderPlan() {
                       nextFromRoutes()]);
 
   /* --- 7. the plan at the bench, and whether it holds up ------------ */
-  fillStep('scheme', [schemeCard(plan),
-                      route ? renderRouteDetail(route) : null,
+  /* schemeCard drew the two parents and the product - which is what
+     "How this route builds it" now does on Routes, for every route
+     rather than only a swap. Two drawings of one thing, on two steps,
+     is one too many. */
+  fillStep('scheme', [route ? renderRouteDetail(route) : null,
                       renderSimulation(route, plan),
                       plan.verification
                         ? renderVerification(plan.verification) : null,
