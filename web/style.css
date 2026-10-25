@@ -201,6 +201,35 @@ label.checkbox {
 .cand-nohas .cand-has { visibility: hidden; }
 /* A note in the header row is still a note, not a column name. */
 .cand-head-note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+/* --- a construct that already exists ---------------------------------- */
+.card-alarm { border-color: var(--error-border); background: var(--error-bg); }
+.card-alarm .card-head h2 { color: var(--error-text); }
+.made-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) max-content;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+}
+.made-name { font-weight: 600; }
+
+/* --- a part's own sequence -------------------------------------------- */
+.seq-wrap { margin: 6px 0 10px; }
+.seq-block {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 4px 0 0;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text);
+  overflow-x: auto;
+  white-space: pre;
+  user-select: text;
+}
 /* The long form of the builder hint, shown only when it is asked for. */
 #builder-help { margin: 0 0 8px; }
 #builder-help p { margin: 4px 0; }

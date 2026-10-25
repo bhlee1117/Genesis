@@ -5519,6 +5519,65 @@ class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
         conn.close()
 
 
+class TestTheProtocolIsReadableAndHonest(unittest.TestCase):
+    """The protocol's own presentation, where it had gone wrong."""
+
+    def test_the_cloning_scheme_is_not_drawn_twice(self):
+        """It drew two parents with the swapped regions marked, which
+        "How this route builds it" already does and better - and on a
+        restriction route the old one still marked primers that route
+        never designs."""
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "protocol.py").read_text()
+        self.assertNotIn('doc.heading("Cloning scheme"', src)
+        self.assertIn("How this route builds it", src)
+
+    def test_a_vendor_box_is_set_in_a_serif_and_can_be_clicked(self):
+        from genesis.pdf import PDF, A4, FONTS
+        self.assertIn("Times-Roman", [n for n, _w in FONTS.values()])
+        doc = PDF(title="t", page_size=A4)
+        doc.boxed(lambda: (doc.paragraph("x", 9, font="F5"),
+                           doc.link("neb.com", "https://www.neb.com", 8)))
+        data = doc.to_bytes()
+        self.assertIn(b"/Annots", data)
+        self.assertIn(b"/URI", data)
+        self.assertIn(b"Times-Roman", data)
+
+    def test_times_metrics_are_the_real_ones(self):
+        """Wrapping with the wrong widths is how text comes out
+        squeezed; the whole point of the change was to stop that."""
+        from genesis.pdf import FONTS, text_width
+        for key in ("F5", "F6", "F7"):
+            self.assertEqual(len(FONTS[key][1]), 95, key)
+        # Times is narrower than Helvetica at the same size, which is
+        # why it fits a reagent name Courier could not
+        self.assertLess(text_width("nuclease-free water", "F5", 9),
+                        text_width("nuclease-free water", "F3", 9))
+
+    def test_two_enzymes_at_one_temperature_share_a_tube(self):
+        from genesis.enzymes import digest_plan
+        plan = digest_plan(["EcoRI", "BamHI"])
+        self.assertFalse(plan["sequential"])
+        self.assertEqual(len(plan["stages"]), 1)
+        self.assertEqual(plan["stages"][0]["temperature"], 37)
+        self.assertEqual(plan["warnings"], [])
+
+    def test_two_enzymes_at_different_temperatures_do_not(self):
+        """BsmBI wants 55 C. A protocol that always says "37 C for an
+        hour" is wrong for that pair, and silently so."""
+        from genesis.enzymes import digest_plan
+        plan = digest_plan(["EcoRI", "BsmBI"])
+        self.assertTrue(plan["sequential"])
+        self.assertEqual([st["temperature"] for st in plan["stages"]],
+                         [37, 55])
+        self.assertTrue(any("two stages" in w for w in plan["warnings"]))
+
+    def test_a_time_saver_pair_cuts_in_fifteen_minutes(self):
+        from genesis.enzymes import digest_plan
+        self.assertEqual(digest_plan(["EcoRI", "BamHI"])["stages"][0]
+                         ["minutes"], "15 min")
+
+
 class TestAPayloadTakenOutOfACreLoxDonorComesOutForwards(unittest.TestCase):
     """A DIO donor stores its payload inverted - that is what DIO is.
 

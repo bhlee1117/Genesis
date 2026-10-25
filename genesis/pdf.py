@@ -181,13 +181,14 @@ class PDF:
         self.ml, self.mr = margin_left, margin_right
         self.mt, self.mb = margin_top, margin_bottom
         self.footer = footer
+        self.gutter = 0.0
         self.pages: list[_Page] = []
         self._new_page()
 
     # -- geometry ------------------------------------------------------
     @property
     def content_width(self) -> float:
-        return self.width - self.ml - self.mr
+        return self.width - self.ml - self.mr - self.gutter
 
     def _new_page(self):
         self.pages.append(_Page())
@@ -390,7 +391,10 @@ class PDF:
         badge_w = (text_width(badge, "F4", 7.6) + 8) if badge else 0
         text_x = x + (badge_w + 6 if badge else 0)
 
-        lines = wrap(title, "F2", size, self.width - self.mr - text_x)
+        # The gutter is reserved for the per-step thumbnails; a title
+        # wrapped against the full page runs straight under them.
+        lines = wrap(title, "F2", size,
+                     self.width - self.mr - self.gutter - text_x)
 
         # First row carries the number, the badge and the first title line.
         self.y -= lead
@@ -1210,32 +1214,96 @@ def _fig_fragment(doc, lane, index, joins, x, y, w):
                 centre=True)
 
 
-def _fig_product(doc, lanes, construct, product_bp, cx, cy):
-    """The new plasmid, each lane's contribution in that lane's colour."""
+def _fig_product(doc, lanes, construct, product_bp, cx, cy, joins=None):
+    """The new plasmid: which piece is which, and where they join.
+
+    It used to carry two rings - the lane contributions outside and the
+    construct's own promoter and CDS inside - with the labels pointing
+    at the inner one, so the arc named ASAP7y was not the arc the
+    fragment beside it was drawn in. One ring now, the pieces, named as
+    the pieces they are, with the junctions marked where they fall.
+    """
     span = product_bp or (construct or {}).get("length") or 1
     r = _FIG["pr"]
+    joins = joins or {}
     _arc_path(doc, cx, cy, r, 0.0, 1.0, 1.0, (0.76, 0.77, 0.79))
+    placed: list = [(cy - r - 16, True), (cy - r - 16, False),
+                    (cy - r - 10, True), (cy - r - 10, False)]
 
-    for lane in lanes:
+    for i, lane in enumerate(lanes):
         src = lane.get("src") or {}
         if not isinstance(src.get("at_start"), int):
             continue
-        _arc_path(doc, cx, cy, r, src["at_start"] / span,
-                  src["at_end"] / span, 4.2, lane["colour"])
-
-    from .figure import product_features
-    named = product_features((construct or {}).get("layout") or [], span)
-    placed: list = [(cy - r - 16, True), (cy - r - 16, False),
-                    (cy - r - 10, True), (cy - r - 10, False)]
-    for a in named[:3]:
-        s, e = (a["start"] % span) / span, (a["end"] % span) / span
-        _arc_path(doc, cx, cy, r - 7, s, e, 3.6, _feature_rgb(a["type"]))
-        mid = s + (((e - s) % 1.0) or 1.0) / 2
+        start_f, end_f = src["at_start"] / span, src["at_end"] / span
+        _arc_path(doc, cx, cy, r, start_f, end_f, 4.6, lane["colour"])
+        mid = start_f + (((end_f - start_f) % 1.0) or 1.0) / 2
         _fig_label(doc, placed, cx, cy, r, mid,
-                   (a.get("name") or a["type"])[:14], _feature_rgb(a["type"]))
+                   str(lane.get("piece") or "")[:16], _FIG_INK)
+        pair = joins.get((i, "right"))
+        if pair:
+            label, rgb = pair
+            a = _polar(cx, cy, r - 5, end_f)
+            b = _polar(cx, cy, r + 5, end_f)
+            doc.line(a[0], a[1], b[0], b[1], rgb=rgb, width=1.4)
+            _fig_label(doc, placed, cx, cy, r + 3, end_f, label, rgb, 5.4)
 
     _fig_caption(doc, cx, cy, r, (construct or {}).get("name")
                  or "new plasmid", f"{span:,} bp")
+
+
+def step_thumbnail(doc, lanes: list, operation: str, x: float, y: float,
+                   width: float = 86, lane=None) -> float:
+    """A small drawing beside a step, of what that step is doing.
+
+    Reading "amplify the 5,791 bp backbone2 arc (23-5,814)" tells you
+    the numbers and not the shape. The figure at the front of the
+    protocol says what the whole route does; this says which part of it
+    you are standing in.
+    """
+    cx, r = x + width / 2, 20
+    if operation in ("PCR", "RE_DIGEST"):
+        if lane is None:
+            lane = next((l for l in lanes
+                         if (l.get("stages") or [{}])[0].get("verb", "")
+                         .upper().startswith(operation[:3])), None)
+        src = (lane or {}).get("src") or {}
+        span = src.get("template_length") or 0
+        cy = y - r - 4
+        _arc_path(doc, cx, cy, r, 0.0, 1.0, 0.9, (0.78, 0.79, 0.81))
+        if span and isinstance(src.get("from_start"), int) \
+                and isinstance(src.get("from_end"), int):
+            _arc_path(doc, cx, cy, r, (src["from_start"] % span) / span,
+                      (src["from_end"] % span) / span, 3.4,
+                      lane.get("colour") or _FIG_INK)
+        doc.text_at("take one piece", cx, cy - r - 9, "F1", 5.6,
+                    rgb=_FIG_GREY, centre=True)
+        return r * 2 + 18
+    if operation in ("HI_FI_ASSEMBLY", "GIBSON_ASSEMBLY", "LIGATION"):
+        cy = y - r - 4
+        _arc_path(doc, cx, cy, r, 0.0, 1.0, 0.9, (0.78, 0.79, 0.81))
+        placed = [l for l in lanes
+                  if isinstance((l.get("src") or {}).get("at_start"), int)]
+        n = max(len(placed), 1)
+        for i, lane in enumerate(placed or lanes[:1]):
+            _arc_path(doc, cx, cy, r, i / n, (i + 1) / n, 3.4,
+                      lane.get("colour") or _FIG_INK)
+        doc.text_at("close the circle", cx, cy - r - 9, "F1", 5.6,
+                    rgb=_FIG_GREY, centre=True)
+        return r * 2 + 18
+    if operation == "SYNTHESIS":
+        doc.line(x + 8, y - 14, x + width - 8, y - 14, rgb=_FIG_GREY,
+                 width=2.5, dash="3 2")
+        doc.text_at("order it", cx, y - 26, "F1", 5.6, rgb=_FIG_GREY,
+                    centre=True)
+        return 34
+    if operation == "TRANSFORMATION":
+        for k in range(3):
+            doc.fill_rect(x + 22 + k * 14, y - 20, 6, 6,
+                          rgb=(0.55, 0.60, 0.68))
+        doc.text_at("colonies", cx, y - 30, "F1", 5.6, rgb=_FIG_GREY,
+                    centre=True)
+        return 38
+    return 0
 
 
 def figure_height(lanes: list) -> float:
@@ -1293,7 +1361,8 @@ def cloning_figure(doc: "PDF", lanes: list, join: str,
     mid_y = (centres[0] + centres[-1]) / 2
     _fig_arrow(doc, x_join, mid_y, _FIG["stage"], join,
                f"{rows} piece" + ("" if rows == 1 else "s"))
-    _fig_product(doc, lanes, construct, product_bp, x_prod, mid_y)
+    _fig_product(doc, lanes, construct, product_bp, x_prod, mid_y,
+                 joins)
 
     doc.y = top_y - height - 6
     key = []

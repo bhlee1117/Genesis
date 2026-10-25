@@ -51,6 +51,75 @@ def plasmid_family(conn: sqlite3.Connection, plasmid_id: int,
     return classify_vector(ann, name)["family"]
 
 
+#: Mutual 40-mer coverage at which two plasmids are the same construct.
+#: Both directions have to clear it: one-way coverage is high whenever
+#: the design is a subset of something bigger.
+SAME_CONSTRUCT = 0.98
+#: Below that but still close enough to be worth a look before cloning.
+NEARLY_THE_SAME = 0.93
+
+
+def already_made(conn: sqlite3.Connection, construct, resolved) -> list:
+    """Plasmids the lab already has that are this construct.
+
+    Cloning something that is already in the freezer is a fortnight
+    spent arriving where you started, and the inventory is the only
+    thing that knows. The test is mutual coverage in both directions:
+    the design is inside the candidate and the candidate is inside the
+    design. One direction on its own is not enough - a design is almost
+    entirely contained in any larger plasmid built around the same
+    backbone, which is how a Voltron2-mGluR2CT construct looks like a
+    plain Voltron2 one from the inside.
+
+    What comes back is ranked rather than binary, because the gap
+    between the same construct and a close relative is a real gap and
+    not always a wide one. Anything at or above SAME_CONSTRUCT is
+    reported as already made; the band below it is reported as worth a
+    look, which is what it is.
+    """
+    from .importer import seq_checksum
+    from .swap import sequence_coverage
+
+    designed = (construct.seq or "").upper()
+    if len(designed) < 500:
+        return []
+    circular = bool(getattr(construct, "circular", True))
+    want_ck = seq_checksum(designed, circular)
+    doubled_design = designed + designed
+
+    hits = []
+    for row in conn.execute(
+            "SELECT id, name, owner, seq, seq_length, circular, verified "
+            "FROM plasmid WHERE seq_length BETWEEN ? AND ? AND seq IS NOT NULL",
+            (int(len(designed) * 0.93), int(len(designed) * 1.07))):
+        host = (row["seq"] or "").upper()
+        if len(host) < 500:
+            continue
+        if seq_checksum(host, bool(row["circular"])) == want_ck:
+            hits.append({"id": row["id"], "name": row["name"],
+                         "owner": row["owner"], "length": row["seq_length"],
+                         "verified": row["verified"], "exact": True,
+                         "coverage": 1.0,
+                         "why": "the same molecule, base for base"})
+            continue
+        forward = sequence_coverage(designed, host + host)
+        if forward < NEARLY_THE_SAME:
+            continue
+        back = sequence_coverage(host, doubled_design)
+        score = min(forward, back)
+        if score < NEARLY_THE_SAME:
+            continue
+        hits.append({
+            "id": row["id"], "name": row["name"], "owner": row["owner"],
+            "length": row["seq_length"], "verified": row["verified"],
+            "exact": False, "coverage": round(score, 3),
+            "why": (f"{score * 100:.0f}% of this design is in it and "
+                    f"{score * 100:.0f}% of it is in this design"),
+        })
+    hits.sort(key=lambda h: (not h["exact"], -h["coverage"], h["name"]))
+    return hits[:6]
+
+
 def required_architecture(spec: ConstructSpec) -> set:
     """Structural features a recipient must already have for this design.
 
@@ -1092,6 +1161,8 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         "verification": verification,
         "swap": analysis.to_dict() if analysis else None,
         "scheme": scheme,
+        # Before anything else: is this already on the shelf?
+        "already_made": already_made(conn, construct, resolved),
         "closest_parents": [p.to_dict() for p in rank_parents(
             conn, [m["part_id"] for m in module_rows if m["part_id"]], cfg,
             limit=6, require_types=required_architecture(spec),

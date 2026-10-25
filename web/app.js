@@ -1194,14 +1194,93 @@ async function renderParts() {
   }
 }
 
+/* The standard genetic code, as the one table it is. */
+var CODONS = (function () {
+  var aas = 'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG';
+  var b = 'TCAG', table = {}, i = 0;
+  for (var x = 0; x < 4; x++)
+    for (var y = 0; y < 4; y++)
+      for (var z = 0; z < 4; z++)
+        table[b[x] + b[y] + b[z]] = aas[i++];
+  return table;
+})();
+
+function translateDna(seq) {
+  var out = '';
+  seq = String(seq || '').toUpperCase();
+  for (var i = 0; i + 2 < seq.length; i += 3) {
+    out += CODONS[seq.substr(i, 3)] || 'X';
+  }
+  return out;
+}
+
+/** A sequence in numbered rows, the way a sequence is read.
+
+   One unbroken string is technically the same information and is
+   unusable: nobody can tell base 400 from base 430 in it. Sixty to a
+   line, grouped in tens, with the coordinate of the first base. */
+function seqBlock(seq, opts) {
+  opts = opts || {};
+  var per = opts.per || 60, group = opts.group || 10;
+  var pre = h('pre', { class: 'seq-block' });
+  var lines = [];
+  for (var i = 0; i < seq.length; i += per) {
+    var chunk = seq.substr(i, per), parts = [];
+    for (var j = 0; j < chunk.length; j += group) {
+      parts.push(chunk.substr(j, group));
+    }
+    lines.push(String(i + 1).padStart(6, ' ') + '  ' + parts.join(' '));
+  }
+  pre.textContent = lines.join('\n');
+  return pre;
+}
+
+function seqSection(title, seq, note, extra) {
+  var open = false;
+  var body = h('div', { hidden: 'hidden' });
+  var head = h('button', {
+    type: 'button', class: 'link-button',
+    onclick: function () {
+      open = !open;
+      body.hidden = !open;
+      head.textContent = (open ? 'hide ' : 'show ') + title;
+    }
+  }, 'show ' + title);
+  body.appendChild(h('p', { class: 'muted small' }, note));
+  body.appendChild(seqBlock(seq, extra));
+  return h('div', { class: 'seq-wrap' }, head, body);
+}
+
 async function showPartSources(part) {
   var side = $('part-detail');
   clear(side);
   side.appendChild(h('h3', null, part.name || '(unnamed)'));
   side.appendChild(h('p', { class: 'muted small' },
     part.feature_type + ' · ' + bp(part.seq_length)));
+  var seqHolder = h('div', null);
+  side.appendChild(seqHolder);
   var holder = h('div', null, h('p', { class: 'muted' }, 'Loading sources…'));
   side.appendChild(holder);
+
+  /* The sequence itself - which is, after all, what a part is. */
+  api('/api/part/' + part.id).then(function (full) {
+    var dna = String(full.seq || '').toUpperCase();
+    if (!dna) return;
+    clear(seqHolder);
+    seqHolder.appendChild(seqSection(
+      'DNA (' + bp(dna.length) + ")", dna,
+      "5' to 3', numbered from the first base of the part."));
+    if (part.feature_type === 'CDS' || full.feature_type === 'CDS') {
+      var aa = translateDna(dna);
+      var trailing = aa.length && aa[aa.length - 1] === '*';
+      seqHolder.appendChild(seqSection(
+        'protein (' + (aa.length - (trailing ? 1 : 0)) + ' aa)', aa,
+        'Translated in frame 1, N to C. '
+        + (trailing ? 'The terminal * is the stop codon.'
+                    : 'No terminal stop codon in this part.'),
+        { per: 60, group: 10 }));
+    }
+  }).catch(function () { /* the sources below are the point */ });
   try {
     var rows = await api('/api/part/' + part.id + '/sources');
     clear(holder);
@@ -2866,12 +2945,60 @@ function parentPicker(role, options, chosenId) {
   return box;
 }
 
+/** Say it before the protocol: the lab may already have this.
+
+   Two weeks of cloning to arrive at a plasmid that is in the freezer
+   is the most expensive thing this tool can fail to mention, and the
+   inventory is the only place that knows. */
+function alreadyMade(plan) {
+  var hits = plan.already_made || [];
+  if (!hits.length) return null;
+  var made = hits.filter(function (h) {
+    return h.exact || h.coverage >= 0.98;
+  });
+  var close = hits.filter(function (h) { return made.indexOf(h) < 0; });
+
+  var card = h('div', { class: 'card' + (made.length ? ' card-alarm' : '') },
+    h('div', { class: 'card-head' },
+      h('h2', null, made.length ? 'The lab already has this construct'
+                                : 'Close relatives already in the inventory'),
+      h('span', { class: 'muted small' },
+        made.length ? 'check one before cloning it again'
+                    : 'different constructs, but worth a look')));
+
+  function row(x, strong) {
+    return h('div', { class: 'made-row' },
+      h('span', { class: strong ? 'made-name' : 'made-name muted' }, x.name),
+      h('span', { class: 'muted small' },
+        bp(x.length) + ' · ' + (x.owner || 'unknown owner')
+        + (x.verified ? ' · ' + String(x.verified).replace(/_/g, ' ') : '')),
+      h('span', { class: 'muted small' },
+        x.exact ? 'the same molecule, base for base'
+                : Math.round(x.coverage * 100) + '% shared'));
+  }
+  made.forEach(function (x) { card.appendChild(row(x, true)); });
+  if (made.length) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'Sequence one of these before building it again. The plan below '
+      + 'is only worth running if it turns out not to be what the name '
+      + 'says.'));
+  }
+  if (close.length) {
+    if (made.length) {
+      card.appendChild(h('p', { class: 'muted small' },
+        'Close relatives, for comparison:'));
+    }
+    close.forEach(function (x) { card.appendChild(row(x, false)); });
+  }
+  return card;
+}
+
 function renderPlan() {
   resetSteps();
   var plan = state.plan;
   if (!plan) return;
-  var scanCards = [selectionSummary(plan), scanRecap(plan),
-                   renderCandidates(plan), nextFromScan()];
+  var scanCards = [alreadyMade(plan), selectionSummary(plan), scanRecap(plan),
+                   renderCandidates(plan), nextFromScan()].filter(Boolean);
 
   var c = plan.construct || {};
 
@@ -4186,38 +4313,6 @@ function figParent(lane, cx, cy) {
   return g;
 }
 
-/** The plasmid's name under its circle, its size inside it.
- *
- *  Real inventory names run to thirty characters - "paav-ef1a-dio-asap7y
- *  -wpre" - and inside a 110 px circle they either overflowed the ring or
- *  had to be cut so short they stopped identifying the plasmid. Under it
- *  there is a whole column of room.
- */
-function figCaption(g, cx, cy, name, size) {
-  var mid = svg('text', { x: cx, y: cy + 4, 'text-anchor': 'middle',
-    class: 'fig-sub' });
-  mid.textContent = size;
-  g.appendChild(mid);
-
-  var words = String(name || 'template');
-  var lines = words.length > 26
-    ? [words.slice(0, 26), words.slice(26, 52)] : [words];
-  lines.forEach(function (line, i) {
-    var t = svg('text', {
-      x: cx, y: cy + (g.__r || FIG.r) + 26 + i * 12,
-      'text-anchor': 'middle',
-      class: 'fig-name'
-    });
-    t.textContent = line;
-    if (i === 0) {
-      var ti = svg('title', null);
-      ti.textContent = words;
-      t.appendChild(ti);
-    }
-    g.appendChild(t);
-  });
-}
-
 /** A piece nobody has a plasmid for: it gets ordered. */
 function figOrder(lane, cx, cy) {
   var g = svg('g', null);
@@ -4294,39 +4389,75 @@ function figFragment(lane, index, joins, x, y, w) {
   return g;
 }
 
-/** The new plasmid, with each lane's contribution in that lane's colour. */
-function figProduct(lanes, plan, sim, cx, cy) {
+/** The new plasmid: which piece is which, and where they join.
+
+   It used to carry two rings - the lane contributions outside and the
+   construct's own promoter and CDS inside - and the labels pointed at
+   the inner one. So the arc labelled ASAP7y was not the arc the
+   fragment on the left was drawn in, and the two colours contradicted
+   each other. One ring now, the pieces, labelled as the pieces they
+   are, with the junctions marked where they actually fall. */
+function figProduct(lanes, plan, sim, cx, cy, joins) {
   var c = (plan && plan.construct) || {};
   var span = sim.product_bp || c.length || 1;
   var r = FIG.pr;
   var g = svg('g', null);
-  g.__r = r;
   g.appendChild(svg('circle', { cx: cx, cy: cy, r: r, fill: 'none',
-    class: 'fig-ring', 'stroke-width': 2 }));
+    class: 'fig-ring', 'stroke-width': 3 }));
 
-  lanes.forEach(function (lane) {
-    var src = lane.src || {};
-    if (typeof src.at_start !== 'number') return;
+  var placed = lanes.filter(function (l) {
+    return typeof ((l.src || {}).at_start) === 'number';
+  });
+  placed.forEach(function (lane, i) {
+    var src = lane.src;
+    var from = src.at_start / span, to = src.at_end / span;
     g.appendChild(svg('path', {
-      d: arcPath(cx, cy, r, src.at_start / span, src.at_end / span),
-      fill: 'none', 'stroke-width': 7, stroke: lane.colour, opacity: 0.85
+      d: arcPath(cx, cy, r, from, to), fill: 'none',
+      'stroke-width': 9, stroke: lane.colour
     }));
+    var mid = from + ((((to - from) % 1) + 1) % 1) / 2;
+    ringLabel(g, cx, cy, r, mid, shortName(lane.piece, 16),
+              'fig-tag fig-tag-strong');
   });
 
-  /* The two things a reader checks on the product: the promoter and what
-     it drives. Everything else is on the full map in the Protocol step. */
-  productFeatures(c.layout || [], span).forEach(function (a) {
-    var from = (a.start % span) / span, to = (a.end % span) / span;
-    g.appendChild(svg('path', {
-      d: arcPath(cx, cy, r - 11, from, to), fill: 'none',
-      'stroke-width': 6, stroke: colorFor(a.type)
-    }));
-    ringLabel(g, cx, cy, r, from + ((((to - from) % 1) + 1) % 1) / 2,
-              shortName(a.name, 14));
+  /* The overhangs, on the product as well as on the pieces: the join is
+     a place on the finished molecule, not only a property of a tube. */
+  var order = lanes.map(function (l, i) { return i; }).filter(function (i) {
+    return typeof ((lanes[i].src || {}).at_start) === 'number';
+  });
+  order.forEach(function (i) {
+    var pair = joins && joins[i + '|right'];
+    if (!pair) return;
+    var at = (lanes[i].src.at_end % span) / span;
+    var a = polar(cx, cy, r - 7, at), b = polar(cx, cy, r + 7, at);
+    g.appendChild(svg('line', { x1: a[0], y1: a[1], x2: b[0], y2: b[1],
+      stroke: pair[1], 'stroke-width': 2.6, 'stroke-linecap': 'round' }));
+    var t = svg('text', { x: 0, y: 0, class: 'fig-end-label', fill: pair[1] });
+    var o = polar(cx, cy, r + 15, at);
+    t.setAttribute('x', o[0]);
+    t.setAttribute('y', o[1] + 3);
+    t.setAttribute('text-anchor', 'middle');
+    t.textContent = pair[0];
+    g.appendChild(t);
   });
 
-  figCaption(g, cx, cy, c.name || 'new plasmid', bp(span));
+  figCaption(g, cx, cy, c.name || 'new plasmid', bp(span), r);
   return g;
+}
+
+/** The plasmid's name under its circle, its size inside it. */
+function figCaption(g, cx, cy, name, size, r) {
+  var mid = svg('text', { x: cx, y: cy + 4, 'text-anchor': 'middle',
+    class: 'fig-sub' });
+  mid.textContent = size;
+  g.appendChild(mid);
+  var t = svg('text', { x: cx, y: cy + (r || FIG.r) + 26,
+    'text-anchor': 'middle', class: 'fig-name' });
+  t.textContent = shortName(String(name || 'template'), 28);
+  var ti = svg('title', null);
+  ti.textContent = String(name || '');
+  t.appendChild(ti);
+  g.appendChild(t);
 }
 
 function shortName(name, n) {
@@ -4551,7 +4682,7 @@ function cloningFigure(route, plan) {
   var mid = (top + bot) / 2;
   root.appendChild(figStageArrow(xJoin, mid, FIG.colStage, joinVerb(route),
                                  rows + ' pieces'));
-  root.appendChild(figProduct(lanes, plan, sim, xProd, mid));
+  root.appendChild(figProduct(lanes, plan, sim, xProd, mid, joins));
   return root;
 }
 

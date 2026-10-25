@@ -528,6 +528,49 @@ def _vendor_box(doc, recipe: dict, product, step: dict) -> None:
     doc.boxed(body, pad=7, fill=(0.985, 0.985, 0.99))
 
 
+def _already_made_banner(doc, plan: dict) -> None:
+    """Say it before the protocol, not after it.
+
+    Two weeks of cloning to arrive at a plasmid that is already in the
+    freezer is the most expensive mistake this tool can fail to
+    prevent, and the inventory is the only thing that knows.
+    """
+    from .pdf import WARN_RED
+    hits = plan.get("already_made") or []
+    made = [h for h in hits if h["exact"] or h["coverage"] >= 0.98]
+    close = [h for h in hits if h not in made]
+    if not made and not close:
+        return
+
+    def body():
+        if made:
+            doc.paragraph("The lab already has this construct.", 11,
+                          font="F2", rgb=WARN_RED)
+            for h in made:
+                doc.bullet(
+                    f"{h['name']} - {h['length']:,} bp, {h['owner']}"
+                    + (f" ({h['verified'].replace('_', ' ')})"
+                       if h.get("verified") else "")
+                    + f". {h['why']}.", 9, rgb=WARN_RED)
+            doc.paragraph(
+                "Check one of these by sequencing before cloning it "
+                "again; the protocol below is only worth running if it "
+                "turns out not to be what the name says.", 8.8, gray=0.3)
+        if close:
+            doc.paragraph(
+                "Close relatives already in the inventory - different "
+                "constructs, but worth a look first:", 8.8,
+                font="F2" if not made else "F1", gray=0.25)
+            for h in close:
+                doc.bullet(f"{h['name']} - {h['length']:,} bp, {h['owner']}; "
+                           f"{h['coverage'] * 100:.0f}% shared", 8.6,
+                           gray=0.35)
+
+    doc.boxed(body, pad=8,
+              rgb=WARN_RED if made else (0.80, 0.82, 0.85),
+              fill=(1.0, 0.97, 0.97) if made else (0.985, 0.985, 0.99))
+
+
 def _kit_protocols(doc, steps: list) -> None:
     """What to buy, and where each set of conditions came from.
 
@@ -587,6 +630,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
     doc.heading(name, 1)
     doc.paragraph(route["title"], 10.5, gray=0.35)
     doc.spacer(4)
+    _already_made_banner(doc, plan)
 
     product = (route.get("scheme") or {}).get("product")
     if product:
@@ -743,11 +787,30 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
 
     # --- 7. the protocol --------------------------------------------
     doc.heading("Protocol", 2)
+    # A column down the right saying what each step is doing to the
+    # molecule. The figure at the front says what the route does; this
+    # says which part of it you are standing in.
+    from .pdf import step_thumbnail
+    from .figure import route_lanes
+    lanes_for_steps = route_lanes(route, route.get("simulation") or {}, plan)
+    doc.gutter = 96 if lanes_for_steps else 0
     for step in p["steps"]:
+        top = doc.y
         doc.step(f"{step['index']}.", step["description"],
                  badge=step["operation"])
+        if lanes_for_steps:
+            # Which lane this step belongs to, not merely which kind of
+            # step it is: two PCRs in a row are two different pieces.
+            here = next(
+                (l for l in lanes_for_steps
+                 if l.get("template")
+                 and str(l["template"]) in (step["description"] or "")),
+                None)
+            step_thumbnail(doc, lanes_for_steps, step["operation"],
+                           doc.width - doc.mr - 86, top, lane=here)
         if step["detail"]:
             doc.paragraph(step["detail"], 8.8, gray=0.3, indent=22)
+        doc.gutter = 0
         recipe = step["recipe"]
         product = step.get("product")
         if recipe and step["operation"] in ("PCR", "HI_FI_ASSEMBLY",
@@ -755,7 +818,9 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                                             "RE_DIGEST", "DPNI_DIGEST",
                                             "TRANSFORMATION"):
             _vendor_box(doc, recipe, product, step)
+        doc.gutter = 96 if lanes_for_steps else 0
 
+    doc.gutter = 0
     _kit_protocols(doc, p["steps"])
 
     # --- 8. everything else -----------------------------------------
