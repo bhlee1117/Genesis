@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import random
 import sys
+import os
+import urllib.parse
 import unittest
 from pathlib import Path
 
@@ -37,6 +39,27 @@ LOX2272 = "ATAACTTCGTATAAAGTATCCTATACGAAGTTAT"
 def rand_seq(n, seed=None):
     r = random.Random(seed)
     return "".join(r.choice("ACGT") for _ in range(n))
+
+
+def pdf_text(data: bytes) -> bytes:
+    """Everything a Genesis PDF draws, with the page streams inflated.
+
+    Content streams are Flate-compressed, so searching the file for a
+    heading finds nothing whether or not the heading is there.
+    """
+    import re, zlib
+    out = []
+    for m in re.finditer(rb"stream\r?\n(.*?)endstream", data, re.S):
+        try:
+            out.append(zlib.decompress(m.group(1)))
+        except zlib.error:
+            out.append(m.group(1))
+    return b"".join(out)
+
+
+def _rc(seq):
+    from genesis.seqtools import revcomp
+    return revcomp(seq)
 
 
 def orf(n_codons, seed=0):
@@ -1009,6 +1032,35 @@ class TestPDF(unittest.TestCase):
         data = protocol_pdf(plan, cfg)
         self.assertTrue(data.startswith(b"%PDF"))
         self.assertGreater(len(data), 3000)
+        # The route figure goes in the protocol, not only on screen.
+        drawn = pdf_text(data)
+        self.assertIn(b"How this route builds it", drawn)
+        self.assertIn(b"NEBuilder HiFi", drawn)
+
+    def test_the_figure_fits_the_page(self):
+        """A figure wider than the text column runs off the paper, and a
+        PDF gives no sign of it - the ink is simply outside the sheet."""
+        from genesis.pdf import PDF, A4, cloning_figure, figure_height, _FIG
+        lanes = [{"origin": "plasmid", "template": "pHost", "piece": "insert",
+                  "colour": (0.2, 0.4, 0.8), "primers": ["a-F", "a-R"],
+                  "cuts_parent": ["HindIII", "EcoRV"],
+                  "ends": ["HindIII", "EcoRV"], "end_kind": "sticky",
+                  "stages": [{"verb": "PCR", "sub": "1,200 bp"},
+                             {"verb": "Digest", "sub": "HindIII + EcoRV"}],
+                  "src": {"template": "pHost", "template_length": 5000,
+                          "from_start": 100, "from_end": 1300, "bp": 1200,
+                          "features": [], "at_start": 0, "at_end": 1200}}]
+        doc = PDF(title="t", page_size=A4)
+        width = (_FIG["parent"] + 2 * _FIG["stage"] + _FIG["frag"]
+                 + _FIG["bracket"] + 6 + _FIG["stage"] + 2 * _FIG["pr"])
+        self.assertLessEqual(width, doc.content_width,
+                             "the widest figure must fit the text column")
+        before = len(doc.pages)
+        cloning_figure(doc, lanes, "T4 ligase", {"name": "p", "length": 6200,
+                                                 "layout": []}, 6200)
+        self.assertEqual(len(doc.pages), before, "one lane should not paginate")
+        self.assertGreater(figure_height(lanes), 0)
+        self.assertTrue(doc.to_bytes().startswith(b"%PDF"))
 
     def test_plan_carries_a_suggested_name(self):
         conn = connect(":memory:")
@@ -1273,8 +1325,10 @@ class TestCodonMarkers(unittest.TestCase):
 
     def test_premature_stop_is_marked_separately_from_the_real_one(self):
         from genesis.construct import codon_markers
-        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 5 + "TGA" + "GCT" * 5),
-                     ("CDS", "geneB", "GCT" * 5 + "TAA")])
+        # Long enough to be a protein: a run shorter than MIN_TRANSLATED_RUN
+        # is an annotation artefact and is deliberately not marked.
+        c = self._c([("CDS", "geneA", "ATG" + "GCT" * 5 + "TGA" + "GCT" * 15),
+                     ("CDS", "geneB", "GCT" * 10 + "TAA")])
         kinds = [m["kind"] for m in codon_markers(c)]
         self.assertIn("premature_stop", kinds)
         self.assertEqual(kinds.count("stop"), 1)
@@ -2798,11 +2852,15 @@ class TestDpnINecessity(unittest.TestCase):
     def setUp(self):
         self.conn = connect(":memory:")
 
-    def _plasmid(self, name, marker):
+    def _plasmid(self, name, marker, seq=None):
+        # Real plasmids carry a GATC every few hundred bases; a 4 bp stub
+        # carries none, which is now its own answer ("DpnI cannot cut
+        # this") and would mask what these tests are about.
+        seq = seq if seq is not None else ("GATC" + rand_seq(200, 77)) * 10
         pid = self.conn.execute(
             """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
-                    circular) VALUES (?,'t','ACGT',4,?,1)""",
-            (name, name)).lastrowid
+                    circular) VALUES (?,'t',?,?,?,1)""",
+            (name, seq, len(seq), name)).lastrowid
         if marker:
             self.conn.execute(
                 """INSERT INTO annotation(plasmid_id, feature_type, name,
@@ -2846,6 +2904,26 @@ class TestDpnINecessity(unittest.TestCase):
         template = self._plasmid("template", None)
         self.assertTrue(dpni_decision(self.conn, [template], product,
                                       gel_purified=False)["needed"])
+
+    def test_a_template_dpni_cannot_cut_is_a_risk_not_a_saving(self):
+        """Skipping the step because the plate removes the parent and
+        skipping it because the enzyme does nothing are different
+        answers; only one of them means the background is handled."""
+        from genesis.planner import dpni_decision, dpni_skipped_warning
+        product = self._plasmid("product", "AmpR")
+        template = self._plasmid("template", "AmpR", seq="ACGTACGT" * 300)
+        result = dpni_decision(self.conn, [template], product,
+                               gel_purified=False)
+        self.assertFalse(result["needed"])
+        self.assertTrue(result["blocked"])
+        self.assertIn("cannot be used", dpni_skipped_warning(result))
+        self.assertIn("false clones", dpni_skipped_warning(result))
+
+        # ...whereas a different marker is a genuine saving
+        other = self._plasmid("other", "KanR")
+        ok = dpni_decision(self.conn, [other], product, gel_purified=False)
+        self.assertFalse(ok["blocked"])
+        self.assertIn("not needed", dpni_skipped_warning(ok))
 
     def test_markers_are_recognised_by_their_usual_labels(self):
         from genesis.planner import resistance_marker
@@ -2977,6 +3055,137 @@ class TestInferredORFs(unittest.TestCase):
         from genesis.orfs import payload_span
         self.assertIsNone(payload_span(
             [{"feature_type": "promoter", "name": "hSyn", "start": 0, "end": 400}]))
+
+    def test_a_token_the_vocabulary_knows_is_not_an_insert_name(self):
+        # "pcag-egfp-wpre-spacer-sv40dts" named its EGFP "sv40dts": the
+        # longest token nobody had put on the hand-kept noise list.  The
+        # vocabulary had a rule for it, so the name list does not have to
+        # grow by a word for every element the share invents.
+        from genesis.orfs import name_from_plasmid as n, _names_an_element
+        self.assertEqual(n("pcag-egfp-wpre-spacer-sv40dts"), "egfp")
+        for token in ("sv40dts", "CAAX", "CaMKIIa", "PuroR", "T7",
+                      "SV40polyA", "minBGpromoter"):
+            self.assertTrue(_names_an_element(token), token)
+        # ...and the rule must not eat the protein names, which are
+        # precisely the tokens the vocabulary has no rule for.
+        for token in ("ASAP7y", "Voltron2", "iGluSnFR4f", "mCherry",
+                      "CheRiff", "egfp", "QuasAr2"):
+            self.assertFalse(_names_an_element(token), token)
+
+    def test_sv40_dts_is_a_dna_element_and_not_a_tag(self):
+        # It is the SV40 72-bp repeat, put in for what it does to the
+        # plasmid rather than to transcription.  It is never translated,
+        # so it must not land among the peptide tags, which the frame
+        # checks read as protein.
+        from genesis.vocab import classify_label
+        for label in ("SV40 DTS", "sv40dts", "DTS",
+                      "DNA nuclear targeting sequence"):
+            self.assertEqual(classify_label(label), "enhancer", label)
+        # the neighbouring SV40 elements keep their own verdicts
+        self.assertEqual(classify_label("SV40 polyA"), "polyA")
+        self.assertEqual(classify_label("SV40 promoter"), "promoter")
+        self.assertEqual(classify_label("SV40 ori"), "origin")
+
+    def test_an_orf_buried_in_a_promoter_is_not_a_gene(self):
+        # A GC-rich promoter read in a frame nobody transcribes gives a
+        # long Ala/Arg/Pro ORF.  Only an ORF that *swallowed* a structural
+        # element used to be rejected, so 108 plasmids carried a 202 aa
+        # "CDS" that was their CAG promoter - and one of them reached the
+        # catalogue as "Voltron" and renamed the same stretch elsewhere.
+        from genesis.orfs import candidate_orfs
+        orf = "ATG" + "GCC" * 300 + "TAA"
+        seq = "TTTT" * 50 + orf + "TTTT" * 50
+        start = 200
+        promoter = [{"feature_type": "promoter", "name": "CAG",
+                     "start": 0, "end": len(seq)}]
+        self.assertEqual(candidate_orfs(seq, False, promoter), [])
+        self.assertTrue(candidate_orfs(seq, False, []))
+        # an ORF merely abutting one is still a candidate
+        touching = [{"feature_type": "promoter", "name": "CAG",
+                     "start": 0, "end": start + 20}]
+        self.assertTrue(candidate_orfs(seq, False, touching))
+
+    def test_refresh_retires_the_parts_the_last_guess_minted(self):
+        # An occurrence is keyed on coordinates, not on the annotation
+        # that argued for it, so a wrong guess used to outlive the
+        # --refresh meant to undo it: part #2849 was the CAG promoter
+        # read in a dead frame, called "Voltron", and it stayed in the
+        # protein index lending that name to thirty-four other plasmids.
+        from genesis.orfs import infer_all
+        from genesis.seqtools import translate
+        conn = connect(":memory:")
+        aa = "M" + "".join(random.Random(9).choice("ACDEFGHIKLMNPQRSTVWY")
+                           for _ in range(250))
+        codon = {translate(a + b + c): a + b + c
+                 for a in "ACGT" for b in "ACGT" for c in "ACGT"}
+        cds = "".join(codon[r] for r in aa) + "TAA"
+        seq = "TTTT" * 100 + cds + "TTTT" * 100
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pTest-Fakease','t',?,?,'orfrefresh',0,
+                       'sequence_verified')""",
+            (seq, len(seq))).lastrowid
+        conn.commit()
+        infer_all(conn)
+        orf = conn.execute(
+            "SELECT start, end, strand FROM annotation "
+            "WHERE plasmid_id=? AND evidence='orf'", (pid,)).fetchone()
+        self.assertIsNotNone(orf, "the ORF should have been annotated")
+
+        # the state a confident run leaves behind: a part of its own,
+        # vouched for by nothing but that ORF.
+        part_id = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length, translated, confidence)
+               VALUES ('CDS','Fakease',?,'fakease',?,1,0.8)""",
+            (cds, len(cds))).lastrowid
+        conn.execute(
+            "INSERT INTO part_occurrence(part_id, plasmid_id, start, end, "
+            "strand) VALUES (?,?,?,?,?)",
+            (part_id, pid, orf["start"], orf["end"], orf["strand"]))
+        conn.commit()
+
+        infer_all(conn, refresh=True)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM part_occurrence "
+                         "WHERE part_id=?", (part_id,)).fetchone()[0], 0,
+            "refresh left an occurrence nothing but the old guess vouched for")
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM part WHERE id=?",
+                         (part_id,)).fetchone()[0], 0,
+            "refresh left a part with no occurrence pointing at it")
+        conn.close()
+
+    def test_refresh_keeps_a_part_the_file_also_vouches_for(self):
+        # The other half: an ORF that merely agreed with an annotation
+        # somebody made must not take that part down with it.
+        from genesis.orfs import infer_all
+        conn = connect(":memory:")
+        seq = "TTTT" * 100 + orf(150, 77) + "TTTT" * 100
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pKeep','t',?,?,'orfkeep',0,'sequence_verified')""",
+            (seq, len(seq))).lastrowid
+        part_id = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length, translated, confidence)
+               VALUES ('CDS','RealThing','ATGTAA','keepme',6,1,1.0)"""
+        ).lastrowid
+        conn.execute("INSERT INTO part_occurrence(part_id, plasmid_id, start, "
+                     "end, strand) VALUES (?,?,10,20,1)", (part_id, pid))
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand, evidence, confidence)
+               VALUES (?, 'CDS','RealThing',10,20,1,'file',1.0)""", (pid,))
+        conn.commit()
+        infer_all(conn, refresh=True)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM part WHERE id=?",
+                         (part_id,)).fetchone()[0], 1,
+            "refresh removed a part the file vouches for")
+        conn.close()
 
 
 class TestCloningSimulation(unittest.TestCase):
@@ -3123,7 +3332,7 @@ class TestArchitectureCandidates(unittest.TestCase):
     def test_one_donor_when_the_remainder_is_in_one_plasmid(self):
         from genesis.swap import architecture_candidates
         self._plasmid("pAAV-hSyn-XXX", ["hSyn", "XXX"])
-        self._plasmid("donor-P2A-ZZZ", ["P2A", "ZZZ"], vector=False)
+        self._plasmid("donor-P2A-ZZZ", ["P2A", "ZZZ"])
         c = architecture_candidates(self.conn, self._modules())
         self.assertEqual(c["n_donors"], 1)
         self.assertEqual(c["donors"][0]["covers"], ["P2A", "ZZZ"])
@@ -3132,8 +3341,8 @@ class TestArchitectureCandidates(unittest.TestCase):
         """The case that has to be said out loud rather than dropped."""
         from genesis.swap import architecture_candidates
         self._plasmid("pAAV-hSyn", ["hSyn"])
-        self._plasmid("donor-XXX-P2A", ["XXX", "P2A"], vector=False)
-        self._plasmid("donor-ZZZ", ["ZZZ"], vector=False)
+        self._plasmid("donor-XXX-P2A", ["XXX", "P2A"])
+        self._plasmid("donor-ZZZ", ["ZZZ"])
         c = architecture_candidates(self.conn, self._modules())
         self.assertEqual(c["recipients"][0]["run"], 1)
         self.assertEqual(c["n_donors"], 2)
@@ -3143,7 +3352,7 @@ class TestArchitectureCandidates(unittest.TestCase):
     def test_a_part_nobody_has_is_reported_not_hidden(self):
         from genesis.swap import architecture_candidates
         self._plasmid("pAAV-hSyn-XXX", ["hSyn", "XXX"])
-        self._plasmid("donor-P2A", ["P2A"], vector=False)
+        self._plasmid("donor-P2A", ["P2A"])
         c = architecture_candidates(self.conn, self._modules())
         last = c["donors"][-1]
         self.assertEqual(last["covers"], ["ZZZ"])
@@ -3682,13 +3891,20 @@ class TestDonorAccuracy(unittest.TestCase):
         # A relative: most of the same bases under another name, which is
         # what the catalogue search turns up.
         self.relative = self.want[:400] + rand_seq(60, 122) + self.want[460:]
+        # A promoter only the recipient carries, so the plasmids holding
+        # the coding sequence are judged as donors.
+        self.prom = rand_seq(300, 120)
         self.parts = {}
-        for nm, sq in (("ASAP7y", self.want), ("ASAP1", self.relative)):
+        for nm, sq in (("hSyn", self.prom), ("ASAP7y", self.want),
+                       ("ASAP1", self.relative)):
             self.parts[nm] = self.conn.execute(
                 """INSERT INTO part(feature_type, name, seq, seq_checksum,
-                        seq_length) VALUES ('CDS',?,?,?,?)""",
-                (nm, sq, nm, len(sq))).lastrowid
+                        seq_length) VALUES (?,?,?,?,?)""",
+                ("promoter" if nm == "hSyn" else "CDS",
+                 nm, sq, nm, len(sq))).lastrowid
         self.conn.commit()
+        self._plasmid("recipient-hSyn", self.prom + rand_seq(400, 125),
+                      "hSyn", self.prom)
 
     def _plasmid(self, name, body, part_name, sq):
         pid = self.conn.execute(
@@ -3700,6 +3916,11 @@ class TestDonorAccuracy(unittest.TestCase):
             """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
                     strand) VALUES (?,?,?,?,1)""",
             (self.parts[part_name], pid, at, at + len(sq)))
+        for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,0,30,1)""",
+                (pid, ftype, nm))
         self.conn.commit()
         return pid
 
@@ -3711,7 +3932,9 @@ class TestDonorAccuracy(unittest.TestCase):
         real = self._plasmid("large-but-right",
                              rand_seq(5000, 124) + self.want, "ASAP7y",
                              self.want)
-        modules = [{"type": "CDS", "part_id": self.parts["ASAP7y"],
+        modules = [{"type": "promoter", "part_id": self.parts["hSyn"],
+                    "part_name": "hSyn", "seq": self.prom},
+                   {"type": "CDS", "part_id": self.parts["ASAP7y"],
                     "part_name": "ASAP7y", "seq": self.want}]
         c = architecture_candidates(self.conn, modules)
         self.assertTrue(c["donors"], c)
@@ -4048,30 +4271,43 @@ class TestDonorCountMeansReactions(unittest.TestCase):
     def setUp(self):
         self.conn = connect(":memory:")
         self.a, self.b = orf(120, 171), orf(90, 172)
+        # A promoter nothing else carries, so the plasmids under test are
+        # donors rather than candidates to start from: a plasmid holding
+        # the whole architecture is a recipient and needs no donor at all.
+        self.p = rand_seq(300, 170)
         self.parts = {}
-        for nm, sq in (("A", self.a), ("B", self.b)):
+        for nm, sq in (("P", self.p), ("A", self.a), ("B", self.b)):
             self.parts[nm] = self.conn.execute(
                 """INSERT INTO part(feature_type, name, seq, seq_checksum,
-                        seq_length) VALUES ('CDS',?,?,?,?)""",
-                (nm, sq, nm, len(sq))).lastrowid
+                        seq_length) VALUES (?,?,?,?,?)""",
+                ("promoter" if nm == "P" else "CDS",
+                 nm, sq, nm, len(sq))).lastrowid
+        self._plasmid("recipient-P", self.p + rand_seq(400, 176))
 
     def _plasmid(self, name, body):
         pid = self.conn.execute(
             """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
                     circular, verified) VALUES (?,'t',?,?,?,1,'unverified')""",
             (name, body, len(body), name)).lastrowid
-        for nm, sq in (("A", self.a), ("B", self.b)):
+        for nm, sq in (("P", self.p), ("A", self.a), ("B", self.b)):
             at = body.find(sq)
             if at >= 0:
                 self.conn.execute(
                     """INSERT INTO part_occurrence(part_id, plasmid_id, start,
                             end, strand) VALUES (?,?,?,?,1)""",
                     (self.parts[nm], pid, at, at + len(sq)))
+        for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+            self.conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,0,30,1)""",
+                (pid, ftype, nm))
         self.conn.commit()
         return pid
 
     def _modules(self):
-        return [{"type": "CDS", "part_id": self.parts["A"], "part_name": "A",
+        return [{"type": "promoter", "part_id": self.parts["P"],
+                 "part_name": "P", "seq": self.p},
+                {"type": "CDS", "part_id": self.parts["A"], "part_name": "A",
                  "seq": self.a},
                 {"type": "CDS", "part_id": self.parts["B"], "part_name": "B",
                  "seq": self.b}]
@@ -4363,3 +4599,2988 @@ class TestCassetteAcrossTheOrigin(unittest.TestCase):
         self.assertFalse(cas["wraps"])
         self.assertEqual(cas["start"], 168)
         self.assertEqual(cas["end"], 168 + len(inner))
+
+
+class TestOnlyRealPlasmidsAreParents(unittest.TestCase):
+    """A PCR product is not something you can take out of a freezer.
+
+    The share holds gel extractions, ordered fragments and PCR products
+    next to real plasmids, and a part sitting in one of those cannot be
+    amplified next week. Topology alone does not sort them: a 1.3 kb
+    fragment in the inventory claims to be circular. Carrying an origin
+    and a resistance marker does.
+    """
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        self.prom, self.cds = rand_seq(300, 181), orf(600, 182)
+        self.parts = {}
+        for nm, sq, ft in (("P", self.prom, "promoter"),
+                           ("X", self.cds, "CDS")):
+            self.parts[nm] = self.conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ft, nm, sq, nm, len(sq))).lastrowid
+
+    def _row(self, name, body, carries, vector, circular=1):
+        pid = self.conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES (?,'t',?,?,?,?,'unverified')""",
+            (name, body, len(body), name, circular)).lastrowid
+        for nm in carries:
+            at = body.find(self.parts and
+                           (self.prom if nm == "P" else self.cds))
+            self.conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,1)""",
+                (self.parts[nm], pid, at,
+                 at + len(self.prom if nm == "P" else self.cds)))
+        if vector:
+            for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+                self.conn.execute(
+                    """INSERT INTO annotation(plasmid_id, feature_type, name,
+                            start, end, strand) VALUES (?,?,?,0,30,1)""",
+                    (pid, ftype, nm))
+        self.conn.commit()
+        return pid
+
+    def _modules(self):
+        return [{"type": "promoter", "part_id": self.parts["P"],
+                 "part_name": "P", "seq": self.prom},
+                {"type": "CDS", "part_id": self.parts["X"],
+                 "part_name": "X", "seq": self.cds}]
+
+    def test_a_fragment_is_not_offered_as_a_donor(self):
+        from genesis.swap import architecture_candidates
+        self._row("recipient", self.prom + rand_seq(400, 183), ["P"], True)
+        self._row("2-4 PCRprdt", self.cds + rand_seq(80, 184), ["X"], False)
+        c = architecture_candidates(self.conn, self._modules())
+        offered = [o["name"] for d in c["donors"] for o in d["options"]]
+        self.assertNotIn("2-4 PCRprdt", offered)
+
+    def test_a_fragment_calling_itself_circular_is_still_a_fragment(self):
+        from genesis.swap import architecture_candidates
+        self._row("recipient", self.prom + rand_seq(400, 185), ["P"], True)
+        self._row("Insert1 1322 bp ds-DNA linear",
+                  self.cds + rand_seq(80, 186), ["X"], False, circular=1)
+        c = architecture_candidates(self.conn, self._modules())
+        offered = [o["name"] for d in c["donors"] for o in d["options"]]
+        self.assertEqual(offered, [])
+
+    def test_the_part_is_still_reported_when_only_fragments_have_it(self):
+        """Dropping it silently would read as "nobody has this"."""
+        from genesis.swap import architecture_candidates
+        self._row("recipient", self.prom + rand_seq(400, 187), ["P"], True)
+        self._row("2-4 PCRprdt", self.cds + rand_seq(80, 188), ["X"], False)
+        c = architecture_candidates(self.conn, self._modules())
+        self.assertEqual(c["donors"][-1]["covers"], ["X"])
+        self.assertIn("PCR product", c["donors"][-1]["note"])
+
+    def test_a_real_plasmid_is_offered(self):
+        from genesis.swap import architecture_candidates
+        self._row("recipient", self.prom + rand_seq(400, 189), ["P"], True)
+        self._row("PP072", self.cds + rand_seq(2000, 190), ["X"], True)
+        c = architecture_candidates(self.conn, self._modules())
+        offered = [o["name"] for d in c["donors"] for o in d["options"]]
+        self.assertIn("PP072", offered)
+
+
+class TestSamePartAtAnotherBoundary(unittest.TestCase):
+    """One gene catalogued twice is one part, not two.
+
+    EGFP is in the inventory both with and without its ATG, and P2A both
+    with and without the GSG linker in front of it. Requiring the exact
+    catalogue row that happened to be resolved made PP078 - which carries
+    P2A fused directly to EGFP - look as though it carried neither, so the
+    plan went off to amplify the two separately from two other plasmids.
+    """
+
+    def test_a_missing_start_codon_is_the_same_part(self):
+        from genesis.swap import interchangeable
+        cds = orf(600, 191)
+        self.assertTrue(interchangeable(cds, cds[3:], "CDS"))
+
+    def test_a_leading_linker_is_the_same_part(self):
+        from genesis.swap import interchangeable
+        p2a = orf(66, 192)
+        self.assertTrue(interchangeable(p2a, p2a[9:], "p2A"))
+
+    def test_different_codons_for_the_same_protein_are_the_same_part(self):
+        from genesis.swap import interchangeable, protein_of
+        cds = orf(600, 193)
+        # Re-spell the third position of a few codons: same protein,
+        # different bases, which is what a codon-optimised copy is.
+        syn = {"GCT": "GCC", "GGT": "GGC", "TGC": "TGT", "ATT": "ATC"}
+        out = [syn.get(cds[i:i + 3], cds[i:i + 3])
+               for i in range(0, len(cds) - 2, 3)]
+        other = "".join(out)
+        self.assertNotEqual(cds, other)
+        self.assertEqual(protein_of(cds), protein_of(other))
+        self.assertTrue(interchangeable(cds, other, "CDS"))
+
+    def test_another_version_of_the_indicator_is_not(self):
+        """The one thing somebody asking for ASAP7y must not be handed."""
+        from genesis.swap import interchangeable
+        want = orf(900, 194)
+        relative = want[:400] + orf(60, 195) + want[460:]
+        self.assertFalse(interchangeable(want, relative, "CDS"))
+
+    def test_a_stub_row_is_not_the_whole_gene(self):
+        """There is a 6 bp part named "ASAP1" in the inventory."""
+        from genesis.swap import interchangeable
+        want = orf(900, 196)
+        self.assertFalse(interchangeable(want, want[:6], "CDS"))
+
+    def test_two_parts_fused_in_one_plasmid_are_one_donor(self):
+        from genesis.swap import architecture_candidates
+        conn = connect(":memory:")
+        prom, a, b = rand_seq(300, 197), orf(300, 198), orf(600, 199)
+        parts = {}
+        for nm, sq, ft in (("P", prom, "promoter"), ("A", a, "p2A"),
+                           ("B", b, "CDS")):
+            parts[nm] = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ft, nm, sq, nm, len(sq))).lastrowid
+
+        def row(name, body, held):
+            pid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'unverified')""",
+                (name, body, len(body), name)).lastrowid
+            for nm, sq in held:
+                at = body.find(sq)
+                conn.execute(
+                    """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                            end, strand) VALUES (?,?,?,?,1)""",
+                    (parts[nm], pid, at, at + len(sq)))
+            for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+                conn.execute(
+                    """INSERT INTO annotation(plasmid_id, feature_type, name,
+                            start, end, strand) VALUES (?,?,?,0,30,1)""",
+                    (pid, ftype, nm))
+            conn.commit()
+            return pid
+
+        row("recipient", prom + rand_seq(400, 200), [("P", prom)])
+        # Holds both, fused - but spelled at the other boundary: no ATG on
+        # the coding sequence, no linker on the 2A.
+        row("fused-donor", a[9:] + b[3:] + rand_seq(500, 201),
+            [("A", a[9:]), ("B", b[3:])])
+        modules = [{"type": "promoter", "part_id": parts["P"],
+                    "part_name": "P", "seq": prom},
+                   {"type": "p2A", "part_id": parts["A"],
+                    "part_name": "A", "seq": a},
+                   {"type": "CDS", "part_id": parts["B"],
+                    "part_name": "B", "seq": b}]
+        c = architecture_candidates(conn, modules)
+        self.assertEqual(c["n_donors"], 1, c["donors"])
+        self.assertEqual(c["donors"][0]["covers"], ["A", "B"])
+        conn.close()
+
+
+class TestInvertedPayloadStillMergesOnePCR(unittest.TestCase):
+    """A Cre-lox payload runs backwards through a forward donor.
+
+    P2A and EGFP sit next to each other in one plasmid, so they are one
+    amplification. Placed inside a DIO cassette the payload is inverted,
+    so its modules walk that donor from the far end towards the near one
+    while the donor still holds them the right way round. Testing the
+    source strand alone missed that and planned two reactions, one of
+    them 66 bp long.
+    """
+
+    def _run(self, placed_strand):
+        from genesis.planner import group_contiguous
+        from genesis.construct import ResolvedModule, AssembledConstruct
+
+        a, b = orf(66, 211), orf(717, 212)
+
+        def source(start, end):
+            return [{"id": 9, "name": "donor", "start": start, "end": end,
+                     "strand": 1, "seq_length": 5000,
+                     "verified": "unverified"}]
+
+        # Adjacent in the donor: P2A at 100-166, EGFP at 166-883.
+        mods = [ResolvedModule(None, 1, "P2A", a, "p2A", source(100, 166)),
+                ResolvedModule(None, 2, "EGFP", b, "CDS", source(166, 883))]
+        if placed_strand == -1:
+            mods.reverse()
+        layout = [{"name": m.part_name, "type": m.feature_type, "start": i,
+                   "end": i + 1, "strand": placed_strand}
+                  for i, m in enumerate(mods)]
+        construct = AssembledConstruct(seq="", layout=layout, circular=True)
+        return group_contiguous(mods, construct, Config())
+
+    def test_forward_payload_is_one_fragment(self):
+        frags = self._run(1)
+        self.assertEqual(len(frags), 1, [f.name for f in frags])
+        self.assertEqual(frags[0].name, "P2A+EGFP")
+
+    def test_inverted_payload_is_also_one_fragment(self):
+        frags = self._run(-1)
+        self.assertEqual(len(frags), 1, [f.name for f in frags])
+        self.assertEqual(frags[0].name, "EGFP+P2A")
+        # And it spans the whole of both, not just the second.
+        self.assertEqual((frags[0].start, frags[0].end), (100, 883))
+
+
+class TestPinnedSourceAcrossTheOrigin(unittest.TestCase):
+    """A plasmid is a circle; its sequence file has to start somewhere.
+
+    A part can straddle the join between the last base of the file and the
+    first, and a plain substring search reads that file as a line and
+    misses it. Genesis would then tell somebody the plasmid they named
+    does not contain the insert they can see in it, and quietly amplify
+    from somewhere else instead.
+    """
+
+    def _inventory(self, body, circular, cds):
+        """A pinned plasmid holding `body`, plus a catalogued usual source."""
+        conn = connect(":memory:")
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','X',?,'x',?)""",
+            (cds, len(cds))).lastrowid
+        usual = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES ('usual','t',?,?,'u',1,'ok')""",
+            (cds + rand_seq(900, 302), len(cds) + 900)).lastrowid
+        conn.execute(
+            """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                    strand) VALUES (?,?,0,?,1)""", (part, usual, len(cds)))
+        mine = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified) VALUES ('mine','t',?,?,'m',?,'ok')""",
+            (body, len(body), 1 if circular else 0)).lastrowid
+        conn.commit()
+        return conn, part, mine
+
+    def _plan(self, conn, part, mine):
+        from genesis.design import design
+        spec = ConstructSpec.from_dict(
+            {"name": "p", "modules": [{"type": "CDS", "part_id": part}],
+             "source_plasmid_ids": {part: mine}})
+        return design(conn, spec, Config())
+
+    @staticmethod
+    def _chosen(plan):
+        return [s["name"] for m in plan["modules"]
+                for s in (m.get("sources") or [])][:1]
+
+    def test_an_insert_across_the_origin_is_found(self):
+        cds = orf(150, 301)
+        # The part is split by the origin: its tail opens the file, its
+        # head closes it. Reading the file as a line, it is in neither.
+        head, tail = cds[:90], cds[90:]
+        body = tail + rand_seq(700, 303) + head
+        conn, part, mine = self._inventory(body, True, cds)
+        self.assertNotIn(cds, body)          # not there as a plain substring
+        plan = self._plan(conn, part, mine)
+        notes = [w for m in plan["modules"] for w in (m.get("warnings") or [])]
+        self.assertFalse(any("does not contain" in w for w in notes), notes)
+        self.assertEqual(self._chosen(plan), ["mine"], plan["modules"])
+        conn.close()
+
+    def test_the_recorded_span_wraps_rather_than_running_backwards(self):
+        """start stays inside the sequence; end runs past it, as the
+        occurrence table and slice_region both expect."""
+        from genesis.seqtools import slice_region
+        cds = orf(150, 304)
+        head, tail = cds[:90], cds[90:]
+        body = tail + rand_seq(700, 305) + head
+        conn, part, mine = self._inventory(body, True, cds)
+        plan = self._plan(conn, part, mine)
+        # The coding sequence's own source, not the Kozak element that may
+        # now sit in front of it and also come from "mine".
+        src = next(s for m in plan["modules"]
+                   if m.get("type") == "CDS"
+                   for s in (m.get("sources") or []) if s["name"] == "mine")
+        self.assertTrue(0 <= src["start"] < len(body), src)
+        self.assertGreater(src["end"], len(body))
+        self.assertEqual(
+            slice_region(body, src["start"], src["end"], circular=True), cds)
+        conn.close()
+
+    def test_an_ordinary_internal_insert_still_works(self):
+        cds = orf(150, 306)
+        body = rand_seq(300, 307) + cds + rand_seq(600, 308)
+        conn, part, mine = self._inventory(body, True, cds)
+        plan = self._plan(conn, part, mine)
+        self.assertEqual(self._chosen(plan), ["mine"], plan["modules"])
+        conn.close()
+
+    def test_the_reverse_strand_across_the_origin_is_found(self):
+        from genesis.seqtools import revcomp
+        cds = orf(150, 309)
+        other = revcomp(cds)
+        body = other[90:] + rand_seq(700, 310) + other[:90]
+        conn, part, mine = self._inventory(body, True, cds)
+        plan = self._plan(conn, part, mine)
+        self.assertEqual(self._chosen(plan), ["mine"], plan["modules"])
+        # The coding sequence's own source, not the Kozak element that may
+        # now sit in front of it and also come from "mine".
+        src = next(s for m in plan["modules"]
+                   if m.get("type") == "CDS"
+                   for s in (m.get("sources") or []) if s["name"] == "mine")
+        self.assertEqual(src["strand"], -1, src)
+        conn.close()
+
+    def test_a_linear_fragment_does_not_match_across_its_ends(self):
+        """The join only exists on a circle. Reading a linear fragment as
+        one would invent a sequence nobody can amplify."""
+        cds = orf(150, 311)
+        head, tail = cds[:90], cds[90:]
+        body = tail + rand_seq(700, 312) + head
+        conn, part, mine = self._inventory(body, False, cds)
+        plan = self._plan(conn, part, mine)
+        notes = [w for m in plan["modules"] for w in (m.get("warnings") or [])]
+        self.assertTrue(any("does not contain" in w for w in notes), notes)
+        self.assertEqual(self._chosen(plan), ["usual"], plan["modules"])
+        conn.close()
+
+
+class TestWrappedRegionAmplifiesInEitherFrame(unittest.TestCase):
+    """Coordinates for a wrapped region must stay inside the sequence.
+
+    Mapping a region onto the other strand is a subtraction, and on one
+    that wraps the origin the plain subtraction lands before position
+    zero. The slice happened to survive that, because a negative start
+    comes back round under modulo, but the coordinates were reported to
+    the bench as a span starting below zero.
+    """
+
+    def setUp(self):
+        import random
+        rng = random.Random(77)
+        self.tpl = "".join(rng.choice("ACGT") for _ in range(400))
+        self.start, self.end = 370, 425          # 30 bases + 25 bases
+
+    def _want(self):
+        from genesis.seqtools import slice_region
+        return slice_region(self.tpl, self.start, self.end, circular=True)
+
+    def test_the_forward_frame_is_unchanged(self):
+        from genesis.planner import _amplification_frame
+        from genesis.seqtools import slice_region
+        want = self._want()
+        tpl, a, b = _amplification_frame(
+            self.tpl, self.start, self.end, 1, wanted=want, circular=True)
+        self.assertEqual(slice_region(tpl, a, b, circular=True), want)
+
+    def test_the_reverse_frame_yields_the_same_bases(self):
+        from genesis.planner import _amplification_frame
+        from genesis.seqtools import revcomp, slice_region
+        want = revcomp(self._want())
+        tpl, a, b = _amplification_frame(
+            self.tpl, self.start, self.end, -1, wanted=want, circular=True)
+        self.assertEqual(slice_region(tpl, a, b, circular=True), want)
+
+    def test_the_reverse_frame_coordinates_are_not_negative(self):
+        from genesis.planner import _amplification_frame
+        from genesis.seqtools import revcomp
+        tpl, a, b = _amplification_frame(
+            self.tpl, self.start, self.end, -1,
+            wanted=revcomp(self._want()), circular=True)
+        self.assertGreaterEqual(a, 0)
+        self.assertEqual(b - a, self.end - self.start)
+
+
+class TestAddgeneIsSearchOnly(unittest.TestCase):
+    """Searching Addgene never puts an unordered plasmid into a protocol.
+
+    A catalogue number is weeks and a purchase order away from being a
+    tube in a freezer. Letting one compete on cost against something the
+    lab already has would make every route estimate a lie, so what comes
+    back is reported beside the plan and never inside it.
+    """
+
+    def setUp(self):
+        import genesis.addgene as ag
+        import tempfile
+        self.ag = ag
+        self._env = os.environ.pop("GENESIS_ADDGENE_TOKEN", None)
+        # The cache lives beside the database, so a test that did not say
+        # where that is would write into the real ~/.genesis and hand the
+        # next test an answer it never asked for.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config()
+        self.cfg.db_path = os.path.join(self._tmp.name, "genesis.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        if self._env is not None:
+            os.environ["GENESIS_ADDGENE_TOKEN"] = self._env
+        else:
+            os.environ.pop("GENESIS_ADDGENE_TOKEN", None)
+
+    def test_without_a_token_it_refuses_rather_than_scraping(self):
+        with self.assertRaises(self.ag.AddgeneUnavailable) as caught:
+            self.ag.search("ASAP7y", cfg=self.cfg)
+        self.assertIn("token", str(caught.exception))
+
+    def test_it_offers_a_browsable_url_instead(self):
+        url = self.ag.search_url("P2A-EGFP")
+        self.assertTrue(url.startswith("https://www.addgene.org/"))
+        self.assertIn("P2A-EGFP", urllib.parse.unquote(url))
+
+    def test_a_missing_part_reports_why_rather_than_an_empty_list(self):
+        out = self.ag.suggest_for_missing(["Nonesuch7z"], cfg=self.cfg)
+        self.assertEqual(out["Nonesuch7z"]["results"], [])
+        self.assertIn("token", out["Nonesuch7z"]["unavailable"])
+        self.assertTrue(out["Nonesuch7z"]["browse"])
+
+    def test_the_token_comes_from_the_environment_first(self):
+        cfg = self.cfg
+        cfg.addgene_token = "from-config"
+        self.assertEqual(self.ag.token(cfg), "from-config")
+        os.environ["GENESIS_ADDGENE_TOKEN"] = "from-env"
+        self.assertEqual(self.ag.token(cfg), "from-env")
+
+    def test_a_scan_without_a_token_does_not_touch_the_network(self):
+        """An offline lab must get exactly the scan it got before."""
+        def explode(*a, **k):
+            raise AssertionError("the network was touched")
+        original = self.ag._request
+        self.ag._request = explode
+        try:
+            from genesis.design import _offer_to_order
+            candidates = {"donors": [{"covers": ["Xa"], "options": []}]}
+            _offer_to_order(candidates, self.cfg)
+        finally:
+            self.ag._request = original
+        self.assertNotIn("to_order", candidates)
+        self.assertIn("developers.addgene.org", candidates["to_order_hint"])
+
+    def test_results_are_reported_beside_the_plan_not_as_donors(self):
+        from genesis.design import _offer_to_order
+        cfg = self.cfg
+        os.environ["GENESIS_ADDGENE_TOKEN"] = "pretend"
+        original = self.ag._request
+        self.ag._request = lambda path, params, key: {"results": [{
+            "id": 12345, "name": "pAAV-hSyn-Thing",
+            "url": "https://www.addgene.org/12345/",
+            "depositor": ["A Lab"], "inserts": [], "cloning": {},
+            "bacterial_resistance": "Ampicillin", "article": {}}]}
+        try:
+            donor = {"covers": ["Xb"], "options": []}
+            candidates = {"donors": [donor]}
+            _offer_to_order(candidates, cfg)
+        finally:
+            self.ag._request = original
+        # Reported...
+        self.assertEqual(
+            candidates["to_order"]["Xb"]["results"][0]["id"], 12345)
+        # ...and the donor is still empty, so no route can amplify from it.
+        self.assertEqual(donor["options"], [])
+
+    def test_a_search_failure_never_fails_the_scan(self):
+        from genesis.design import _offer_to_order
+        os.environ["GENESIS_ADDGENE_TOKEN"] = "pretend"
+        original = self.ag._request
+        self.ag._request = lambda *a, **k: (_ for _ in ()).throw(
+            self.ag.AddgeneUnavailable("Addgene is down"))
+        try:
+            candidates = {"donors": [{"covers": ["Xc"], "options": []}]}
+            _offer_to_order(candidates, self.cfg)
+        finally:
+            self.ag._request = original
+        self.assertEqual(candidates["to_order"]["Xc"]["results"], [])
+        self.assertIn("down", candidates["to_order"]["Xc"]["unavailable"])
+
+
+class TestASwapMustReplaceThePayload(unittest.TestCase):
+    """Removing too little leaves the old indicator in the plasmid.
+
+    A request for CAG - ASAP7y against a pAAV-CAG-Voltron2 recipient cut
+    16 bp out of it - the Kozak between the promoter and the coding
+    sequence - and put ASAP7y in there, leaving Voltron-2, Ace2N and
+    HaloTag sitting between the new gene and the WPRE. Every presence
+    check passed, because every part that was asked for really was in the
+    product, and the plasmid was ruined anyway.
+    """
+
+    def _recipient(self, conn, prom, payload):
+        body = (rand_seq(140, 401) + prom + rand_seq(16, 402) + payload
+                + rand_seq(600, 403))
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('recipient','t',?,?,'r',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at_p = body.find(prom)
+        at_x = body.find(payload)
+        rows = [("promoter", "CAG", at_p, at_p + len(prom)),
+                ("unknown", "Kozak sequence", at_p + len(prom),
+                 at_p + len(prom) + 16),
+                ("CDS", "Voltron-2", at_x, at_x + len(payload)),
+                ("WPRE", "WPRE", at_x + len(payload),
+                 at_x + len(payload) + 300),
+                ("origin", "ori", len(body) - 200, len(body) - 100),
+                ("resistance", "AmpR", len(body) - 100, len(body))]
+        for ftype, nm, a, b in rows:
+            conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        start, end, strand) VALUES (?,?,?,?,?,1)""",
+                (pid, ftype, nm, a, b))
+        conn.commit()
+        return pid, body
+
+    def test_the_whole_payload_is_removed_not_the_gap_before_it(self):
+        from genesis.swap import _payload_end, _annotations
+        conn = connect(":memory:")
+        prom, payload = rand_seq(400, 404), orf(900, 405)
+        pid, body = self._recipient(conn, prom, payload)
+        annots = _annotations(conn, pid)
+        start = body.find(prom) + len(prom)
+        end = _payload_end(annots, start, len(body))
+        # It must reach past the Kozak and take the whole coding sequence.
+        self.assertEqual(end, body.find(payload) + len(payload),
+                         f"stopped at {end}, payload ends at "
+                         f"{body.find(payload) + len(payload)}")
+        conn.close()
+
+    def test_it_stops_at_the_wpre_rather_than_eating_the_vector(self):
+        from genesis.swap import _payload_end, _annotations
+        conn = connect(":memory:")
+        prom, payload = rand_seq(400, 406), orf(900, 407)
+        pid, body = self._recipient(conn, prom, payload)
+        annots = _annotations(conn, pid)
+        start = body.find(prom) + len(prom)
+        end = _payload_end(annots, start, len(body))
+        wpre_start = body.find(payload) + len(payload)
+        self.assertLessEqual(end, wpre_start)
+        conn.close()
+
+    def test_furniture_alone_is_not_a_payload(self):
+        """A Kozak with no coding sequence after it is nothing to replace."""
+        from genesis.swap import _payload_end
+        annots = [{"feature_type": "unknown", "name": "Kozak sequence",
+                   "start": 100, "end": 116, "strand": 1},
+                  {"feature_type": "WPRE", "name": "WPRE",
+                   "start": 130, "end": 700, "strand": 1}]
+        self.assertEqual(_payload_end(annots, 100, 5000), 100)
+
+
+class TestTheProductMustNotCarryWhatWasNotAskedFor(unittest.TestCase):
+    """Presence checks alone cannot see what came along for the ride."""
+
+    def test_a_leftover_coding_sequence_fails_the_simulation(self):
+        from genesis.simulate import _check_leftovers, SimulationResult
+        conn = connect(":memory:")
+        old, new = orf(900, 411), orf(600, 412)
+        body = rand_seq(100, 413) + old + rand_seq(100, 414)
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('parent','t',?,?,'p',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at = body.find(old)
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand) VALUES (?,'CDS','Voltron-2',?,?,1)""",
+            (pid, at, at + len(old)))
+        conn.commit()
+
+        # A product that kept the old payload as well as taking the new one.
+        product = body + new
+        result = SimulationResult()
+        plan = {"backbone": {"id": pid, "name": "parent"},
+                "modules": [{"part_name": "ASAP7y", "seq": new}]}
+        _check_leftovers(result, product, plan, conn)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Voltron-2" in p for p in result.problems),
+                        result.problems)
+        conn.close()
+
+    def test_a_clean_replacement_passes(self):
+        from genesis.simulate import _check_leftovers, SimulationResult
+        conn = connect(":memory:")
+        old, new = orf(900, 415), orf(600, 416)
+        body = rand_seq(100, 417) + old + rand_seq(100, 418)
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('parent','t',?,?,'p',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at = body.find(old)
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand) VALUES (?,'CDS','Voltron-2',?,?,1)""",
+            (pid, at, at + len(old)))
+        conn.commit()
+        product = body.replace(old, new)       # the payload really replaced
+        result = SimulationResult()
+        plan = {"backbone": {"id": pid, "name": "parent"},
+                "modules": [{"part_name": "ASAP7y", "seq": new}]}
+        _check_leftovers(result, product, plan, conn)
+        self.assertTrue(result.passed, result.problems)
+        conn.close()
+
+    def test_a_part_that_was_asked_for_is_not_a_leftover(self):
+        from genesis.simulate import _check_leftovers, SimulationResult
+        conn = connect(":memory:")
+        keep = orf(900, 419)
+        body = rand_seq(100, 420) + keep + rand_seq(100, 421)
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('parent','t',?,?,'p',1,'unverified')""",
+            (body, len(body))).lastrowid
+        at = body.find(keep)
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand) VALUES (?,'CDS','ASAP7y',?,?,1)""",
+            (pid, at, at + len(keep)))
+        conn.commit()
+        result = SimulationResult()
+        plan = {"backbone": {"id": pid, "name": "parent"},
+                "modules": [{"part_name": "ASAP7y", "seq": keep}]}
+        _check_leftovers(result, body, plan, conn)
+        self.assertTrue(result.passed, result.problems)
+        conn.close()
+
+
+class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
+    """Smallness decides between donors that hold the same thing."""
+
+    def test_a_relative_never_outranks_the_real_part(self):
+        from genesis.swap import find_donors
+        conn = connect(":memory:")
+        want = orf(1200, 431)
+        relative = want[:500] + orf(90, 432) + want[590:]
+        parts = {}
+        for nm, sq in (("ASAP7y", want), ("ASAP3", relative)):
+            parts[nm] = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (nm, sq, nm, len(sq))).lastrowid
+
+        def plasmid(name, body, part):
+            pid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified, available_template)
+                   VALUES (?,'t',?,?,?,1,'unverified',1)""",
+                (name, body, len(body), name)).lastrowid
+            at = body.find(part[1])
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,1)""",
+                (parts[part[0]], pid, at, at + len(part[1])))
+            for ftype, nm in (("origin", "ori"), ("resistance", "AmpR")):
+                conn.execute(
+                    """INSERT INTO annotation(plasmid_id, feature_type, name,
+                            start, end, strand) VALUES (?,?,?,0,30,1)""",
+                    (pid, ftype, nm))
+            conn.commit()
+            return pid
+
+        # The relative sits in a smaller plasmid, which used to win.
+        small = plasmid("small-ASAP3", relative + rand_seq(600, 433),
+                        ("ASAP3", relative))
+        right = plasmid("bigger-ASAP7y", want + rand_seq(3000, 434),
+                        ("ASAP7y", want))
+        donors = find_donors(conn, [parts["ASAP7y"], parts["ASAP3"]],
+                             exact_ids={parts["ASAP7y"]})
+        self.assertEqual(donors[0].plasmid_id, right,
+                         [d.name for d in donors])
+        self.assertTrue(any("has the part itself" in r
+                            for r in donors[0].reasons), donors[0].reasons)
+        self.assertEqual(donors[1].plasmid_id, small)
+        self.assertTrue(any("not the part" in r for r in donors[1].reasons))
+        conn.close()
+
+
+class TestPrimerSiteMovesToBetterBases(unittest.TestCase):
+    """A junction is where the DNA joins, not where a primer must bind.
+
+    The annealing site used to be fixed at the fragment boundary and only
+    its length could change, so a junction in an AT-rich stretch gave a
+    primer that was reported as too cold and used anyway. The site may now
+    move into the fragment, with the bases it steps over carried on the
+    tail - which leaves the product identical and only lengthens the oligo.
+    """
+
+    def setUp(self):
+        import random
+        rng = random.Random(909)
+        # An AT-rich mouth followed by balanced sequence, so moving in is
+        # the only way to reach NEB's 40-60% band.
+        poor = "".join(rng.choice("ATATATATGC") for _ in range(40))
+        good = "".join(rng.choice("ACGT") for _ in range(3000))
+        self.template = poor + good
+        self.up = "".join(rng.choice("ACGT") for _ in range(300))
+        self.dn = "".join(rng.choice("ACGT") for _ in range(300))
+
+    def _pair(self, shift):
+        from genesis.primers import design_gibson_pair
+        cfg = Config()
+        cfg.primer_max_shift = shift
+        return design_gibson_pair(0, "frag", self.template, 0, 1500,
+                                  self.up, self.dn, cfg,
+                                  carry_downstream=False), cfg
+
+    def test_the_product_is_unchanged_by_the_shift(self):
+        from genesis.seqtools import revcomp
+        products = []
+        for shift in (0, 15):
+            (f, r), _ = self._pair(shift)
+            at = self.template.find(f.anneal)
+            rc_at = self.template.find(revcomp(r.anneal))
+            products.append(f.sequence
+                            + self.template[at + len(f.anneal):rc_at]
+                            + revcomp(r.sequence))
+        self.assertEqual(products[0], products[1])
+
+    def test_it_reaches_better_bases_than_the_boundary_offers(self):
+        from genesis.seqtools import gc_fraction
+        (f0, _), _ = self._pair(0)
+        (f1, _), _ = self._pair(15)
+        self.assertGreater(gc_fraction(f1.anneal), gc_fraction(f0.anneal))
+
+    def test_the_bases_stepped_over_are_on_the_tail(self):
+        (f, _), _ = self._pair(15)
+        self.assertEqual(f.sequence, f.tail + f.anneal)
+        at = self.template.find(f.anneal)
+        self.assertTrue(f.tail.endswith(self.template[:at]), f.tail)
+
+    def test_moving_the_site_is_said_out_loud(self):
+        (f, _), _ = self._pair(15)
+        self.assertTrue(any("moved" in w for w in f.warnings), f.warnings)
+
+
+class TestEveryPieceInTheTubeIsDrawable(unittest.TestCase):
+    """Where each piece came from, and where it ended up.
+
+    ``sources`` is what the Routes figure draws from. It was zipped
+    against ``products`` by position, and the two lists stop running in
+    parallel the moment a route orders a fragment or cuts a plasmid: an
+    ordered gBlock produced a molecule with no source at all - so
+    synthesis was simply missing from the drawing - and the entries that
+    were left got paired with somebody else's sequence and placed in the
+    wrong arc of the product.
+    """
+
+    def test_a_cut_band_knows_where_it_lands(self):
+        """A two-plasmid digest runs no PCR, so ``products`` is empty and
+        zipping the sources against it placed neither band."""
+        from genesis import simulate
+        rng = random.Random(77)
+        filler = lambda n: "".join(rng.choice("ACGT") for _ in range(n))
+        # GGATCC = BamHI, AAGCTT = HindIII
+        vector = filler(200) + "GGATCC" + filler(2400) + "AAGCTT" + filler(200)
+        donor = filler(150) + "GGATCC" + filler(800) + "AAGCTT" + filler(150)
+        conn = connect(":memory:")
+        for i, (name, seq) in enumerate((("pVec", vector), ("pDon", donor))):
+            conn.execute("INSERT INTO plasmid (name, seq, seq_length, "
+                         "circular, seq_checksum) VALUES (?,?,?,1,?)",
+                         (name, seq, len(seq), "ck-band-%d" % i))
+        vid = conn.execute("SELECT id FROM plasmid WHERE name='pVec'"
+                           ).fetchone()["id"]
+        did = conn.execute("SELECT id FROM plasmid WHERE name='pDon'"
+                           ).fetchone()["id"]
+        plan = {"backbone": {"id": vid}, "modules": [], "fragments": [],
+                "swap": {"recipient": {"id": vid}, "donor": {"id": did}},
+                "construct": {"length": 0}}
+        route = {"id": "restriction", "primers": [], "steps": [
+            {"operation": "RE_DIGEST", "inputs": ["pVec"],
+             "details": {"enzymes": ["BamHI", "HindIII"]}},
+            {"operation": "RE_DIGEST", "inputs": ["pDon"],
+             "details": {"enzymes": ["BamHI", "HindIII"]}},
+            {"operation": "LIGATION", "inputs": ["pVec", "pDon"]}]}
+        result = simulate.simulate_route(conn, plan, route)
+        self.assertTrue(result.product_bp, result.problems)
+        self.assertEqual(len(result.sources), 2, result.sources)
+        for src in result.sources:
+            self.assertIn("at_start", src,
+                          "%s was never located in the product" % src["name"])
+        # and they land in different places, which is the point of drawing them
+        self.assertNotEqual(result.sources[0]["at_start"],
+                            result.sources[1]["at_start"])
+        conn.close()
+
+    def test_an_ordered_fragment_is_a_source(self):
+        """Nothing drew the synthesis step, because it had no source."""
+        from genesis import simulate
+        conn = connect(":memory:")
+        vector, insert = rand_seq(2000, 23), rand_seq(900, 24)
+        # a vector amplified end to end, closed by an ordered insert that
+        # shares 25 bp with each of its ends
+        arm_l, arm_r = vector[-25:], vector[:25]
+        ordered = arm_l + insert + arm_r
+        conn.execute("INSERT INTO plasmid (name, seq, seq_length, circular, "
+                     "seq_checksum) VALUES (?,?,?,1,?)",
+                     ("host", vector, len(vector), "ck-order-1"))
+        pid = conn.execute("SELECT id FROM plasmid").fetchone()["id"]
+        plan = {"backbone": {"id": pid}, "modules": [], "fragments": [],
+                "construct": {"length": len(vector) + len(insert)}}
+        route = {
+            "id": "gblock",
+            "steps": [
+                {"operation": "SYNTHESIS", "output": "synthetic insert",
+                 "details": {"sequence": ordered, "length": len(ordered)}},
+                {"operation": "PCR", "output": "vector amplicon",
+                 "inputs": ["host", "v-F+v-R"],
+                 "details": {"template": "host"}},
+                {"operation": "HI_FI_ASSEMBLY",
+                 "inputs": ["vector amplicon", "synthetic insert"]},
+            ],
+            "primers": [
+                {"name": "v-F", "direction": "F", "template": "backbone",
+                 "tail": "", "anneal": vector[:20],
+                 "target_start": 0, "target_end": len(vector)},
+                {"name": "v-R", "direction": "R", "template": "backbone",
+                 "tail": "", "anneal": _rc(vector[-20:])},
+            ],
+        }
+        result = simulate.simulate_route(conn, plan, route)
+        names = [s["name"] for s in result.sources]
+        self.assertIn("synthetic insert", names,
+                      "the ordered fragment has to be drawable too")
+        ordered_src = [s for s in result.sources
+                       if s["name"] == "synthetic insert"][0]
+        self.assertTrue(ordered_src.get("synthesised"))
+        self.assertEqual(ordered_src["bp"], len(ordered))
+        self.assertIn("at_start", ordered_src,
+                      "a source with no place in the product cannot be drawn")
+        conn.close()
+
+    def test_the_locating_sequence_does_not_reach_the_browser(self):
+        """A plan carries a dozen sources; shipping each one's bases
+        would roughly double the size of every response."""
+        from genesis.simulate import SimulationResult
+        result = SimulationResult()
+        result.sources = [{"name": "a", "bp": 3, "seq": "ACGT" * 500}]
+        d = result.to_dict()
+        self.assertNotIn("seq", d["sources"][0])
+        self.assertEqual(d["sources"][0]["name"], "a")
+
+
+class TestDpnIIsActuallySimulated(unittest.TestCase):
+    """The step claims two things; both are now checked, not assumed.
+
+    The simulation never put the template in the tube, so DpnI had
+    nothing to act on and was skipped as a no-op. "The template is
+    removed" was therefore an assumption the simulation inherited from
+    the plan rather than a result it produced.
+    """
+
+    def test_dpni_cuts_a_plasmid_and_not_the_product_off_it(self):
+        """The same GATC, two different answers - which is the whole
+        mechanism, and is wrong if the model ignores methylation."""
+        from genesis.enzymes import digest
+        seq = ("GATC" + rand_seq(300, 41)) * 8
+        cut = digest(seq, ["DpnI"], circular=True, methylated=True)
+        self.assertGreaterEqual(len(cut), 8)
+        # the amplicon carries the same sites and is made in vitro
+        whole = digest(seq, ["DpnI"], circular=False, methylated=False)
+        self.assertEqual(len(whole), 1, "a PCR product is unmethylated; "
+                                        "DpnI must leave it alone")
+        self.assertEqual(whole[0].seq, seq)
+
+    def test_dpni_leaves_blunt_ends(self):
+        from genesis.enzymes import CATALOG
+        self.assertEqual(CATALOG["DpnI"].overhang_len, 0)
+        self.assertTrue(CATALOG["DpnI"].dam_dependent)
+
+    def _route(self, template_seq):
+        """A one-PCR route whose template is `template_seq`."""
+        conn = connect(":memory:")
+        conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular) VALUES ('pT','t',?,?,'dsim',1)""",
+            (template_seq, len(template_seq)))
+        pid = conn.execute("SELECT id FROM plasmid").fetchone()["id"]
+        plan = {"backbone": {"id": pid}, "modules": [], "fragments": [],
+                "construct": {"length": len(template_seq)}}
+        arm_l, arm_r = template_seq[-25:], template_seq[:25]
+        route = {"id": "r", "steps": [
+            {"operation": "PCR", "output": "vector amplicon",
+             "inputs": ["pT", "v-F+v-R"], "details": {"template": "pT"}},
+            {"operation": "DPNI_DIGEST", "output": "template-free"},
+            {"operation": "SYNTHESIS", "output": "insert",
+             "details": {"sequence": arm_l + rand_seq(400, 42) + arm_r}},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": ["vector", "insert"]}],
+            "primers": [
+                {"name": "v-F", "direction": "F", "template": "backbone",
+                 "tail": "", "anneal": template_seq[:20],
+                 "target_start": 0, "target_end": len(template_seq)},
+                {"name": "v-R", "direction": "R", "template": "backbone",
+                 "tail": "", "anneal": _rc(template_seq[-20:])}]}
+        return conn, plan, route
+
+    def test_the_simulation_reports_the_template_being_destroyed(self):
+        from genesis import simulate
+        conn, plan, route = self._route(("GATC" + rand_seq(300, 43)) * 8)
+        result = simulate.simulate_route(conn, plan, route)
+        notes = [x for x in result.steps
+                 if x.get("operation") == "DPNI_DIGEST"]
+        self.assertTrue(notes, "the DpnI step was not replayed")
+        self.assertIn("cut into", notes[0]["note"])
+        self.assertGreaterEqual(notes[0]["pieces"], 8)
+        conn.close()
+
+    def test_a_template_dpni_cannot_cut_is_reported_as_surviving(self):
+        """Not a wrong molecule - a wrong plate. The simulation used to
+        be silent about it because it never ran the step."""
+        from genesis import simulate
+        conn, plan, route = self._route("ACGTTGCA" * 300)   # no GATC
+        result = simulate.simulate_route(conn, plan, route)
+        self.assertTrue(any("does not cut" in w and "survives" in w
+                            for w in result.warnings), result.warnings)
+        conn.close()
+
+    def test_a_single_site_only_linearises_and_says_so(self):
+        from genesis import simulate
+        conn, plan, route = self._route("ACGTTGCA" * 150 + "GATC"
+                                        + "ACGTTGCA" * 150)
+        result = simulate.simulate_route(conn, plan, route)
+        self.assertTrue(any("only linearises" in w for w in result.warnings),
+                        result.warnings)
+        conn.close()
+
+
+class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
+    """DpnI reads methylation, not a rare sequence.
+
+    A plasmid grown in a dam+ strain carries a methyl group on every
+    GATC, so a template with thirty of them is cut into thirty pieces
+    and cannot transform, while the PCR product off it - built from
+    unmethylated dNTPs - is untouched. Many sites is the mechanism. No
+    sites and the step is theatre, which is the case nothing checked:
+    dpni_decision's docstring claimed to skip a template DpnI cannot
+    cut, and the code never looked.
+    """
+
+    def _db(self, template_seq, product_marker="AmpR",
+            template_marker="AmpR"):
+        conn = connect(":memory:")
+        tid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular) VALUES ('pTpl','t',?,?,'dp1',1)""",
+            (template_seq, len(template_seq))).lastrowid
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular) VALUES ('pProd','t',?,?,'dp2',1)""",
+            ("ACGT" * 500, 2000)).lastrowid
+        for plasmid, marker in ((tid, template_marker), (pid, product_marker)):
+            if marker:
+                conn.execute(
+                    """INSERT INTO annotation(plasmid_id, name, feature_type,
+                            start, end, strand) VALUES (?,?,'resistance',0,10,1)""",
+                    (plasmid, marker))
+        conn.commit()
+        return conn, tid, pid
+
+    def test_sites_are_counted_around_the_circle(self):
+        from genesis.enzymes import dam_sites
+        self.assertEqual(dam_sites("GATCAAAAGATC"), 2)
+        # a site split across the origin is still a site
+        self.assertEqual(dam_sites("TCAAAAAAGA", circular=True), 1)
+        self.assertEqual(dam_sites("TCAAAAAAGA", circular=False), 0)
+
+    def test_a_template_with_no_gatc_cannot_be_cut(self):
+        from genesis.planner import dpni_decision
+        conn, tid, pid = self._db("ACGTACGTAC" * 200)   # no GATC anywhere
+        d = dpni_decision(conn, [tid], pid, gel_purified=False)
+        self.assertFalse(d["needed"], d["reason"])
+        self.assertIn("GATC", d["reason"])
+        self.assertEqual(d["uncuttable"], ["pTpl"])
+        self.assertEqual(d["sites"], {"pTpl": 0})
+        conn.close()
+
+    def test_a_normal_plasmid_is_cut_many_times_and_dpni_stays(self):
+        from genesis.planner import dpni_decision, dpni_note
+        conn, tid, pid = self._db(("GATC" + rand_seq(250, 8)) * 20)
+        d = dpni_decision(conn, [tid], pid, gel_purified=False)
+        self.assertTrue(d["needed"], d["reason"])
+        self.assertGreaterEqual(d["sites"]["pTpl"], 20)
+        self.assertEqual(d["uncuttable"], [])
+        # the count is what answers "why is it cutting everywhere?"
+        note = dpni_note(d)
+        self.assertIn("GATC site", note)
+        self.assertIn("unmethylated", note)
+        conn.close()
+
+    def test_a_different_marker_still_skips_it(self):
+        """The GATC check must not override the cheaper reasons."""
+        from genesis.planner import dpni_decision
+        conn, tid, pid = self._db(("GATC" + rand_seq(250, 9)) * 20,
+                                  product_marker="KanR",
+                                  template_marker="AmpR")
+        d = dpni_decision(conn, [tid], pid, gel_purified=False)
+        self.assertFalse(d["needed"])
+        self.assertIn("antibiotic", d["reason"])
+        conn.close()
+
+    def test_the_step_carries_the_count_into_the_protocol(self):
+        """The question this answers - "my plasmid has dozens of DpnI
+        sites, why is that fine?" - needs the number on the page."""
+        import hashlib
+        from genesis.export import protocol_pdf
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'dpbb',1,'sequence_verified')""",
+            ("GAATTC" + ("GATC" + rand_seq(120, 320)) * 20,
+             6 + 124 * 20)).lastrowid
+        seq = orf(150, 321)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'dpd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 322), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("dpni test", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]), cfg)
+        drawn = pdf_text(protocol_pdf(plan, cfg))
+        self.assertIn(b"GATC site", drawn)
+        self.assertIn(b"unmethylated dNTPs", drawn)
+        conn.close()
+
+
+class TestTheChecksAreOfferedNotDemanded(unittest.TestCase):
+    """A checkpoint gel is worth running and is not required.
+
+    Skipping one does not stop the cloning; it only moves the moment
+    you find out. So the step says optional, and its bench time is
+    reported apart from the hours the protocol actually demands.
+    """
+
+    def test_the_operation_is_marked_optional(self):
+        from genesis.operations import OPERATIONS
+        self.assertTrue(OPERATIONS["QC_GEL"].optional)
+        for code in ("PCR", "HI_FI_ASSEMBLY", "TRANSFORMATION"):
+            self.assertFalse(OPERATIONS[code].optional, code)
+
+    def test_every_checkpoint_says_so_in_its_title(self):
+        from genesis.checkpoints import for_route
+        marks = for_route({"steps": [
+            {"operation": "PCR", "output": "a amplicon",
+             "details": {"length": 900, "template": "pA"}},
+            {"operation": "RE_DIGEST", "inputs": ["pA", "EcoRI, BamHI"]},
+            {"operation": "LIGATION", "inputs": []}]}, {"pA": 4000})
+        self.assertTrue(marks)
+        for _i, check in marks:
+            self.assertTrue(check.title.lower().startswith("optional"),
+                            check.title)
+
+    def test_optional_time_is_not_in_the_headline(self):
+        from genesis.operations import Step
+        from genesis.planner import Route
+        from genesis.config import Config
+        route = Route(id="r", strategy="hifi", title="t", steps=[
+            Step(1, "PCR", "amplify"),
+            Step(2, "QC_GEL", "Optional: check it"),
+        ])
+        d = route.to_dict(Config())
+        pcr = 20            # PCR hands-on, from the operation library
+        self.assertEqual(d["hands_on_minutes"], pcr)
+        self.assertEqual(d["optional_minutes"], 20)
+        self.assertEqual(d["n_optional"], 1)
+        self.assertEqual(d["n_steps"], 2)
+
+    def test_the_tallies_are_recounted_after_the_checks_go_in(self):
+        """They were computed when the route was serialised, which was
+        before these steps existed - so the protocol printed a list of
+        ten under a heading that said eight."""
+        from genesis.design import _recount
+        route = {"steps": [
+            {"operation": "PCR", "hands_on": 20, "minutes": 90},
+            {"operation": "QC_GEL", "hands_on": 20, "minutes": 45,
+             "optional": True},
+            {"operation": "HI_FI_ASSEMBLY", "hands_on": 15, "minutes": 60},
+        ]}
+        _recount(route)
+        self.assertEqual(route["n_steps"], 3)
+        self.assertEqual(route["n_optional"], 1)
+        self.assertEqual(route["hands_on_minutes"], 35)
+        self.assertEqual(route["optional_minutes"], 20)
+
+
+class TestThePrimerOrderGoesStraightToIDT(unittest.TestCase):
+    """Four columns, and nothing else, or the upload fails."""
+
+    PLAN = {"routes": [{"id": "r", "primers": [
+        {"name": "backbone2-F", "sequence": "ACGT" * 11},     # 44 nt
+        {"name": "long-R", "sequence": "ACGT" * 18},          # 72 nt
+        {"name": "very,long-F", "sequence": "ACGT" * 25},     # 100 nt
+    ]}]}
+
+    def test_the_header_is_the_one_idt_expects(self):
+        from genesis.export import primer_order_csv
+        first = primer_order_csv(self.PLAN).splitlines()[0]
+        self.assertEqual(first, "Name,Sequence,Scale,Purification")
+
+    def test_every_row_has_exactly_four_fields(self):
+        from genesis.export import primer_order_csv
+        for line in primer_order_csv(self.PLAN).strip().splitlines()[1:]:
+            self.assertEqual(len(line.split(",")), 4, line)
+
+    def test_a_comma_in_a_name_does_not_shift_the_columns(self):
+        from genesis.export import primer_order_csv
+        rows = primer_order_csv(self.PLAN).strip().splitlines()[1:]
+        self.assertTrue(any(r.startswith("very-long-F") for r in rows), rows)
+
+    def test_the_scale_follows_the_length(self):
+        """IDT will not make a 25 nmole oligo past 60 bases."""
+        from genesis.export import idt_scale, idt_purification
+        self.assertEqual(idt_scale(44), "25nm")
+        self.assertEqual(idt_scale(60), "25nm")
+        self.assertEqual(idt_scale(61), "100nm")
+        self.assertEqual(idt_scale(95), "250nm")
+        # and a long assembly primer is worth purifying: a truncated
+        # chain still anneals, and then seeds a deletion
+        self.assertEqual(idt_purification(44), "STD")
+        self.assertEqual(idt_purification(72), "PAGE")
+
+    def test_the_sequence_is_the_whole_primer_in_upper_case(self):
+        """The tail is lower case in the analysis table because it does
+        not anneal; an order is just bases."""
+        from genesis.export import primer_order_csv
+        plan = {"routes": [{"id": "r", "primers": [
+            {"name": "p", "sequence": "acgtACGT", "tail": "acgt",
+             "anneal": "ACGT"}]}]}
+        row = primer_order_csv(plan).strip().splitlines()[1]
+        self.assertEqual(row.split(",")[1], "ACGTACGT")
+
+
+class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
+    """The protocol runs on master mixes.
+
+    Listing "5x reaction buffer, 10 mM dNTPs, high-fidelity DNA
+    polymerase" as three line items is a shopping list for a reaction
+    nobody is setting up: those are inside the Q5 tube.
+    """
+
+    def _reagents(self):
+        import hashlib
+        from genesis.protocol import build_protocol
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'rgbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 350), 2506)).lastrowid
+        seq = orf(150, 351)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'rgd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 352), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("rg", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        out = build_protocol(plan, cfg)["reagents"]
+        conn.close()
+        return [i.lower() for i, _a in out]
+
+    def test_the_master_mix_replaces_its_own_components(self):
+        items = self._reagents()
+        self.assertTrue(any("q5" in i and "master mix" in i for i in items))
+        for gone in ("5x high-fidelity reaction buffer", "10 mm dntps",
+                     "high-fidelity dna polymerase"):
+            self.assertNotIn(gone, items,
+                             f"{gone} is inside the master mix")
+
+    def test_a_polymerase_is_only_ordered_for_the_branch_that_needs_one(self):
+        """The screen is a colony PCR or a diagnostic digest. The
+        digest reads size and orientation off a miniprep with an enzyme
+        already in the freezer, and needs no polymerase at all."""
+        import hashlib
+        from genesis.protocol import build_protocol
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'scbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 360), 2506)).lastrowid
+        seq = orf(150, 361)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'scd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 362), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("sc", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        p = build_protocol(plan, cfg)
+        enzyme = next(((s.get("details") or {}).get("diagnostic_enzyme")
+                       for s in p["steps"]
+                       if s["operation"] == "COLONY_SCREEN"), None)
+        taq = [i for i, _a in p["reagents"] if "taq" in i.lower()]
+        conn.close()
+        if not enzyme:
+            self.assertTrue(taq, "colony PCR is the only screen here")
+            return
+        self.assertTrue(taq)
+        self.assertTrue(all("colony PCR only" in i for i in taq),
+                        "Taq is for one branch of the screen, not both")
+        self.assertTrue(
+            any(enzyme in i and "digest only" in i
+                for i, _a in p["reagents"]),
+            "the other branch needs the enzyme and no polymerase")
+
+    def test_the_screening_polymerase_is_the_one_they_own(self):
+        from genesis.reagents import for_operation
+        screen = for_operation("COLONY_SCREEN")
+        self.assertIsNotNone(screen)
+        self.assertEqual(screen.catalogue, "76620-472")
+        joined = " ".join(screen.notes)
+        self.assertIn("Q5", joined)          # says the alternative
+        self.assertIn("No polymerase at all", joined)
+
+    def test_what_is_left_is_what_you_add_to_it(self):
+        items = self._reagents()
+        for wanted in ("forward primer", "plasmid template",
+                       "nuclease-free water"):
+            self.assertTrue(any(wanted in i for i in items), wanted)
+
+
+class TestTheInventoryCanBeRefreshedFromTheApp(unittest.TestCase):
+    """The inventory is a snapshot, and a snapshot goes stale.
+
+    pPH003 was saved to the share on 19 October; the last scan was on
+    the 8th. From the design side that looks like Genesis having lost
+    a plasmid, and the only way to fix it was a terminal and the right
+    command.
+    """
+
+    def test_the_endpoint_exists_and_writes_so_needs_a_role(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "server.py").read_text()
+        self.assertIn('"/api/rescan/stream"', src)
+        self.assertIn('"/api/rescan/stream": "member"', src,
+                      "re-reading the share writes to the shared inventory")
+
+    def test_it_says_so_rather_than_failing_when_the_share_is_away(self):
+        """A laptop off the VPN is the common case, and "is not
+        reachable - is the share mounted?" is the answer to it."""
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "server.py").read_text()
+        self.assertIn("share mounted?", src)
+        self.assertIn("os.path.isdir(root)", src)
+
+    def test_the_refresh_is_both_passes(self):
+        """A scan picks up the file; inferring the ORFs is what makes
+        a new plasmid usable as a donor."""
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "server.py").read_text()
+        start = src.index("def rescan_stream")
+        body = src[start:src.index("def design_stream")]
+        self.assertIn("import_tree", body)
+        self.assertIn("infer_all", body)
+
+    def test_the_button_is_on_the_inventory_tab(self):
+        root = Path(__file__).resolve().parent.parent / "web"
+        html = (root / "index.html").read_text()
+        app = (root / "app.js").read_text()
+        self.assertIn('id="inv-rescan"', html)
+        self.assertIn("function rescanShare", app)
+        # and it redraws the table afterwards, or the new plasmid is
+        # in the database and not on the screen
+        tail = app[app.index("async function rescanShare"):]
+        self.assertIn("renderInventory()", tail[:tail.index("async function showPartSources")])
+
+
+class TestAJoinIsNotEveryBoundary(unittest.TestCase):
+    """Two different things were being called a junction.
+
+    A join is where two amplicons meet, and only there is there an
+    overlap arm whose GC and Tm decide whether the assembly works. A
+    boundary between two annotated elements matters for the reading
+    frame and is usually in the middle of one PCR product, with no arm
+    between them at all.
+
+    Reporting all of them as HiFi joins gave seventeen rows for a
+    three-fragment assembly and warned that "the overlap arm is only
+    24% GC" between the AmpR promoter and AmpR - a redesign of a
+    primer that does not exist.
+    """
+
+    LAYOUT = [
+        {"name": "CAG", "type": "promoter", "start": 0, "end": 300},
+        {"name": "gene", "type": "CDS", "start": 300, "end": 900},
+        {"name": "AmpR promoter", "type": "promoter",
+         "start": 900, "end": 1000},
+        {"name": "AmpR", "type": "resistance", "start": 1000, "end": 1600},
+    ]
+
+    def _seq(self):
+        return (rand_seq(300, 600) + orf(199, 601)[:600]
+                + "AT" * 50 + "AT" * 300)[:1600]
+
+    def test_only_the_named_positions_are_joins(self):
+        from genesis.primers import analyse_junctions
+        js = analyse_junctions(self.LAYOUT, self._seq(), "hifi", Config(),
+                               joins={300})
+        self.assertEqual([j.is_join for j in js], [True, False, False])
+        self.assertEqual([j.overlap_length for j in js], [25, 0, 0])
+        self.assertEqual([j.method for j in js], ["hifi", "", ""])
+
+    def test_no_overlap_warning_where_there_is_no_overlap(self):
+        """An AT-rich boundary inside one amplicon is not a low-Tm
+        overlap arm; it is not an arm."""
+        from genesis.primers import analyse_junctions
+        js = analyse_junctions(self.LAYOUT, self._seq(), "hifi", Config(),
+                               joins={300})
+        for j in js:
+            if j.is_join:
+                continue
+            self.assertFalse([w for w in j.warnings if "overlap" in w],
+                             j.warnings)
+
+    def test_the_frame_check_still_runs_everywhere(self):
+        """A CDS that is not a multiple of three puts the next one out
+        of frame whether or not anything is joined there."""
+        from genesis.primers import analyse_junctions
+        layout = [{"name": "a", "type": "CDS", "start": 0, "end": 100},
+                  {"name": "b", "type": "CDS", "start": 100, "end": 400}]
+        js = analyse_junctions(layout, rand_seq(400, 602), "hifi", Config(),
+                               joins=set())
+        self.assertFalse(js[0].is_join)
+        self.assertEqual(js[0].frame_shift, 1)
+        self.assertTrue(any("out of frame" in w for w in js[0].warnings))
+
+    def test_without_a_join_set_every_boundary_counts(self):
+        """The old behaviour, for a caller that has not worked out its
+        pieces."""
+        from genesis.primers import analyse_junctions
+        js = analyse_junctions(self.LAYOUT, self._seq(), "hifi", Config())
+        self.assertTrue(all(j.is_join for j in js))
+
+    def test_a_real_plan_has_one_join_per_piece(self):
+        import sqlite3
+        from genesis.config import Config as C
+        conn = connect(":memory:")
+        cfg = C()
+        import hashlib
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'jn',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 603), 3006)).lastrowid
+        seq = orf(150, 604)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'jnd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 605), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("j", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        hifi = next(r for r in plan["routes"] if r["id"] == "hifi")
+        pcrs = sum(1 for s in hifi["steps"] if s["operation"] == "PCR")
+        joins = [j for j in hifi["junctions"] if j["is_join"]]
+        self.assertLessEqual(len(joins), pcrs,
+                             "more joins than there are pieces to join")
+        for j in hifi["junctions"]:
+            if not j["is_join"]:
+                self.assertEqual(j["overlap_length"], 0)
+                self.assertEqual(j["method"], "")
+        conn.close()
+
+
+class TestTheDesignSaysWhatItIsDoing(unittest.TestCase):
+    """Planning takes the better part of a minute, and a button that
+    goes grey for forty seconds looks like a button that has broken."""
+
+    def test_every_stage_reports_before_it_runs(self):
+        import hashlib
+        from genesis.design import DESIGN_STAGES
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'prog',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 500), 3006)).lastrowid
+        seq = orf(150, 501)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'progd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 502), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+
+        seen = []
+        design(conn, ConstructSpec("p", backbone_plasmid_id=bb,
+                                   modules=[Module("CDS", "gene")]), cfg,
+               progress=lambda k, label, done: seen.append((k, label, done)))
+        conn.close()
+
+        self.assertEqual([k for k, _l, _d in seen],
+                         [k for k, _l, _w in DESIGN_STAGES],
+                         "the stages must report in the order they run")
+        # ...monotonic, starting at zero and never reaching one early
+        fractions = [d for _k, _l, d in seen]
+        self.assertEqual(fractions[0], 0.0)
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertLess(fractions[-1], 1.0)
+        for _k, label, _d in seen:
+            self.assertTrue(label and label[0].isupper(), label)
+
+    def test_a_design_without_a_callback_still_works(self):
+        """progress is optional; nothing may depend on it."""
+        import inspect
+        from genesis.design import design as fn
+        sig = inspect.signature(fn)
+        self.assertIn("progress", sig.parameters)
+        self.assertIsNone(sig.parameters["progress"].default)
+
+    def test_the_weights_are_shares_of_one_whole(self):
+        from genesis.design import DESIGN_STAGES
+        self.assertTrue(all(w > 0 for _k, _l, w in DESIGN_STAGES))
+        self.assertEqual(len({k for k, _l, _w in DESIGN_STAGES}),
+                         len(DESIGN_STAGES), "duplicate stage key")
+
+    def test_the_browser_falls_back_when_there_is_no_stream(self):
+        """A progress bar is not worth failing a design over."""
+        app = (Path(__file__).resolve().parent.parent
+               / "web" / "app.js").read_text()
+        self.assertIn("function streamDesign", app)
+        self.assertIn("return postJSON('/api/design', { spec: spec });", app)
+        # and the bar goes where the user is looking, not into the
+        # hidden leftover container
+        self.assertIn(".step-pane:not([hidden])", app)
+
+
+class TestASequenceTypedInIsThePart(unittest.TestCase):
+    """Some parts are not in any plasmid here yet.
+
+    A tag out of a paper, a linker somebody designed this morning:
+    Genesis has always taken a literal sequence through the API and had
+    nowhere to type one.
+    """
+
+    def test_a_literal_sequence_resolves_without_the_inventory(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'lit',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 400), 3006)).lastrowid
+        conn.commit()
+        mine = orf(40, 401)
+        plan = design(conn, ConstructSpec(
+            "literal", backbone_plasmid_id=bb,
+            modules=[Module("CDS", "myTag", seq=mine)]), cfg)
+        self.assertIn(mine.upper(),
+                      plan["construct"]["sequence"].upper())
+        got = [m for m in plan["modules"] if m["part_name"] == "myTag"]
+        self.assertTrue(got)
+        self.assertEqual(got[0]["length"], len(mine))
+        conn.close()
+
+    def test_it_is_ordered_rather_than_hunted_for(self):
+        """There is no lab source for a sequence nobody has, so the
+        plan has to say it gets synthesised rather than quietly pick a
+        plasmid that looks similar."""
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'lit2',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 402), 3006)).lastrowid
+        conn.commit()
+        mine = orf(60, 403)
+        plan = design(conn, ConstructSpec(
+            "literal", backbone_plasmid_id=bb,
+            modules=[Module("CDS", "myTag", seq=mine)]), cfg)
+        frag = [f for f in plan["fragments"] if f["name"] == "myTag"]
+        self.assertTrue(frag)
+        self.assertTrue(frag[0]["needs_synthesis"])
+        conn.close()
+
+    def test_the_browser_sends_it_and_cleans_it_first(self):
+        """People paste FASTA, and GenBank ORIGIN blocks with their
+        line numbers. All of it is the same sequence."""
+        app = (Path(__file__).resolve().parent.parent
+               / "web" / "app.js").read_text()
+        self.assertIn("function cleanDna", app)
+        self.assertIn("function customSeqEditor", app)
+        # the spec payload has to carry it, or none of it reaches here
+        self.assertIn("if (m.seq) out.seq = m.seq;", app)
+        # and the server has to accept it
+        self.assertIn("seq", str(Module.__dataclass_fields__))
+
+    def test_the_spec_round_trips_a_literal(self):
+        spec = ConstructSpec.from_dict({
+            "name": "x", "circular": True,
+            "modules": [{"type": "CDS", "name": "mine", "seq": "acgtACGT"}]})
+        self.assertEqual(spec.modules[0].seq, "acgtACGT")
+
+
+class TestAShortElementRidesOnThePrimerTails(unittest.TestCase):
+    """P2A is 66 bp, and it was getting its own PCR.
+
+    A reaction whose primers are longer than its product is not a
+    reaction anybody sets up. The way it is done is to split the
+    element between the two primers that flank it - the upstream
+    fragment's reverse primer takes the front, the downstream
+    fragment's forward primer takes the back, and the two share enough
+    of the middle to anneal - so the assembly rebuilds one complete
+    element out of oligos nobody had to order separately.
+    """
+
+    def test_the_overlap_keeps_both_tails_orderable(self):
+        """Splitting 66 bp down the middle at the assembly's standard
+        25 bp overlap gives 46 nt tails; the budget pulls that in."""
+        from genesis.planner import _fold_overlap, FOLD_TARGET_TAIL
+        cfg = Config()
+        for length in (54, 60, 66, 72):
+            v = _fold_overlap("A" * length, cfg)
+            front = (length + v + 1) // 2
+            back = length + v - front
+            with self.subTest(length=length):
+                self.assertLessEqual(max(front, back), FOLD_TARGET_TAIL)
+                self.assertGreaterEqual(v, 15)   # the kit still has to anneal
+                self.assertEqual(front + back - v, length)
+
+    def test_a_long_element_gives_up_tail_length_before_annealing(self):
+        from genesis.planner import _fold_overlap
+        self.assertEqual(_fold_overlap("A" * 102, Config()), 15)
+
+    def test_the_two_halves_rebuild_one_element(self):
+        from genesis.planner import _split_into_tails, Route
+        from genesis.primers import Primer
+        from genesis.seqtools import revcomp
+        element = orf(21, 91)[:66]
+        up_rev = Primer(name="a-R", sequence="AAAA", anneal="AAAA", tail="",
+                        direction="R", template="a")
+        down_fwd = Primer(name="b-F", sequence="CCCC", anneal="CCCC",
+                          tail="GGGGGG", direction="F", template="b")
+        route = Route(id="r", strategy="hifi", title="t")
+        _split_into_tails(up_rev, down_fwd, element, 20, route)
+
+        front = revcomp(up_rev.tail)          # back to the top strand
+        back = down_fwd.tail
+        self.assertTrue(element.startswith(front), "front half is misplaced")
+        self.assertTrue(element.endswith(back), "back half is misplaced")
+        # together they cover it, and they share the overlap
+        self.assertEqual(len(front) + len(back) - 20, len(element))
+        joined = front + element[len(front):]
+        self.assertEqual(joined, element)
+
+    def test_the_skipped_bases_survive_the_rewrite(self):
+        """Whatever the annealing site stepped over sits at the end of
+        the tail and has to stay there. Overwriting the whole tail lost
+        it, and the product then had no second CDS in it at all."""
+        from genesis.planner import _split_into_tails, Route
+        from genesis.primers import Primer
+        rev = Primer(name="a-R", sequence="", anneal="AAAA", tail="TTTGGG",
+                     shift_tail="GGG", direction="R", template="a")
+        fwd = Primer(name="b-F", sequence="", anneal="CCCC", tail="AAACCC",
+                     shift_tail="CCC", direction="F", template="b")
+        _split_into_tails(rev, fwd, "ACGT" * 16, 20,
+                          Route(id="r", strategy="hifi", title="t"))
+        self.assertTrue(rev.tail.endswith("GGG"), rev.tail)
+        self.assertTrue(fwd.tail.endswith("CCC"), fwd.tail)
+        self.assertTrue(rev.sequence.endswith(rev.anneal))
+
+    def test_an_element_too_short_to_split_is_still_not_lost(self):
+        """Returning early dropped the bases: a 15 bp linker vanished
+        out of the design and the assembly then had one fragment with
+        nothing to close on."""
+        from genesis.planner import _split_into_tails, Route
+        from genesis.primers import Primer
+        rev = Primer(name="a-R", sequence="", anneal="AAAA", tail="",
+                     direction="R", template="a")
+        fwd = Primer(name="b-F", sequence="", anneal="CCCC", tail="GGGGGG",
+                     direction="F", template="b")
+        _split_into_tails(rev, fwd, "ACGTACGTACGTACG", 25,
+                          Route(id="r", strategy="hifi", title="t"))
+        self.assertIn("ACGTACGTACGTACG", fwd.tail)
+
+    def test_it_is_not_offered_as_something_to_pick_a_donor_for(self):
+        """If it rides on the tails there is no plasmid to take it
+        from, and a picker for it offers a choice that changes
+        nothing."""
+        from genesis.design import rides_on_a_primer_tail, _drop_folded_donors
+        from genesis.construct import ResolvedModule, Module
+
+        def rm(name, length, ftype="CDS"):
+            return ResolvedModule(Module(ftype, name), None, name,
+                                  "A" * length, ftype, [], [])
+
+        resolved = [rm("prom", 500, "promoter"), rm("cds1", 900),
+                    rm("P2A", 66, "p2A"), rm("cds2", 800)]
+        self.assertEqual(rides_on_a_primer_tail(resolved, Config()), ["P2A"])
+
+        cands = {"donors": [{"covers": ["cds1"], "options": [{"a": 1}]},
+                            {"covers": ["P2A"], "options": [{"a": 2}]},
+                            {"covers": ["cds2"], "options": [{"a": 3}]}],
+                 "n_donors": 3}
+        _drop_folded_donors(cands, resolved, Config())
+        self.assertEqual([d["covers"] for d in cands["donors"]],
+                         [["cds1"], ["cds2"]])
+        self.assertEqual(cands["n_donors"], 2)
+        self.assertEqual(cands["on_primer_tails"], ["P2A"])
+
+    def test_a_short_part_with_nothing_after_it_keeps_its_picker(self):
+        """The fold needs a tail on each side. A short element at the
+        end of the architecture is not folded, so it still needs a
+        donor and still gets one to choose."""
+        from genesis.design import rides_on_a_primer_tail
+        from genesis.construct import ResolvedModule, Module
+
+        def rm(name, length, ftype="CDS"):
+            return ResolvedModule(Module(ftype, name), None, name,
+                                  "A" * length, ftype, [], [])
+
+        self.assertEqual(
+            rides_on_a_primer_tail(
+                [rm("prom", 500, "promoter"), rm("cds1", 900),
+                 rm("P2A", 66, "p2A")], Config()),
+            [])
+
+    def test_p2a_between_two_cds_is_not_its_own_reaction(self):
+        """End to end: the element goes in the tails, the assembly
+        rebuilds it once, and the two proteins stay in one frame."""
+        import hashlib
+        from genesis.seqtools import revcomp
+        conn = connect(":memory:")
+        cfg = Config()
+        p2a = orf(21, 92)[3:69]                       # 66 bp, no ATG/stop
+        cds1, cds2 = orf(300, 93), orf(260, 94)
+        prom = rand_seq(500, 95)
+        bb = "GAATTC" + prom + rand_seq(3000, 96)
+        bid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular, verified)
+               VALUES ('pBB','t',?,?,'fold-b',1,'sequence_verified')""",
+            (bb, len(bb))).lastrowid
+        hosts = {}
+        for nm, body in (("cds1", cds1), ("p2a", p2a), ("cds2", cds2)):
+            host = rand_seq(800, 97) + body + rand_seq(800, 98)
+            pid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'sequence_verified')""",
+                ("p" + nm, host, len(host), "fold-" + nm)).lastrowid
+            hosts[nm] = (pid, 800, 800 + len(body))
+        for nm, body, ftype in (("cds1", cds1, "CDS"), ("p2a", p2a, "p2A"),
+                                ("cds2", cds2, "CDS")):
+            part = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ftype, nm, body, hashlib.sha256(body.encode()).hexdigest(),
+                 len(body))).lastrowid
+            pid, lo, hi = hosts[nm]
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,1)""",
+                (part, pid, lo, hi))
+        conn.commit()
+
+        plan = design(conn, ConstructSpec(
+            "fold", backbone_plasmid_id=bid,
+            modules=[Module("CDS", "cds1"), Module("p2A", "p2a"),
+                     Module("CDS", "cds2")]), cfg)
+        hifi = next(r for r in plan["routes"] if r["id"] == "hifi")
+
+        # no 66 bp reaction
+        for step in hifi["steps"]:
+            if step["operation"] == "PCR":
+                self.assertGreater((step.get("details") or {}).get("length", 0),
+                                   100, step["description"])
+        # Genesis trims a CDS's stop before a 2A and may adjust an
+        # element's boundaries, so the test is against what it resolved
+        # rather than against the strings the fixture put in.
+        placed = {m["type"]: (m.get("seq") or "").upper()
+                  for m in plan["modules"]}
+        element = placed["p2A"]
+        self.assertTrue(element)
+
+        # the element is in the tails, split across two primers
+        tails = [p["tail"].upper() for p in hifi["primers"]]
+        head, tailend = element[:18], element[-18:]
+        self.assertTrue(
+            any(revcomp(head) in t for t in tails),
+            "the front of the element is on no reverse primer")
+        self.assertTrue(any(tailend in t for t in tails),
+                        "the back of the element is on no forward primer")
+
+        # ...and it is there exactly once in the designed molecule
+        built = plan["construct"]["sequence"].upper()
+        self.assertEqual((built + built).count(element), 2,
+                         "the element should appear once in the circle")
+        # CDS1 - element - CDS2 runs as one piece
+        doubled = built + built
+        at = doubled.find(element)
+        self.assertGreaterEqual(at, 0)
+        conn.close()
+
+
+class TestEachReactionIsCheckedBeforeTheNextOne(unittest.TestCase):
+    """PCR is where a cloning fails, and it fails silently.
+
+    The amplicon that is not there goes into the assembly anyway, and
+    the first hard evidence is a plate of parental vector two days
+    later. The information to catch it existed at minute ninety.
+    """
+
+    def _plan(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'qcbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 340), 2506)).lastrowid
+        seq = orf(150, 341)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'qcd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 342), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("qc test", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        return conn, cfg, plan
+
+    def test_a_pcr_is_followed_by_a_gel(self):
+        conn, _cfg, plan = self._plan()
+        checked = 0
+        for route in plan["routes"]:
+            ops = [s["operation"] for s in route["steps"]]
+            if "PCR" not in ops:
+                continue
+            checked += 1
+            self.assertIn("QC_GEL", ops,
+                          f"{route['id']} amplifies and never looks")
+            # ...and it comes after the amplifying, not at the end
+            self.assertLess(ops.index("QC_GEL"), len(ops) - 2)
+        self.assertTrue(checked)
+        conn.close()
+
+    def test_the_gel_names_the_band_this_plan_expects(self):
+        """"Run a gel" is advice. "One band at 5,791 bp, and a band at
+        6,539 bp is uncut template" is a test."""
+        conn, _cfg, plan = self._plan()
+        for route in plan["routes"]:
+            for step in route["steps"]:
+                check = (step.get("details") or {}).get("checkpoint")
+                if not check or check["operation"] != "PCR":
+                    continue
+                joined = " ".join(check["expect"])
+                self.assertIn("bp", joined)
+                self.assertRegex(joined, r"\d,?\d*\s*bp")
+                # and a way out of each failure
+                self.assertTrue(check["troubles"])
+                for seen, means, todo in check["troubles"]:
+                    self.assertTrue(seen and means and todo)
+                conn.close()
+                return
+        conn.close()
+        self.fail("no PCR checkpoint was generated")
+
+    def test_two_pcrs_share_one_gel(self):
+        """Nobody pours a second gel to look at the second tube."""
+        from genesis.checkpoints import for_route
+        route = {"steps": [
+            {"operation": "PCR", "output": "a amplicon",
+             "details": {"length": 1000, "template": "pA"}},
+            {"operation": "PCR", "output": "b amplicon",
+             "details": {"length": 2000, "template": "pB"}},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": []}]}
+        marks = for_route(route, {"pA": 5000, "pB": 6000})
+        pcr = [c for _i, c in marks if c.operation == "PCR"]
+        self.assertEqual(len(pcr), 1, "one gel, not two")
+        joined = " ".join(pcr[0].expect)
+        self.assertIn("1,000 bp", joined)
+        self.assertIn("2,000 bp", joined)
+        self.assertIn("5,000 bp", joined)   # the template band to avoid
+
+    def test_the_digest_checkpoint_knows_the_real_bands(self):
+        """The simulator already cuts these molecules, so the sizes are
+        known rather than guessed."""
+        conn, _cfg, plan = self._plan()
+        found = False
+        for route in plan["routes"]:
+            for step in route["steps"]:
+                check = (step.get("details") or {}).get("checkpoint")
+                if check and check["operation"] == "RE_DIGEST":
+                    found = True
+                    self.assertTrue(any("uncut" in e
+                                        for e in check["expect"]))
+        conn.close()
+        if not found:
+            self.skipTest("this fixture produced no restriction route")
+
+    def test_an_assembly_is_checked_against_a_no_insert_control(self):
+        """An assembly cannot be read on a gel; the plate is the
+        readout, and a plate alone says nothing."""
+        from genesis.checkpoints import for_route
+        marks = for_route({"steps": [
+            {"operation": "HI_FI_ASSEMBLY", "inputs": []}]})
+        self.assertEqual(len(marks), 1)
+        check = marks[0][1]
+        self.assertIn("control", check.title)
+        self.assertTrue(any("vector-only" in e for e in check.expect))
+
+    def test_the_checkpoint_reaches_the_pdf_and_the_markdown(self):
+        from genesis.export import protocol_pdf, protocol_markdown
+        conn, cfg, plan = self._plan()
+        drawn = pdf_text(protocol_pdf(plan, cfg))
+        self.assertIn(b"Go on if you see", drawn)
+        md = protocol_markdown(plan, cfg)
+        self.assertIn("**Go on if you see:**", md)
+        conn.close()
+
+
+class TestTheProtocolIsReadableAndHonest(unittest.TestCase):
+    """The protocol's own presentation, where it had gone wrong."""
+
+    def test_the_cloning_scheme_is_not_drawn_twice(self):
+        """It drew two parents with the swapped regions marked, which
+        "How this route builds it" already does and better - and on a
+        restriction route the old one still marked primers that route
+        never designs."""
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "protocol.py").read_text()
+        self.assertNotIn('doc.heading("Cloning scheme"', src)
+        self.assertIn("How this route builds it", src)
+
+    def test_a_vendor_box_is_set_in_a_serif_and_can_be_clicked(self):
+        from genesis.pdf import PDF, A4, FONTS
+        self.assertIn("Times-Roman", [n for n, _w in FONTS.values()])
+        doc = PDF(title="t", page_size=A4)
+        doc.boxed(lambda: (doc.paragraph("x", 9, font="F5"),
+                           doc.link("neb.com", "https://www.neb.com", 8)))
+        data = doc.to_bytes()
+        self.assertIn(b"/Annots", data)
+        self.assertIn(b"/URI", data)
+        self.assertIn(b"Times-Roman", data)
+
+    def test_times_metrics_are_the_real_ones(self):
+        """Wrapping with the wrong widths is how text comes out
+        squeezed; the whole point of the change was to stop that."""
+        from genesis.pdf import FONTS, text_width
+        for key in ("F5", "F6", "F7"):
+            self.assertEqual(len(FONTS[key][1]), 95, key)
+        # Times is narrower than Helvetica at the same size, which is
+        # why it fits a reagent name Courier could not
+        self.assertLess(text_width("nuclease-free water", "F5", 9),
+                        text_width("nuclease-free water", "F3", 9))
+
+    def test_two_enzymes_at_one_temperature_share_a_tube(self):
+        from genesis.enzymes import digest_plan
+        plan = digest_plan(["EcoRI", "BamHI"])
+        self.assertFalse(plan["sequential"])
+        self.assertEqual(len(plan["stages"]), 1)
+        self.assertEqual(plan["stages"][0]["temperature"], 37)
+        self.assertEqual(plan["warnings"], [])
+
+    def test_two_enzymes_at_different_temperatures_do_not(self):
+        """BsmBI wants 55 C. A protocol that always says "37 C for an
+        hour" is wrong for that pair, and silently so."""
+        from genesis.enzymes import digest_plan
+        plan = digest_plan(["EcoRI", "BsmBI"])
+        self.assertTrue(plan["sequential"])
+        self.assertEqual([st["temperature"] for st in plan["stages"]],
+                         [37, 55])
+        self.assertTrue(any("two stages" in w for w in plan["warnings"]))
+
+    def test_a_time_saver_pair_cuts_in_fifteen_minutes(self):
+        from genesis.enzymes import digest_plan
+        self.assertEqual(digest_plan(["EcoRI", "BamHI"])["stages"][0]
+                         ["minutes"], "15 min")
+
+
+class TestAPayloadTakenOutOfACreLoxDonorComesOutForwards(unittest.TestCase):
+    """A DIO donor stores its payload inverted - that is what DIO is.
+
+    Amplify it with the donor's own coordinates and the amplicon is the
+    reverse complement of what the construct wants, and the assembly
+    puts it in backwards. The all-PCR swap has always gone through
+    _amplification_frame for this; the hybrid swap passed the donor
+    sequence straight to the primer designer, so ASAP7y went into
+    pAAV-CAG-ASAP7y the wrong way round.
+
+    Every part was reported present, because presence is tested on both
+    strands - it has to be, or a legitimately inverted Cre-lox payload
+    would read as missing. So nothing caught it.
+    """
+
+    def _db(self):
+        """A recipient with a payload to replace, and a DIO donor whose
+        own payload is stored on the minus strand."""
+        import hashlib
+        conn = connect(":memory:")
+        payload = orf(300, 61)                     # what the donor carries
+        old = orf(260, 62)                         # what the recipient has
+        prom = rand_seq(500, 63)
+        rec = (rand_seq(400, 64) + prom + old + rand_seq(1500, 65))
+        rid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular, verified)
+               VALUES ('pRec','t',?,?,'orient-r',1,'sequence_verified')""",
+            (rec, len(rec))).lastrowid
+        # the donor keeps the payload reverse-complemented, between lox
+        # sites, exactly as a DIO cassette does
+        flipped = _rc(payload)
+        don = (rand_seq(600, 66) + LOX2272 + rand_seq(40, 67) + LOXP
+               + flipped + _rc(LOX2272) + _rc(LOXP) + rand_seq(900, 68))
+        did = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular, verified)
+               VALUES ('pDonDIO','t',?,?,'orient-d',1,'sequence_verified')""",
+            (don, len(don))).lastrowid
+        at = don.index(flipped)
+        for pid, name, ftype, start, end, strand in (
+                (rid, "prom", "promoter", 400, 400 + len(prom), 1),
+                (rid, "old", "CDS", 400 + len(prom),
+                 400 + len(prom) + len(old), 1),
+                (did, "payload", "CDS", at, at + len(flipped), -1)):
+            conn.execute(
+                """INSERT INTO annotation(plasmid_id, name, feature_type,
+                        start, end, strand) VALUES (?,?,?,?,?,?)""",
+                (pid, name, ftype, start, end, strand))
+        for name, seq in (("prom", prom), ("payload", payload)):
+            ck = hashlib.sha256(seq.encode()).hexdigest()
+            part = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                ("promoter" if name == "prom" else "CDS", name, seq, ck,
+                 len(seq))).lastrowid
+            host, lo = ((rid, 400) if name == "prom" else (did, at))
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,?)""",
+                (part, host, lo, lo + len(seq), 1 if name == "prom" else -1))
+        conn.commit()
+        return conn, rid, did, payload
+
+    def test_the_amplification_frame_flips_a_minus_strand_part(self):
+        from genesis.planner import _amplification_frame
+        from genesis.seqtools import slice_region
+        template = rand_seq(300, 71) + orf(100, 72) + rand_seq(300, 73)
+        want = _rc(template[300:300 + len(orf(100, 72))])
+        tpl, lo, hi = _amplification_frame(
+            template, 300, 300 + len(orf(100, 72)), -1, wanted=want)
+        self.assertEqual(slice_region(tpl, lo, hi), want,
+                         "a minus-strand part must be amplified in the "
+                         "orientation the construct reads")
+
+    def test_an_inverted_insert_fails_the_simulation(self):
+        """The check that was missing: present on either strand is not
+        the same question as present the right way round."""
+        from genesis.simulate import _check_orientation, SimulationResult
+        body = orf(300, 81)
+        designed = rand_seq(200, 82) + body + rand_seq(200, 83)
+        built = rand_seq(200, 82) + _rc(body) + rand_seq(200, 83)
+        plan = {"construct": {"sequence": designed, "circular": True},
+                "modules": [{"part_name": "payload", "seq": body}]}
+        ok = SimulationResult()
+        _check_orientation(ok, designed, plan)
+        self.assertTrue(ok.passed, ok.problems)
+
+        bad = SimulationResult()
+        _check_orientation(bad, built, plan)
+        self.assertFalse(bad.passed)
+        self.assertFalse(bad.identical)
+        self.assertTrue(any("reversed" in p for p in bad.problems),
+                        bad.problems)
+
+    def test_a_part_the_design_itself_inverts_is_not_flagged(self):
+        """A Cre-lox payload is meant to sit backwards. The design says
+        so, and the check compares against the design rather than
+        against an assumption."""
+        from genesis.simulate import _check_orientation, SimulationResult
+        body = orf(300, 84)
+        designed = rand_seq(200, 85) + _rc(body) + rand_seq(200, 86)
+        plan = {"construct": {"sequence": designed, "circular": True},
+                "modules": [{"part_name": "payload", "seq": body}]}
+        result = SimulationResult()
+        _check_orientation(result, designed, plan)
+        self.assertTrue(result.passed, result.problems)
+
+    def test_the_hybrid_swap_builds_it_forwards(self):
+        """End to end, on a donor that stores the payload inverted."""
+        from genesis.seqtools import revcomp
+        conn, rid, did, payload = self._db()
+        plan = design(conn, ConstructSpec(
+            "flip test", backbone_plasmid_id=rid,
+            modules=[Module("promoter", "prom"), Module("CDS", "payload")]),
+            Config())
+        seen = 0
+        for route in plan["routes"]:
+            sim = route.get("simulation") or {}
+            if not sim.get("simulated") or not route.get("feasible"):
+                continue
+            seen += 1
+            self.assertFalse(
+                any("reversed" in p for p in sim.get("problems") or []),
+                f"{route['id']} builds the payload backwards")
+        self.assertTrue(seen, "no route was simulated, so nothing was tested")
+        # the design itself must read the payload forward
+        built = plan["construct"]["sequence"].upper()
+        doubled = (built + built)
+        self.assertIn(payload[:60].upper(), doubled)
+        self.assertNotIn(revcomp(payload)[:60].upper(), doubled)
+        conn.close()
+
+
+class TestTheProtocolNamesWhatTheLabBuys(unittest.TestCase):
+    """A generic recipe is right for every kit and exact for none.
+
+    "2x assembly master mix, 10 uL" fits any kit; the conditions that
+    differ between them are the ones worth printing. The purchasing
+    record says which products this bench runs, and two of their
+    published conditions contradict what Genesis used to print.
+    """
+
+    def test_every_catalogue_entry_is_complete(self):
+        from genesis.reagents import CATALOGUE
+        for product in CATALOGUE:
+            with self.subTest(product.catalogue):
+                self.assertTrue(product.setup, "no reaction setup")
+                self.assertTrue(product.program, "no programme")
+                self.assertTrue(product.url.startswith("https://"))
+                self.assertTrue(product.title)
+                for amount, item in product.setup:
+                    self.assertTrue(amount and item)
+
+    def test_each_operation_resolves_to_one_product(self):
+        from genesis.reagents import CATALOGUE, for_operation
+        claimed = [op for p in CATALOGUE for op in p.operations]
+        self.assertEqual(len(claimed), len(set(claimed)),
+                         "two products claim the same operation")
+        for op in ("PCR", "HI_FI_ASSEMBLY", "LIGATION", "RE_DIGEST",
+                   "DPNI_DIGEST", "TRANSFORMATION"):
+            self.assertIsNotNone(for_operation(op), op)
+
+    def test_the_stable_strain_recovers_cold_and_not_in_soc(self):
+        """The generic text said 37 C in SOC. This lab buys NEB Stable
+        for AAV transfer plasmids, whose ITRs are exactly the repeats
+        the strain exists to hold together, and NEB specifies 30 C in
+        its own outgrowth medium - not SOC."""
+        from genesis.reagents import for_operation
+        cells = for_operation("TRANSFORMATION")
+        self.assertIn("C3040", cells.catalogue)
+        programme = " ".join(f"{a} {b}" for a, b in cells.program)
+        self.assertIn("30 C", programme)
+        self.assertNotIn("37 C", programme)
+        self.assertTrue(any("Outgrowth Medium" in a or "Outgrowth Medium" in b
+                            for a, b in cells.setup))
+        self.assertTrue(any("not to substitute SOC" in n or "SOC" in n
+                            for n in cells.notes))
+
+    def test_the_extension_rate_comes_from_the_polymerase(self):
+        """Printed twice, it can disagree with itself: Q5 extends
+        plasmid at 20-30 s/kb and Phusion at 15."""
+        from genesis.reagents import CATALOGUE, for_operation
+        q5 = for_operation("PCR")
+        self.assertEqual(q5.catalogue, "M0492")
+        self.assertTrue(q5.extension_s_per_kb)
+        phusion = [p for p in CATALOGUE if p.catalogue == "M0531"][0]
+        self.assertEqual(phusion.extension_s_per_kb, 15)
+        self.assertNotEqual(phusion.extension_s_per_kb,
+                            q5.extension_s_per_kb)
+
+    def test_the_protocol_prints_the_catalogue_number_and_the_link(self):
+        import hashlib
+        from genesis.export import protocol_pdf
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'kitbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 330), 2506)).lastrowid
+        seq = orf(150, 331)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'kitd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 332), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("kit test", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]), cfg)
+        drawn = pdf_text(protocol_pdf(plan, cfg))
+        self.assertIn(b"M0492", drawn)
+        self.assertIn(b"Kits and catalogue numbers", drawn)
+        self.assertIn(b"neb.com", drawn)
+        # the strain's own conditions, not the generic ones
+        self.assertIn(b"30 C, 60 min", drawn)
+        conn.close()
+
+
+class TestTheStylesheetDoesNotCollide(unittest.TestCase):
+    """Two different things called "steps".
+
+    The design step navigation is `nav class="steps"` and the protocol's
+    numbered bench list is `ol class="steps"`. A rule written as plain
+    `.steps` matches both, and the navigation's `display: flex` turned
+    the bench steps into a wrapping row, so step 4 and step 5 printed on
+    top of each other. CSS gives no error for this; the page just looks
+    wrong.
+    """
+
+    @staticmethod
+    def _css():
+        root = Path(__file__).resolve().parent.parent
+        return (root / "web" / "style.css").read_text()
+
+    @staticmethod
+    def _html():
+        root = Path(__file__).resolve().parent.parent
+        return (root / "web" / "index.html").read_text()
+
+    def test_shared_class_names_are_scoped_to_their_element(self):
+        import re
+        css = self._css()
+        app = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+        # class names used on more than one kind of element
+        for name, elements in (("steps", ("nav", "ol")),):
+            self.assertIn(f'<{elements[0]} class="{name}"', self._html())
+            self.assertIn(f"'{elements[1]}', {{ class: '{name}' }}", app)
+            bare = [l for l in css.splitlines()
+                    if re.match(r"^\s*\.%s\b" % name, l)]
+            self.assertEqual(bare, [],
+                             f"a bare .{name} rule matches both "
+                             f"{' and '.join(elements)}: {bare}")
+
+    def test_every_custom_property_used_is_declared(self):
+        """var(--line) and var(--muted) were never declared, so 22 rules
+        silently fell through to a dark-theme fallback - in light mode,
+        near-white text on a white card."""
+        import re
+        css = self._css()
+        declared = set(re.findall(r"^\s*(--[a-z0-9-]+)\s*:", css, re.M))
+        used = set(re.findall(r"var\((--[a-z0-9-]+)", css))
+        missing = sorted(u for u in used - declared)
+        self.assertEqual(missing, [],
+                         f"used but never declared at :root: {missing}")
+
+
+class TestTheFigureShowsWhatMeetsWhat(unittest.TestCase):
+    """Two grey caps both labelled "overlap" said only that an overlap
+    existed, not which end goes into which."""
+
+    def _lanes(self, n, kind="homology", ends=None):
+        lanes = []
+        for i in range(n):
+            lanes.append({
+                "piece": f"p{i}", "end_kind": kind,
+                "ends": ends or ["overlap", "overlap"],
+                "src": {"at_start": i * 1000, "at_end": (i + 1) * 1000}})
+        return lanes
+
+    def test_both_halves_of_a_join_share_a_letter_and_a_colour(self):
+        from genesis.figure import junction_colours
+        m = junction_colours(self._lanes(2))
+        # piece 0's right end meets piece 1's left end
+        self.assertEqual(m[(0, "right")], m[(1, "left")])
+        self.assertEqual(m[(1, "right")], m[(0, "left")])
+        # ...and the two junctions are told apart
+        self.assertNotEqual(m[(0, "right")][0], m[(1, "right")][0])
+        self.assertNotEqual(m[(0, "right")][1], m[(1, "right")][1])
+
+    def test_three_pieces_close_the_circle(self):
+        from genesis.figure import junction_colours
+        m = junction_colours(self._lanes(3))
+        self.assertEqual(len({v[0] for v in m.values()}), 3)
+        # the last piece joins back to the first
+        self.assertEqual(m[(2, "right")], m[(0, "left")])
+
+    def test_sticky_ends_pair_by_enzyme(self):
+        """A HindIII end only goes into a HindIII end, and the figure
+        should say so without counting round the product."""
+        from genesis.figure import junction_colours
+        lanes = self._lanes(2, kind="sticky", ends=["HindIII", "EcoRV"])
+        m = junction_colours(lanes)
+        self.assertEqual(m[(0, "left")][0], "HindIII")
+        self.assertEqual(m[(1, "left")][0], "HindIII")
+        self.assertEqual(m[(0, "left")][1], m[(1, "left")][1])
+        self.assertNotEqual(m[(0, "left")][1], m[(0, "right")][1])
+
+    def test_an_unplaced_piece_gets_no_junction(self):
+        """Without a simulation there is no product order to count
+        round, and inventing one would pair the wrong ends."""
+        from genesis.figure import junction_colours
+        lanes = self._lanes(2)
+        lanes[1]["src"] = {}
+        self.assertEqual(junction_colours(lanes), {})
+
+    def test_a_feature_inside_a_feature_is_not_a_part(self):
+        from genesis.figure import outermost, figure_features
+        items = [{"name": "CAG", "start": 31, "end": 1776},
+                 {"name": "chicken", "start": 397, "end": 675},
+                 {"name": "Voltron2", "start": 758, "end": 1367},
+                 {"name": "ASAP7y", "start": 1782, "end": 3066}]
+        self.assertEqual([a["name"] for a in outermost(items)],
+                         ["CAG", "ASAP7y"])
+        # and the parent picker uses it
+        src = {"template_length": 7606, "features": [
+            dict(a, feature_type="promoter" if "CAG" in a["name"] else "CDS")
+            for a in items]}
+        self.assertNotIn("Voltron2",
+                         [a["name"] for a in figure_features(src)])
+
+    def test_identical_spans_do_not_delete_each_other(self):
+        """Two annotations over exactly the same bases contain each
+        other; dropping both would leave the figure blank."""
+        from genesis.figure import outermost
+        items = [{"name": "a", "start": 0, "end": 100},
+                 {"name": "b", "start": 0, "end": 100}]
+        self.assertEqual(len(outermost(items)), 2)
+
+
+class TestTheTwoFiguresAgree(unittest.TestCase):
+    """One idea, two languages.
+
+    The cloning figure is drawn twice - once in the browser and once in
+    the protocol PDF - from the same lane model. Two implementations of
+    one idea are worth nothing if nobody checks they still agree, so the
+    JavaScript is run against the same routes as the Python and the
+    lanes compared field by field.
+    """
+
+    #: Routes covering the shapes the walk has to get right: a plain
+    #: two-PCR assembly, a digest of a named plasmid, a bare digest that
+    #: applies to the amplicon before it, a synthesis, and a primer pair
+    #: whose part names contain the separator.
+    ROUTES = [
+        {"id": "hifi", "steps": [
+            {"operation": "PCR", "output": "backbone2 amplicon",
+             "inputs": ["pHost", "backbone2-F+backbone2-R"],
+             "details": {"template": "pHost", "length": 5791}},
+            {"operation": "PCR", "output": "Kozak+ASAP7y amplicon",
+             "inputs": ["pDon", "Kozak+ASAP7y-F+Kozak+ASAP7y-R"],
+             "details": {"template": "pDon", "length": 1290}},
+            {"operation": "DPNI_DIGEST", "inputs": [], "output": "clean"},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": ["backbone2", "Kozak"]},
+         ],
+         "primers": [{"name": "backbone2-F"}, {"name": "backbone2-R"},
+                     {"name": "Kozak+ASAP7y-F"}, {"name": "Kozak+ASAP7y-R"}]},
+        {"id": "restriction", "steps": [
+            {"operation": "PCR", "output": "Kozak+ASAP7y amplicon with sites",
+             "inputs": ["pDon", "Kozak+ASAP7y-F+Kozak+ASAP7y-R"],
+             "details": {"length": 1290, "template": "pDon"}},
+            {"operation": "RE_DIGEST", "inputs": ["HindIII, EcoRV"],
+             "output": "digested insert"},
+            {"operation": "RE_DIGEST", "inputs": ["pHost"],
+             "output": "linearised backbone"},
+            {"operation": "LIGATION", "inputs": ["backbone", "insert"]},
+         ],
+         "primers": [{"name": "Kozak+ASAP7y-F", "target_start": 2218,
+                      "target_end": 3508},
+                     {"name": "Kozak+ASAP7y-R"}]},
+        {"id": "gblock", "steps": [
+            {"operation": "SYNTHESIS", "output": "synthetic insert",
+             "inputs": [], "details": {"length": 2571}},
+            {"operation": "PCR", "output": "linearised vector",
+             "inputs": ["pHost", "backbone-F+backbone-R"],
+             "details": {"length": 4004, "template": "pHost"}},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": ["vector", "insert"]},
+         ],
+         "primers": [{"name": "backbone-F"}, {"name": "backbone-R"}]},
+        # a route the planner rejected: no steps at all
+        {"id": "swap_re", "steps": [], "primers": []},
+    ]
+
+    #: A real layout: CAG with the chicken beta-actin promoter nested in
+    #: it, plus the junk "Voltron2" that YD030's file buries in the same
+    #: promoter, and the CDS that is actually a part of the construct.
+    NESTED = [{"name": "CAG", "start": 31, "end": 1776},
+              {"name": "chicken b-actin promoter", "start": 397, "end": 675},
+              {"name": "Voltron2", "start": 758, "end": 1367},
+              {"name": "ASAP7y", "start": 1782, "end": 3066}]
+
+    #: The product layout YD030 produces, junk annotation included.
+    LAYOUT = [{"name": "CAG", "type": "promoter", "start": 31, "end": 1776},
+              {"name": "chicken b-actin promoter", "type": "promoter",
+               "start": 397, "end": 675},
+              {"name": "Voltron2", "type": "CDS", "start": 758, "end": 1367},
+              {"name": "ASAP7y", "type": "CDS", "start": 1782, "end": 3066},
+              {"name": "Factor Xa site", "type": "CDS",
+               "start": 3537, "end": 3549}]
+
+    PLAN = {"templates": {
+        "pHost": {"id": 1, "name": "pHost", "bp": 6539, "circular": True,
+                  "features": []},
+        "pDon": {"id": 2, "name": "pDon", "bp": 6880, "circular": True,
+                 "features": []}}}
+
+    SIM = {"product_bp": 7081, "sources": [
+        {"name": "backbone2", "template": "pHost", "template_length": 6539,
+         "from_start": 23, "from_end": 5814, "bp": 5807,
+         "at_start": 0, "at_end": 5807,
+         "features": [{"feature_type": "promoter", "name": "CAG",
+                       "start": 31, "end": 1776, "strand": 1},
+                      {"feature_type": "promoter", "name": "chicken",
+                       "start": 397, "end": 675, "strand": 1},
+                      {"feature_type": "CDS", "name": "Voltron2",
+                       "start": 758, "end": 1367, "strand": -1}]},
+        {"name": "Kozak+ASAP7y", "template": "pDon", "template_length": 6880,
+         "from_start": 2218, "from_end": 3508, "bp": 1305,
+         "at_start": 5792, "at_end": 16, "features": []},
+    ]}
+
+    @staticmethod
+    def _shape(lanes):
+        """The fields both ports are responsible for, in order."""
+        return [{"origin": l["origin"], "template": l["template"],
+                 "piece": l["piece"], "ends": l.get("ends") or [],
+                 "stages": [[s["verb"], s["sub"]] for s in l["stages"]],
+                 "primers": l.get("primers") or []}
+                for l in lanes]
+
+    def test_the_javascript_walks_a_route_the_same_way(self):
+        import json
+        import shutil
+        import subprocess
+        import tempfile
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed; cannot check the port")
+
+        from genesis.figure import route_lanes
+        want = [self._shape(route_lanes(r, self.SIM, self.PLAN))
+                for r in self.ROUTES]
+
+        app = (Path(__file__).resolve().parent.parent / "web" / "app.js")
+        driver = """
+          global.document = { createElement: t => node(t),
+            createElementNS: (ns, t) => node(t),
+            createTextNode: t => node('#text'),
+            getElementById: () => null, addEventListener(){},
+            querySelector: () => null, querySelectorAll: () => [] };
+          function node(t){ return { tagName:t, children:[], attrs:{},
+            textContent:'', appendChild(c){this.children.push(c);return c;},
+            setAttribute(){}, addEventListener(){},
+            classList:{add(){},remove(){},toggle(){}} }; }
+          global.Node = class Node {};
+          global.window = { addEventListener(){}, location:{hash:''} };
+          global.fetch = async () => ({ ok:true, json: async () => ({}) });
+          global.localStorage = { getItem:()=>null, setItem(){}, removeItem(){} };
+          global.ResizeObserver = class { observe(){} disconnect(){} };
+          global.setTimeout = () => 0; global.clearTimeout = () => {};
+          require('vm').runInThisContext(
+            require('fs').readFileSync(process.argv[2], 'utf8'));
+          const input = JSON.parse(require('fs').readFileSync(process.argv[3]));
+          const out = input.routes.map(r => routeLanes(r, input.sim, input.plan)
+            .map(l => ({ origin: l.origin, template: l.template,
+                         piece: l.piece, ends: l.ends || [],
+                         stages: (l.stages||[]).map(s => [s.verb, s.sub]),
+                         primers: l.primers || [] })));
+          const joins = input.routes.map(r => {
+            const m = junctionColours(routeLanes(r, input.sim, input.plan));
+            return Object.keys(m).sort().map(k => [k, m[k][0]]);
+          });
+          const nested = outermost(input.nested).map(a => a.name);
+          const feats = input.sim.sources.map(s => figFeatures(s).map(a => a.name));
+          const prod = productFeatures(input.layout, input.span).map(a => a.name);
+          process.stdout.write(JSON.stringify({out, joins, nested, feats, prod}));
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            drv = Path(tmp) / "drive.js"
+            inp = Path(tmp) / "in.json"
+            drv.write_text(driver)
+            inp.write_text(json.dumps({"routes": self.ROUTES, "sim": self.SIM,
+                                       "plan": self.PLAN,
+                                       "nested": self.NESTED,
+                                       "layout": self.LAYOUT,
+                                       "span": 7081}))
+            proc = subprocess.run(
+                [node, str(drv), str(app), str(inp)],
+                capture_output=True, text=True, cwd=str(app.parent.parent))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        payload = json.loads(proc.stdout)
+        got = payload["out"]
+
+        self.assertEqual(len(got), len(want))
+        for route, a, b in zip(self.ROUTES, got, want):
+            self.assertEqual(a, b, f"route {route['id']} is walked "
+                                   f"differently by the two ports")
+
+        # which end meets which, and under which letter
+        from genesis.figure import junction_colours, outermost
+        for route, a in zip(self.ROUTES, payload["joins"]):
+            lanes = route_lanes(route, self.SIM, self.PLAN)
+            mine = sorted([[f"{i}|{side}", label]
+                           for (i, side), (label, _rgb)
+                           in junction_colours(lanes).items()])
+            self.assertEqual(sorted(a), mine,
+                             f"route {route['id']} pairs its ends "
+                             f"differently in the two ports")
+
+        self.assertEqual(payload["nested"],
+                         [x["name"] for x in outermost(self.NESTED)])
+
+        # and which features each port keeps on a parent circle
+        from genesis.figure import figure_features
+        self.assertEqual(
+            payload["feats"],
+            [[a["name"] for a in figure_features(src)]
+             for src in self.SIM["sources"]])
+        self.assertNotIn("Voltron2", payload["feats"][0],
+                         "a CDS buried in the CAG promoter is not a part")
+
+        # ...and on the product circle
+        from genesis.figure import product_features
+        self.assertEqual(
+            payload["prod"],
+            [a["name"] for a in product_features(self.LAYOUT, 7081)])
+        self.assertEqual(payload["prod"], ["CAG", "ASAP7y"])
+
+    def test_a_bare_digest_applies_to_the_amplicon_before_it(self):
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[1], self.SIM, self.PLAN)
+        self.assertEqual(len(lanes), 2)
+        self.assertEqual([s["verb"] for s in lanes[0]["stages"]],
+                         ["PCR", "Digest"])
+        self.assertEqual(lanes[0]["ends"], ["HindIII", "EcoRV"])
+        # and the plasmid digest is its own lane, not a stage on that one
+        self.assertEqual(lanes[1]["template"], "pHost")
+        self.assertEqual([s["verb"] for s in lanes[1]["stages"]], ["Digest"])
+
+    def test_a_digest_with_no_enzymes_borrows_the_route_pair(self):
+        """The backbone digest names no enzymes of its own, and was
+        drawn as a bare "Digest" with nothing to say which ones."""
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[1], self.SIM, self.PLAN)
+        self.assertEqual(lanes[1]["stages"][0]["sub"], "HindIII + EcoRV")
+
+    def test_a_fused_name_does_not_split_the_primer_pair(self):
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[0], self.SIM, self.PLAN)
+        self.assertEqual(lanes[1]["primers"],
+                         ["Kozak+ASAP7y-F", "Kozak+ASAP7y-R"])
+
+    def test_an_unsimulated_route_still_has_geometry(self):
+        from genesis.figure import route_lanes
+        lanes = route_lanes(self.ROUTES[1], {}, self.PLAN)
+        src = lanes[0]["src"]
+        self.assertEqual(src["template_length"], 6880)
+        self.assertEqual(src["from_start"], 2218)
+        self.assertTrue(src["estimated"])
+
+    def test_a_route_with_no_steps_draws_nothing(self):
+        from genesis.figure import route_lanes
+        self.assertEqual(route_lanes(self.ROUTES[3], {}, self.PLAN), [])
+
+
+class TestTemplateAtlas(unittest.TestCase):
+    """A route the planner rejected still has to be drawable."""
+
+    def test_the_atlas_names_sizes_without_sequences(self):
+        from genesis import simulate
+        conn = connect(":memory:")
+        seq = rand_seq(1500, 31)
+        conn.execute("INSERT INTO plasmid (name, seq, seq_length, circular, "
+                     "seq_checksum) VALUES (?,?,?,1,?)",
+                     ("pHost", seq, len(seq), "ck-atlas-1"))
+        pid = conn.execute("SELECT id FROM plasmid").fetchone()["id"]
+        conn.execute("INSERT INTO annotation (plasmid_id, name, feature_type,"
+                     " start, end, strand) VALUES (?,?,?,?,?,1)",
+                     (pid, "CAG", "promoter", 10, 700))
+        plan = {"backbone": {"id": pid},
+                "routes": [{"id": "re", "steps": [
+                    {"operation": "RE_DIGEST", "inputs": ["pHost"]}]}]}
+        atlas = simulate.template_atlas(conn, plan)
+        self.assertIn("pHost", atlas)
+        self.assertEqual(atlas["pHost"]["bp"], len(seq))
+        self.assertNotIn("seq", atlas["pHost"])
+        self.assertEqual([f["name"] for f in atlas["pHost"]["features"]],
+                         ["CAG"])
+        conn.close()
+
+
+class TestStickyEndLigationIsSimulated(unittest.TestCase):
+    """A digest route cannot be judged by looking for homology.
+
+    Every restriction route was reported as "the fragments do not
+    assemble", because the simulator amplified what the primers described
+    and then looked for 15 bp of shared end sequence. A sticky-end
+    ligation does not have that and never will, so the cheapest route on
+    the page was being discarded by a test that did not apply to it.
+    """
+
+    def _plasmid(self):
+        import random
+        rng = random.Random(555)
+        filler = lambda n: "".join(rng.choice("ACGT") for _ in range(n))
+        # GGATCC = BamHI, AAGCTT = HindIII
+        return (filler(300) + "GGATCC" + filler(900) + "AAGCTT"
+                + filler(400))
+
+    def test_a_digest_cuts_into_the_expected_pieces(self):
+        from genesis.simulate import digest
+        seq = self._plasmid()
+        pieces = digest(seq, True, ["BamHI", "HindIII"])
+        self.assertEqual(len(pieces), 2)
+        self.assertEqual({p.left for p in pieces}, {"GATC", "AGCT"})
+
+    def test_the_pieces_religate_to_the_original(self):
+        from genesis.simulate import digest, ligate
+        seq = self._plasmid()
+        joined, note = ligate(digest(seq, True, ["BamHI", "HindIII"]))
+        self.assertIsNotNone(joined, note)
+        self.assertEqual(len(joined), len(seq))
+
+    def test_incompatible_ends_do_not_close(self):
+        from genesis.simulate import digest, ligate
+        seq = self._plasmid()
+        vector = [p for p in digest(seq, True, ["BamHI", "HindIII"])
+                  if len(p.seq) > 500][0]
+        # An insert cut with one enzyme only has two identical ends, so it
+        # cannot go into a vector cut with two different ones directionally.
+        from genesis.simulate import CutFragment
+        wrong = CutFragment("ACGT" * 50, "GATC", "GATC")
+        joined, note = ligate([vector, wrong])
+        self.assertIsNone(joined, note)
+
+    def test_blunt_ends_ligate_but_fix_no_orientation(self):
+        """Blunt ligation is routine; refusing it made ordinary plans
+        - a HindIII/EcoRV cloning, say - look impossible."""
+        from genesis.simulate import CutFragment, ligate
+        a = CutFragment("ACGT" * 40, "", "")
+        b = CutFragment("TTGA" * 40, "", "")
+        joined, note = ligate([a, b])
+        self.assertIsNotNone(joined, note)
+        self.assertIn('orientation', note)
+
+    def test_a_sticky_end_does_not_ligate_to_a_blunt_one(self):
+        """What makes a one-sticky-one-blunt digest directional."""
+        from genesis.simulate import CutFragment, ligate
+        a = CutFragment("ACGT" * 40, "GATC", "GATC")
+        b = CutFragment("TTGA" * 40, "", "")
+        self.assertIsNone(ligate([a, b])[0])
+
+
+class TestProteinEndsAreLabelled(unittest.TestCase):
+    """Which end of a block is the start of the protein.
+
+    On a circular map the two ends of a coding sequence look alike, and
+    for a Cre-lox payload - stored inverted - the amino end is the one
+    drawn second. Getting it from the drawing rather than the strand
+    would label every inverted cassette backwards.
+    """
+
+    def test_a_forward_gene_starts_at_its_low_end(self):
+        from genesis.pdf import _terminus_ends
+        f = {"_start_f": 0.2, "_end_f": 0.6, "strand": 1}
+        self.assertEqual(_terminus_ends(f), (0.2, 0.6))
+
+    def test_a_reverse_gene_starts_at_its_high_end(self):
+        from genesis.pdf import _terminus_ends
+        f = {"_start_f": 0.2, "_end_f": 0.6, "strand": -1}
+        self.assertEqual(_terminus_ends(f), (0.6, 0.2))
+
+    def test_a_feature_with_no_strand_reads_forward(self):
+        from genesis.pdf import _terminus_ends
+        f = {"_start_f": 0.1, "_end_f": 0.3}
+        self.assertEqual(_terminus_ends(f), (0.1, 0.3))
+
+    def test_only_coding_sequences_get_their_own_ends(self):
+        """A 2A peptide is part of somebody else's protein."""
+        from genesis.pdf import _PROTEIN_ENDS
+        self.assertIn("CDS", _PROTEIN_ENDS)
+        for borrowed in ("p2A", "trafficking_motif", "linker", "tag"):
+            self.assertNotIn(borrowed, _PROTEIN_ENDS)
+
+    def test_an_inverted_fusion_reads_from_high_to_low(self):
+        """The order the ribosome sees, for a payload stored backwards."""
+        from genesis.pdf import _terminus_ends
+        # ASAP7y then P2A then EGFP, all on the minus strand.
+        asap = {"_start_f": 0.30, "_end_f": 0.55, "strand": -1}
+        egfp = {"_start_f": 0.08, "_end_f": 0.26, "strand": -1}
+        asap_n, asap_c = _terminus_ends(asap)
+        egfp_n, egfp_c = _terminus_ends(egfp)
+        # ASAP7y is read first, so its C end comes before EGFP's N end.
+        self.assertGreater(asap_n, asap_c)
+        self.assertGreater(asap_c, egfp_n)
+        self.assertGreater(egfp_n, egfp_c)
+
+    def test_the_map_draws_them_for_a_real_construct(self):
+        from genesis.pdf import PDF, A4, circular_map
+        doc = PDF("test", A4)
+        doc._ensure(1)
+        feats = [{"feature_type": "CDS", "name": "ASAP7y", "start": 1920,
+                  "end": 3204, "strand": 1},
+                 {"feature_type": "promoter", "name": "CAG", "start": 92,
+                  "end": 1837, "strand": 1}]
+        circular_map(doc, "test", "7,219 bp", 7219, feats)
+        ops = "".join(o if isinstance(o, str) else o.decode("latin-1")
+                      for o in doc.pages[-1].ops)
+        self.assertIn("(N)", ops)
+        self.assertIn("(C)", ops)
+
+
+class TestSensorGenerationsAreNeverTheSamePart(unittest.TestCase):
+    """A number after a sensor name is a different molecule.
+
+    The lab's rule, stated plainly: the number is the version, a higher
+    one is a better model, and two versions are completely different
+    coding sequences however similar they look. Sequence cannot enforce
+    that - jGCaMP7f's 415 residues are an exact substring of GCaMP6f's
+    450, and QuasAr2 and QuasAr3 differ by a single residue, which is
+    exactly the distance an annotation boundary or a one-base error
+    produces. So the name decides.
+    """
+
+    def test_a_numbered_family_is_recognised(self):
+        from genesis.swap import version_token
+        self.assertEqual(version_token("GCaMP6f"), ("gcamp", "6f"))
+        self.assertEqual(version_token("QuasAr3"), ("quasar", "3"))
+        self.assertEqual(version_token("ASAP7y"), ("asap", "7y"))
+
+    def test_a_one_letter_prefix_does_not_make_a_new_family(self):
+        from genesis.swap import version_token
+        self.assertEqual(version_token("jGCaMP7f")[0], version_token("GCaMP6f")[0])
+        self.assertEqual(version_token("zArchon1")[0], version_token("Archon")[0])
+
+    def test_unnumbered_proteins_are_left_alone(self):
+        from genesis.swap import version_token, same_generation
+        self.assertIsNone(version_token("EGFP"))
+        self.assertIsNone(version_token("HaloTag"))
+        self.assertTrue(same_generation("EGFP", "GFP"))
+
+    def test_different_generations_are_not_the_same_generation(self):
+        from genesis.swap import same_generation
+        for a, b in (("GCaMP6s", "GCaMP6m"), ("QuasAr2", "QuasAr3"),
+                     ("ASAP1", "ASAP7y"), ("ASAP6c", "ASAP7y"),
+                     ("jGCaMP7f", "GCaMP6f")):
+            self.assertFalse(same_generation(a, b), f"{a} vs {b}")
+
+    def test_a_substring_of_a_later_generation_is_refused(self):
+        """The failure this exists to stop."""
+        from genesis.swap import interchangeable
+        later = orf(900, 501)
+        # An exact substring, long enough to pass the length gate - which is
+        # the shape of the real failure: jGCaMP7f's 415 residues sit inside
+        # GCaMP6f's 450.
+        earlier = later[:int(len(later) * 0.92)]
+        self.assertTrue(interchangeable(later, earlier, "CDS"))
+        self.assertFalse(interchangeable(later, earlier, "CDS",
+                                         "GCaMP6f", "jGCaMP7f"))
+
+    def test_one_residue_apart_is_refused(self):
+        from genesis.swap import interchangeable
+        a = orf(900, 502)
+        b = a[:30] + ("A" if a[30] != "A" else "T") + a[31:]
+        self.assertFalse(interchangeable(a, b, "CDS", "QuasAr2", "QuasAr3"))
+
+    def test_the_same_generation_still_merges(self):
+        from genesis.swap import interchangeable
+        cds = orf(900, 503)
+        self.assertTrue(interchangeable(cds, cds[3:], "CDS",
+                                        "ASAP7y", "ASAP7y"))
+
+    def test_an_identical_protein_is_one_molecule_whatever_the_number(self):
+        """Archon and zArchon1 are the same 253 aa protein."""
+        from genesis.swap import interchangeable
+        cds = orf(900, 504)
+        self.assertTrue(interchangeable(cds, cds, "CDS", "Archon", "zArchon1"))
+
+
+class TestPartAliasesFromFolderNames(unittest.TestCase):
+    """A part answers to the name its own folder uses for it.
+
+    The CDS in BHL021_pAAV_ef1a_FLEX_ASAP6c is annotated "ASAP4c 413G"
+    and the same sequence in BHL020_..._DIO_ASAP6c_Kv is annotated
+    "ASAP6b (VR; 6.2)". Neither is findable as ASAP6c, which is what the
+    folder, the file and the person who made it all call it.
+    """
+
+    def test_status_words_are_not_insert_names(self):
+        from genesis.orfs import name_from_plasmid
+        self.assertEqual(
+            (name_from_plasmid("paav-ef1a-flex-asap6c-wpre_estimated") or "").lower(),
+            "asap6c")
+        self.assertEqual(
+            (name_from_plasmid("paav-hsyn-dio-asap6c-kv-wpre_confirmed") or "").lower(),
+            "asap6c")
+
+    def test_a_folder_name_yields_the_insert(self):
+        from genesis.orfs import name_from_plasmid
+        self.assertEqual(name_from_plasmid("BHL021_pAAV_ef1a_FLEX_ASAP6c"),
+                         "ASAP6c")
+
+    def test_the_alias_table_exists_on_an_old_database(self):
+        """A new table needs migrating, not just declaring."""
+        conn = connect(":memory:")
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("part_alias", names)
+        conn.close()
+
+    def test_only_an_authoritative_alias_is_searchable(self):
+        from genesis.construct import candidate_parts, Module
+        conn = connect(":memory:")
+        cds = orf(900, 511)
+        pid = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','ASAP4c 413G',?,'x',?)""",
+            (cds, len(cds))).lastrowid
+        conn.execute(
+            """INSERT INTO part_alias(part_id, alias, source, authoritative)
+               VALUES (?,?,'folder',0)""", (pid, "ASAP6c"))
+        conn.commit()
+        self.assertEqual(candidate_parts(conn, Module(type="CDS", name="ASAP6c")),
+                         [], "a disputed alias must not answer a search")
+        conn.execute("UPDATE part_alias SET authoritative = 1")
+        conn.commit()
+        found = candidate_parts(conn, Module(type="CDS", name="ASAP6c"))
+        self.assertEqual([f["id"] for f in found], [pid])
+        conn.close()
+
+
+class TestShortElementsAreNotAmbiguousRepeats(unittest.TestCase):
+    """Six bases recur by arithmetic, not by accident."""
+
+    def test_a_kozak_is_not_reported_as_an_ambiguous_repeat(self):
+        from genesis.verify import MIN_DISTINCT_ELEMENT
+        self.assertGreater(MIN_DISTINCT_ELEMENT, 6)
+
+
+def _back_translate(protein):
+    """One arbitrary coding sequence for a peptide, for building fixtures."""
+    table = {"A": "GCT", "R": "CGT", "N": "AAT", "D": "GAT", "C": "TGT",
+             "Q": "CAA", "E": "GAA", "G": "GGT", "H": "CAT", "I": "ATT",
+             "L": "CTG", "K": "AAA", "M": "ATG", "F": "TTT", "P": "CCT",
+             "S": "TCT", "T": "ACT", "W": "TGG", "Y": "TAT", "V": "GTT"}
+    return "".join(table[a] for a in protein)
+
+
+class TestPickerGroupsByProtein(unittest.TestCase):
+    """One row per protein, not per annotation.
+
+    A name search for "CheRiff" returned the same molecule seventeen times,
+    hid the soma-targeted version behind an identical label, and missed
+    every row whose annotation says "ChR64". Grouping by the protein fixes
+    all three, provided it never puts two generations of a sensor in one
+    family.
+    """
+
+    def _inventory(self):
+        conn = connect(":memory:")
+        # Proportions that match the real case: CheRiff is 320 aa and the
+        # Kv2.1 soma tag that makes a SomCheRiff out of it is 65 aa. A tag
+        # that is a rounding error next to its core would simply read as a
+        # different annotation boundary, which is the thing being tested.
+        core = orf(320, 601)
+        from genesis.swap import protein_of
+        self.core_aa = protein_of(core)
+
+        host = [0]
+        made = [0]
+
+        def part(name, seq, occ=1):
+            made[0] += 1
+            pid = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (name, seq, "chk%d" % made[0], len(seq))).lastrowid
+            for _ in range(occ):
+                host[0] += 1
+                plid = conn.execute(
+                    """INSERT INTO plasmid(name, owner, seq, seq_length,
+                            seq_checksum, circular, verified)
+                       VALUES (?,'t',?,?,?,1,'unverified')""",
+                    ("host%d" % host[0], seq, len(seq),
+                     "h%d" % host[0])).lastrowid
+                conn.execute(
+                    """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                            end, strand) VALUES (?,?,0,?,1)""",
+                    (pid, plid, len(seq)))
+            return pid
+
+        # the same protein at four boundaries, as the real catalogue has it
+        self.plain = part("CheRiff", core, occ=9)
+        part("CheRiff", core[:-9], occ=5)
+        part("CheRiff", core[:-15], occ=3)
+        part("ChR64", core[:-6], occ=2)          # encodes it under another name
+        # a decorated version: the core plus the real 65 aa Kv2.1 soma tag
+        kv = _back_translate("MSSMPSPVAPLPARTEGVIDMRSMSSIDSFISCATDFPEATRF"
+                             "QSQPILNTKEMAPQSKPPEE")
+        self.soma = part("CheRiff", core[:-3] + kv, occ=4)
+        conn.commit()
+        return conn
+
+    def test_duplicate_boundaries_collapse_into_one_entry(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        self.assertTrue(fams)
+        plain = [v for v in fams[0]["variants"] if v["label"] == "plain"]
+        self.assertEqual(len(plain), 1, [v["label"] for v in fams[0]["variants"]])
+        self.assertGreater(plain[0]["n_rows"], 1)
+        conn.close()
+
+    def test_sources_are_summed_across_the_collapsed_rows(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        plain = next(v for v in fams[0]["variants"] if v["label"] == "plain")
+        self.assertGreaterEqual(plain["n_sources"], 9 + 5 + 3)
+        conn.close()
+
+    def test_a_part_named_something_else_is_still_found(self):
+        """The recall half: 56 real CheRiff rows are named ChR64 and friends."""
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        names = {n for v in fams[0]["variants"]
+                 for n in ([v["name"]] + list(v.get("also") or []))}
+        self.assertIn("ChR64", names)
+        conn.close()
+
+    def test_a_decorated_version_is_its_own_entry(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        fams = protein_families(conn, "CheRiff", limit=5)
+        labels = [v["label"] for v in fams[0]["variants"]]
+        self.assertTrue(any(l != "plain" for l in labels), labels)
+        conn.close()
+
+    def test_two_generations_never_share_a_family(self):
+        """The rule that overrides every sequence argument."""
+        from genesis.families import protein_families
+        conn = connect(":memory:")
+        later = orf(900, 602)
+        earlier = later[:int(len(later) * 0.92)]
+        for n, (name, seq) in enumerate((("GCaMP6f", later),
+                                         ("jGCaMP7f", earlier)), start=1):
+            pid = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES ('CDS',?,?,?,?)""",
+                (name, seq, name, len(seq))).lastrowid
+            plid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'unverified')""",
+                ("h%d" % n, seq, len(seq), "k%d" % n)).lastrowid
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start, end,
+                        strand) VALUES (?,?,0,?,1)""", (pid, plid, len(seq)))
+        conn.commit()
+        fams = protein_families(conn, "GCaMP", limit=5)
+        for fam in fams:
+            names = {v["name"] for v in fam["variants"]}
+            self.assertFalse({"GCaMP6f", "jGCaMP7f"} <= names,
+                             "two generations were put in one family")
+        conn.close()
+
+    def test_an_empty_query_does_not_explode(self):
+        from genesis.families import protein_families
+        conn = self._inventory()
+        self.assertIsInstance(protein_families(conn, "", limit=3), list)
+        conn.close()
+
+
+class TestShortFragmentInAnIsothermalAssembly(unittest.TestCase):
+    """A piece an isothermal assembly could digest entirely.
+
+    Addgene's cloning reference: "Anything shorter than 200 base pairs
+    has the potential to be completely degraded by the 5' exonuclease."
+    Genesis's own floor is 100 bp, which is about whether a PCR is worth
+    running rather than whether the product survives the reaction.
+    """
+
+    def test_the_floor_is_addgenes_number(self):
+        from genesis.planner import GIBSON_EXONUCLEASE_FLOOR
+        self.assertEqual(GIBSON_EXONUCLEASE_FLOOR, 200)
+
+    def test_a_short_fragment_is_called_out(self):
+        from genesis.planner import (plan_hifi_route, PlannedFragment,
+                                     GIBSON_EXONUCLEASE_FLOOR)
+        from genesis.construct import AssembledConstruct
+        cfg = Config()
+        short = orf(150, 701)[:150]          # above the PCR floor, below 200
+        self.assertTrue(cfg.min_pcr_length <= len(short)
+                        < GIBSON_EXONUCLEASE_FLOOR)
+        frag = PlannedFragment('tiny', short, None, '(synthesis)', 0,
+                               len(short), 1, False, [], needs_synthesis=True)
+        construct = AssembledConstruct(seq=short, layout=[], circular=True)
+        route = plan_hifi_route(connect(":memory:"), construct, [frag], None,
+                                cfg, kit="HI_FI_ASSEMBLY")
+        self.assertTrue(
+            any('exonuclease' in w for w in route.warnings),
+            route.warnings)
+
+    def test_a_long_fragment_is_not(self):
+        from genesis.planner import plan_hifi_route, PlannedFragment
+        from genesis.construct import AssembledConstruct
+        cfg = Config()
+        long_ = orf(900, 702)
+        frag = PlannedFragment('big', long_, None, '(synthesis)', 0,
+                               len(long_), 1, False, [], needs_synthesis=True)
+        construct = AssembledConstruct(seq=long_, layout=[], circular=True)
+        route = plan_hifi_route(connect(":memory:"), construct, [frag], None,
+                                cfg, kit="HI_FI_ASSEMBLY")
+        self.assertFalse(any('exonuclease' in w for w in route.warnings),
+                         route.warnings)

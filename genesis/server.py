@@ -18,7 +18,7 @@ GET  /api/enzymes                       enzyme catalogue
 GET  /api/vocab                         controlled feature vocabulary
 GET  /api/config                        effective configuration
 POST /api/scan          {spec}          resolve modules, list candidate parents
-POST /api/design        {spec}          run Stages 4-10, return a plan
+POST /api/design        {spec}          run Stages 4-10, return a plan\nPOST /api/design/stream {spec}          the same, as server-sent events: one\n                     `progress` per stage, then `plan`
 POST /api/save   {spec, plan, mode, design_id}\n                     mode: version | overwrite | save_as\nPOST /api/delete-design {design_id} or {construct_id}
 GET  /api/designs                       stored designs
 POST /api/outcome       {...}           record an experimental result
@@ -29,6 +29,7 @@ POST /api/import        {limit}         rescan the share
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import traceback
@@ -45,7 +46,8 @@ from .db import connect
 from .design import (delete_construct, delete_design, design, save_design,
                      scan_sources)
 from .enzymes import CATALOG
-from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
+from .export import (primer_order_csv, primer_table_csv,
+                     protocol_markdown, protocol_pdf,
                      to_genbank)
 from .importer import import_tree
 
@@ -76,6 +78,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/save": "member", "/api/outcome": "member",
         "/api/delete-design": "member",
         "/api/import": "admin", "/api/users": "admin",
+        # Re-reading the share writes to the shared inventory.
+        "/api/rescan/stream": "member",
     }
 
     def cookie_token(self) -> str:
@@ -133,6 +137,104 @@ class Handler(BaseHTTPRequestHandler):
         if filename:
             extra["Content-Disposition"] = f'attachment; filename="{filename}"'
         self._send(200, data.encode(), ctype, extra)
+
+    def rescan_stream(self, conn, force: bool = False):
+        """Re-read the share, saying how far it has got.
+
+        The inventory is a snapshot, and a snapshot goes stale the
+        moment somebody saves a plasmid: a folder added after the last
+        scan simply is not there, which looks like Genesis losing it.
+        Running the scan took a terminal and knowing the command, so
+        in practice it was run when something was already missing.
+
+        Two passes, because that is what a refresh is: read the tree
+        for files that are new or changed, then look for payload
+        coding sequences in whatever arrived that nobody annotated.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(event, payload):
+            self.wfile.write(
+                f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+                .encode())
+            self.wfile.flush()
+
+        root = str(self.cfg.dna_root)
+        if not os.path.isdir(root):
+            emit("failed", {"error": f"{root} is not reachable - is the "
+                                     f"share mounted?"})
+            return
+        emit("progress", {"phase": "scan", "label": f"Reading {root}",
+                          "done": 0})
+        try:
+            def scanning(st):
+                emit("progress", {
+                    "phase": "scan", "done": None,
+                    "label": f"{st.scanned:,} files read, "
+                             f"{st.plasmids:,} plasmids",
+                    "scanned": st.scanned, "plasmids": st.plasmids,
+                    "reads": st.reads, "duplicates": st.duplicates})
+
+            stats = import_tree(conn, self.cfg, progress=scanning,
+                                motif_scan=True, force=force)
+
+            from .orfs import infer_all
+            emit("progress", {"phase": "orfs", "done": None,
+                              "label": "Looking for coding sequences "
+                                       "nobody annotated"})
+
+            def orfing(done, total, found, skipped):
+                emit("progress", {
+                    "phase": "orfs",
+                    "done": (done / total) if total else None,
+                    "label": f"{done:,}/{total:,} plasmids, "
+                             f"{found:,} coding sequences inferred"})
+
+            orfs = infer_all(conn, progress=orfing)
+        except Exception as exc:
+            emit("failed", {"error": str(exc)})
+            return
+
+        emit("done", {"scan": stats.as_dict(), "orfs": orfs})
+
+    def design_stream(self, conn, spec):
+        """Run the design, saying what it is doing while it does it.
+
+        Planning takes the better part of a minute on a four-module
+        construct, and a button that goes grey for forty seconds looks
+        like a button that has broken. Each stage is sent as it starts
+        and the finished plan as the last event, so nothing has to be
+        requested twice.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(event, payload):
+            self.wfile.write(
+                f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+                .encode())
+            self.wfile.flush()
+
+        def progress(key, label, done):
+            emit("progress", {"stage": key, "label": label,
+                              "done": round(done, 3)})
+
+        try:
+            plan = design(conn, spec, self.cfg, progress=progress)
+        except Exception as exc:                 # the stream owns the error
+            emit("failed", {"error": str(exc)})
+            return
+        emit("progress", {"stage": "done", "label": "Done", "done": 1})
+        emit("plan", plan)
 
     def body_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -206,7 +308,19 @@ class Handler(BaseHTTPRequestHandler):
                  ".js": "application/javascript; charset=utf-8",
                  ".css": "text/css; charset=utf-8",
                  ".svg": "image/svg+xml"}.get(target.suffix, "application/octet-stream")
-        self._send(200, target.read_bytes(), ctype)
+        body = target.read_bytes()
+        # Revalidate every time. Nothing here was cache-busted, so a browser
+        # applying its own heuristic happily serves the app.js from before a
+        # deploy and the new feature simply is not there - which looks like a
+        # bug in the feature rather than a stale file. The files are tens of
+        # kilobytes over a LAN; a conditional request costs nothing.
+        stamp = str(int(target.stat().st_mtime))
+        tag = '"%s-%d"' % (stamp, len(body))
+        if self.headers.get("If-None-Match") == tag:
+            return self._send(304, b"", ctype, {"ETag": tag,
+                                                "Cache-Control": "no-cache"})
+        self._send(200, body, ctype,
+                   {"ETag": tag, "Cache-Control": "no-cache"})
 
     # -- GET endpoints ---------------------------------------------------
     def api_get(self, path: str, q: dict):
@@ -293,6 +407,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/parts":
             ftype = (q.get("type") or [""])[0]
             term = (q.get("q") or [""])[0].strip()
+            # One row per protein, not per annotation. A name search for
+            # "CheRiff" returns the same molecule six times and hides the
+            # soma-targeted one behind an identical label; grouping shows
+            # the family and names what is fused to each member.
+            if (q.get("group") or [""])[0] == "protein" and ftype == "CDS":
+                from .families import protein_families
+                return self.json({
+                    "groups": protein_families(
+                        self.conn, term, ftype,
+                        limit=min(int((q.get("limit") or ["12"])[0]), 40)),
+                })
             limit = min(int((q.get("limit") or ["120"])[0]), 300)
             # Hide annotations too short to be a believable instance of their
             # type, so the picker cannot offer something the planner would
@@ -509,14 +634,15 @@ class Handler(BaseHTTPRequestHandler):
                     else ConstructSpec.from_dict(spec_in or {}))
             return self.json(scan_sources(c, spec, self.cfg))
 
-        if path == "/api/design":
+        if path in ("/api/design", "/api/design/stream"):
             spec_in = body.get("spec")
             if isinstance(spec_in, str):
                 spec = ConstructSpec.from_yaml(spec_in)
             else:
                 spec = ConstructSpec.from_dict(spec_in or {})
-            plan = design(c, spec, self.cfg)
-            return self.json(plan)
+            if path == "/api/design":
+                return self.json(design(c, spec, self.cfg))
+            return self.design_stream(c, spec)
 
         if path == "/api/save":
             spec = ConstructSpec.from_dict(body["spec"]) if isinstance(
@@ -562,6 +688,10 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "primers":
                 return self.text(primer_table_csv(plan, route),
                                  "text/csv; charset=utf-8", f"{name}_primers.csv")
+            if kind == "order":
+                return self.text(primer_order_csv(plan, route),
+                                 "text/csv; charset=utf-8",
+                                 f"{name}_IDT_order.csv")
             if kind == "pdf":
                 data = protocol_pdf(plan, self.cfg, route)
                 return self._send(200, data, "application/pdf",
@@ -577,6 +707,9 @@ class Handler(BaseHTTPRequestHandler):
             stats = import_tree(c, self.cfg, limit=limit,
                                 motif_scan=body.get("motif_scan", True))
             return self.json(stats.as_dict())
+
+        if path == "/api/rescan/stream":
+            return self.rescan_stream(c, bool(body.get("force")))
 
         if path.startswith("/api/plasmid/") and path.endswith("/annotate"):
             if not self.cfg.allow_annotation_edits:

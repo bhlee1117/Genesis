@@ -24,6 +24,12 @@ class Operation:
     inputs: tuple
     output: str
     mandatory: bool = False
+    #: Worth doing and not required. A checkpoint gel tells you whether
+    #: the last reaction worked; skipping it does not stop the cloning,
+    #: it only moves the moment you find out. Marked so the protocol can
+    #: say so, and so an optional step's bench time is not added to the
+    #: hours the protocol actually demands.
+    optional: bool = False
     changes_sequence: bool = False
     combinable_with: tuple = ()
     default_minutes: int = 60      # elapsed, including incubations and waits
@@ -75,6 +81,13 @@ OPERATIONS: dict[str, Operation] = {o.code: o for o in [
     Operation("SEQUENCE_VERIFY", "Confirm the final construct by sequencing",
               ("candidate clone",), "verified plasmid", mandatory=True,
               default_minutes=1440, hands_on_minutes=20),
+    Operation("QC_GEL", "Check the last reaction worked before going on",
+              ("an aliquot of the reaction",), "a go / no-go answer",
+              default_minutes=45, hands_on_minutes=20, optional=True,
+              notes="Optional, and the cheapest step in the protocol and "
+                    "the one that saves the most: a failed PCR costs an "
+                    "hour here and two days if it is found on the plate "
+                    "instead."),
     Operation("SYNTHESIS", "Order a synthetic DNA fragment",
               ("sequence",), "synthetic fragment", changes_sequence=True,
               default_minutes=10080, hands_on_minutes=10, notes="Use only when no lab template exists."),
@@ -98,6 +111,7 @@ class Step:
         d["notes"] = op.notes if op else ""
         d["minutes"] = op.default_minutes if op else 0       # elapsed
         d["hands_on"] = op.hands_on_minutes if op else 0     # active bench time
+        d["optional"] = bool(op.optional) if op else False
         return d
 
 

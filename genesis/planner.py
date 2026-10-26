@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 
 from .config import Config
 from .construct import AssembledConstruct, ResolvedModule
-from .enzymes import CATALOG, digest, ends_compatible, find_sites, methylation_warnings
+from .enzymes import (CATALOG, dam_sites, digest, ends_compatible, find_sites,
+                      methylation_warnings)
 from .operations import Step, renumber
 from .primers import (Junction, Primer, analyse_junctions, check_overlap_uniqueness,
                       design_gibson_pair, design_re_pair)
@@ -72,8 +73,20 @@ class Route:
             "n_steps": len(self.steps),
             # Active bench time, and total elapsed turnaround including
             # overnight growth, sequencing and any synthesis order.
-            "hands_on_minutes": sum(s.to_dict()["hands_on"] for s in self.steps),
-            "turnaround_minutes": sum(s.to_dict()["minutes"] for s in self.steps),
+            # Optional steps are counted separately: a checkpoint gel is
+            # worth running and is not work the protocol demands, so
+            # folding its time into the headline overstates the job.
+            "hands_on_minutes": sum(d["hands_on"] for d in
+                                    (s.to_dict() for s in self.steps)
+                                    if not d.get("optional")),
+            "turnaround_minutes": sum(d["minutes"] for d in
+                                      (s.to_dict() for s in self.steps)
+                                      if not d.get("optional")),
+            "optional_minutes": sum(d["hands_on"] for d in
+                                    (s.to_dict() for s in self.steps)
+                                    if d.get("optional")),
+            "n_optional": sum(1 for d in (s.to_dict() for s in self.steps)
+                              if d.get("optional")),
         }
 
 
@@ -190,15 +203,23 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
             current = None
             continue
 
+        # Which way along the template consecutive modules travel. It is
+        # not the source strand alone: a Cre-lox payload is placed
+        # inverted, so its modules run backwards through a donor that
+        # holds them the right way round, and testing only the source
+        # strand left P2A and EGFP - adjacent bases in one plasmid - as
+        # two reactions, one of them 66 bp long.
+        placed_strand = item.get("strand", 1)
+        forward = source["strand"] * placed_strand == 1
         can_extend = (
             current is not None
             and current.source_plasmid_id == source["id"]
             and current.strand == source["strand"]
-            and current.placed_strand == item.get("strand", 1)
+            and current.placed_strand == placed_strand
             and not current.needs_synthesis
             and (
-                (source["strand"] == 1 and source["start"] == current.end)
-                or (source["strand"] == -1 and source["end"] == current.start)
+                (forward and source["start"] == current.end)
+                or (not forward and source["end"] == current.start)
             )
             and (len(current.seq) + len(rm.seq)) <= cfg.max_pcr_length
         )
@@ -206,7 +227,7 @@ def group_contiguous(resolved: list[ResolvedModule], construct: AssembledConstru
             current.seq += rm.seq
             current.name += f"+{rm.part_name}"
             current.modules.append(item)
-            if source["strand"] == 1:
+            if forward:
                 current.end = source["end"]
             else:
                 current.start = source["start"]
@@ -304,7 +325,19 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     # PCR.  Anything too short to amplify is carried on the next piece's
     # forward primer instead, which puts the same bases in the same place
     # for the cost of a longer oligo.
+    # Which short fragments have a long piece on both sides, and so can
+    # be written into two tails that will actually exist.
+    def _long(o):
+        return len(o["seq"]) >= cfg.min_pcr_length
+    foldable = {}
+    for pos, o in enumerate(ordered):
+        foldable[id(o)] = (any(_long(x) for x in ordered[:pos])
+                           and any(_long(x) for x in ordered[pos + 1:]))
+
     carried: dict[int, str] = {}
+    #: piece index -> bases that belong between it and the next piece,
+    #: to be written into the two primer tails that meet there.
+    split_after: dict[int, str] = {}
     keep: list[dict] = []
     pending = ""
     for o in ordered:
@@ -319,6 +352,19 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             if o["kind"] == "fragment":
                 absorbed.add(o["index"])
             continue
+        # A short element out of a real plasmid was still getting its own
+        # reaction: P2A is 66 bp, and a PCR whose primers are longer than
+        # its product is not a PCR anybody sets up. It goes into the two
+        # primer tails that flank it instead - but only where there is a
+        # tail on each side to take it. An element with no amplified
+        # neighbour before and after it is a different operation (an
+        # inverse PCR with the insert on the tails), so it keeps the
+        # advice it had rather than getting a fold that does not apply.
+        if short and o["kind"] == "fragment" and keep and foldable[id(o)]:
+            split_after[len(keep) - 1] = (
+                split_after.get(len(keep) - 1, "") + o["seq"])
+            absorbed.add(o["index"])
+            continue
         if pending:
             carried[len(keep)] = pending
             pending = ""
@@ -331,6 +377,14 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     else:
         carried = {}
 
+    # `split_after` is deliberately NOT folded in here. These sequences
+    # are what the overlaps get computed from, and a folded element is
+    # written into the tails afterwards: for a split the computed tail
+    # is overwritten anyway, and for one too short to split the tail
+    # has to stay the real homology with the neighbour's real end.
+    # Appending it made the overlap describe bases that end up
+    # somewhere else, and a single-piece circularisation then had two
+    # ends that shared nothing.
     pieces: list[tuple[str, str]] = [
         (o["name"], carried.get(i, "") + o["seq"])
         for i, o in enumerate(ordered)]
@@ -340,7 +394,9 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         return route
 
     n = len(pieces)
+    pair_by_piece: dict[int, tuple] = {}
     templates_needing_dpni: list[str] = []
+    dpni_template_ids: list = []
 
     # --- backbone amplification ------------------------------------------
     for k, piece in enumerate(ordered):
@@ -356,6 +412,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             carry_downstream=False, unique_in=construct.seq)
         _carry(fwd, carried.get(k, ""), route, cfg)
         _check_unique(fwd, construct.seq, route)
+        pair_by_piece[k] = (fwd, rev)
         primers += [fwd, rev]
         if len(bb_seq) > cfg.max_pcr_length:
             route.warnings.append(
@@ -373,6 +430,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             details={"length": len(bb_seq), "template": backbone["name"]}))
         if backbone["name"] not in templates_needing_dpni:
             templates_needing_dpni.append(backbone["name"])
+            dpni_template_ids.append(backbone["id"])
 
     # --- insert amplification ---------------------------------------------
     where = {o["index"]: k for k, o in enumerate(ordered)
@@ -380,6 +438,22 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     for i, frag in enumerate(fragments):
         if i in absorbed:
             continue            # amplified as part of the recipient's arc
+
+        # Addgene's reference: "Anything shorter than 200 base pairs has
+        # the potential to be completely degraded by the 5' exonuclease."
+        # Genesis would rather carry a short piece on a neighbouring
+        # primer tail than put it in the tube, and usually does - but a
+        # fragment that reaches the reaction on its own is at risk
+        # whether it was amplified or ordered, so this sits before the
+        # branch that separates the two.
+        if (cfg.min_pcr_length <= len(frag.seq) < GIBSON_EXONUCLEASE_FLOOR
+                and kit in ("HI_FI_ASSEMBLY", "GIBSON_ASSEMBLY")):
+            route.warnings.append(
+                f"{frag.name} is {len(frag.seq)} bp; a fragment under "
+                f"{GIBSON_EXONUCLEASE_FLOOR} bp can be chewed away entirely "
+                f"by the exonuclease in an isothermal assembly - carry it on "
+                f"a neighbouring primer tail, or order it as annealed oligos")
+
         piece_index = where.get(i, i)
         up = pieces[piece_index - 1][1]
         down = pieces[(piece_index + 1) % n][1]
@@ -408,6 +482,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             circular_template=circ, carry_downstream=False,
             unique_in=construct.seq)
         _carry(fwd, carried.get(piece_index, ""), route, cfg)
+        pair_by_piece[piece_index] = (fwd, rev)
         # Report where the part is in the donor, not where it is in the
         # strand the primers were written against.
         for pr in (fwd, rev):
@@ -439,17 +514,49 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             details={"length": len(frag.seq), "template": frag.source_name,
                      "gc": round(gc_fraction(frag.seq), 3)}))
         templates_needing_dpni.append(frag.source_name)
+        if frag.source_plasmid_id:
+            dpni_template_ids.append(frag.source_plasmid_id)
+
+    # Every pair exists now, so the folded elements can be written into
+    # the two tails that meet where each one belongs.
+    for k, element in split_after.items():
+        here = pair_by_piece.get(k)
+        nxt = pair_by_piece.get((k + 1) % n)
+        if not here or not nxt:
+            route.warnings.append(
+                f"a {len(element)} bp element has no amplified neighbour to "
+                f"carry it; order it as annealed oligos")
+            continue
+        _split_into_tails(here[1], nxt[0], element,
+                          _fold_overlap(element, cfg), route, cfg)
 
     # --- template removal and cleanup -------------------------------------
-    if templates_needing_dpni:
-        steps.append(Step(
-            0, "DPNI_DIGEST",
-            "Digest the PCR reactions with DpnI to remove the parental "
-            "plasmid templates (" + ", ".join(sorted(set(templates_needing_dpni))[:4]) + ")",
-            output="template-free amplicons"))
-
-    # Gel extraction only where it is actually warranted (Stage 8 rule).
+    # Gel extraction is decided first: an amplicon cut out of a gel is
+    # already separated from its template, which is one of the reasons
+    # DpnI can be skipped. The swap routes have always reasoned this way;
+    # here the step went in unconditionally.
     gel_needed = [f.name for f in fragments if _expects_extra_bands(f, cfg)]
+    if templates_needing_dpni:
+        dpni = dpni_decision(conn, dpni_template_ids,
+                             backbone["id"] if backbone else None,
+                             gel_purified=bool(gel_needed) and
+                             len(gel_needed) == len(fragments))
+        if dpni["needed"]:
+            note = dpni_note(dpni)
+            steps.append(Step(
+                0, "DPNI_DIGEST",
+                "Digest the PCR reactions with DpnI to remove the parental "
+                "plasmid templates ("
+                + ", ".join(sorted(set(templates_needing_dpni))[:4]) + ")",
+                output="template-free amplicons",
+                details={"note": note} if note else {}))
+            for name in dpni.get("uncuttable") or []:
+                route.warnings.append(
+                    f"{name} has no GATC site, so DpnI cannot cut it; gel "
+                    f"purify that amplicon or expect parental background")
+        else:
+            route.warnings.append(dpni_skipped_warning(dpni))
+
     if gel_needed:
         steps.append(Step(
             0, "GEL_EXTRACTION",
@@ -479,7 +586,12 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
 
     route.steps = renumber(steps)
     route.primers = primers
-    route.junctions = analyse_junctions(construct.layout, construct.seq, "hifi", cfg)
+    # Where the amplicons actually meet, as opposed to every boundary
+    # between two annotated elements: three joins in a three-fragment
+    # assembly, not one per annotation.
+    joins = {o["at"] for o in ordered if isinstance(o.get("at"), int)}
+    route.junctions = analyse_junctions(construct.layout, construct.seq,
+                                        "hifi", cfg, joins=joins)
     route.warnings += check_overlap_uniqueness(construct.layout, construct.seq, cfg)
     for j in route.junctions:
         route.warnings += [f"junction {j.index} ({j.left_name}|{j.right_name}): {w}"
@@ -620,10 +732,20 @@ def plan_gblock_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         inputs=[backbone["name"], f"{bb_f.name}+{bb_r.name}"],
         output="linearised vector",
         details={"length": len(kept), "template": backbone["name"]}))
-    steps.append(Step(
-        0, "DPNI_DIGEST",
-        f"Digest the PCR with DpnI to remove the {backbone['name']} template",
-        inputs=["vector PCR"], output="template-free vector"))
+    dpni = (dpni_decision(conn, [backbone["id"]], backbone["id"],
+                          gel_purified=False) if conn is not None
+            else {"needed": True, "blocked": False, "sites": {},
+                  "uncuttable": []})
+    if dpni["needed"]:
+        note = dpni_note(dpni)
+        steps.append(Step(
+            0, "DPNI_DIGEST",
+            f"Digest the PCR with DpnI to remove the {backbone['name']} "
+            f"template",
+            inputs=["vector PCR"], output="template-free vector",
+            details={"note": note} if note else {}))
+    else:
+        route.warnings.append(dpni_skipped_warning(dpni))
     steps.append(Step(
         0, "DNA_CLEANUP", "Column purify the vector PCR",
         output="clean vector"))
@@ -638,7 +760,8 @@ def plan_gblock_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     route.steps = renumber(steps)
     route.primers = primers
     route.junctions = analyse_junctions(construct.layout, construct.seq,
-                                        "gblock", cfg)
+                                        "gblock", cfg,
+                                        joins=_insert_joins(construct))
     route.warnings.append(
         f"one fragment to order and one reaction to run, against "
         f"{len(construct.backbone_segments)} arc(s) of recipient kept")
@@ -699,6 +822,8 @@ def plan_restriction_route(conn: sqlite3.Connection, construct: AssembledConstru
 
     candidates = _find_enzyme_pairs(bb_seq, insert_seq, construct, protected, cfg,
                                     bb_circ)
+    candidates = _native_pairs_that_work(conn, candidates, fragments,
+                                         insert_seq)
     if not single_donor_contiguous:
         # Without a single contiguous donor the sites have to be added by PCR.
         candidates = [c for c in candidates if c["mode"] == "add_by_pcr"] or [
@@ -784,12 +909,68 @@ def plan_restriction_route(conn: sqlite3.Connection, construct: AssembledConstru
     route.steps = renumber(steps)
     route.primers = primers
     route.junctions = analyse_junctions(construct.layout, construct.seq,
-                                        "ligation", cfg)
+                                        "ligation", cfg,
+                                        joins=_insert_joins(construct))
     route.warnings += best["warnings"]
     for p in primers:
         route.warnings += [f"primer {p.name}: {w}" for w in p.warnings]
     route.cost_breakdown["enzymes"] = [e1, e2]
     return route
+
+
+def _native_pairs_that_work(conn: sqlite3.Connection, candidates: list,
+                            fragments: list, insert_seq: str) -> list:
+    """Drop "cut it straight out of the donor" pairs that cannot do that.
+
+    A pair qualifies by cutting the backbone once each and not cutting
+    inside the insert. Neither of those says the pair cuts the DONOR at
+    the insert's edges, and the native mode assumes it does. So a plan
+    went out saying "digest the donor with HindIII + EcoRV to release the
+    insert" when those two sites sit four bases apart in the backbone and
+    nowhere near the insert's boundaries in the donor - the digest yields
+    2,846, 4 and 4,030 bp and not one of them is the 1,290 bp the step
+    claims to gel-purify.
+
+    Rather than reason about where the sites fall, cut the donor and look
+    for the band.
+    """
+    from .simulate import digest
+
+    if not candidates or not fragments:
+        return candidates
+    source_id = getattr(fragments[0], "source_plasmid_id", None)
+    if not source_id:
+        return candidates
+    row = conn.execute("SELECT seq, circular FROM plasmid WHERE id = ?",
+                       (source_id,)).fetchone()
+    if row is None or not row["seq"]:
+        return candidates
+    donor_seq, donor_circ = row["seq"].upper(), bool(row["circular"])
+    want = len(insert_seq)
+
+    kept = []
+    for cand in candidates:
+        if cand.get("mode") != "native":
+            kept.append(cand)
+            continue
+        bands = digest(donor_seq, donor_circ, list(cand["enzymes"]))
+        # The band has to be the insert: the right size, and actually
+        # containing it rather than merely measuring the same.
+        ok = any(abs(len(b.seq) - want) <= 12
+                 and (insert_seq.upper() in b.seq
+                      or revcomp(insert_seq.upper()) in b.seq)
+                 for b in bands)
+        if ok:
+            kept.append(cand)
+        else:
+            # Still usable if the sites are added by PCR instead.
+            kept.append(dict(
+                cand, mode="add_by_pcr",
+                warnings=cand.get("warnings", []) + [
+                    f"{' + '.join(cand['enzymes'])} do not cut the donor at "
+                    f"the insert's edges, so the sites are added by PCR "
+                    f"rather than cutting it straight out"]))
+    return kept
 
 
 def _find_enzyme_pairs(bb_seq: str, insert_seq: str,
@@ -1070,7 +1251,118 @@ def _merge_contiguous(ordered: list[dict], template_length: int
     return pieces, absorbed
 
 
-def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
+#: Below this an isothermal assembly can digest a fragment completely:
+#: the 5' exonuclease chews both ends, and a short piece has no middle
+#: left. Addgene's cloning reference gives 200 bp.
+GIBSON_EXONUCLEASE_FLOOR = 200
+
+
+#: Keep a folded element's tails in the band people actually order.
+#: A 40-50 nt tail on a 20 nt annealing site is a 60-70mer, which is
+#: one oligo at the 100 nmole scale; past that it becomes an ultramer
+#: and the truncation fraction starts to matter.
+FOLD_TARGET_TAIL = 45
+
+
+def _fold_overlap(element: str, cfg: Config) -> int:
+    """The longest overlap that still keeps both tails orderable.
+
+    Splitting a 66 bp element down the middle with the assembly's
+    standard 25 bp overlap gives 46 nt tails; dropping to 20 gives 43.
+    Both work, so take the longest overlap the tail budget allows -
+    a longer overlap is the more robust assembly - and never go under
+    what the kit needs to anneal at all.
+    """
+    from .primers import ASSEMBLY_HOMOLOGY
+    kit = "gibson" if "gibson" in (cfg.preferred_assembly_kit or "").lower() \
+        else "hifi"
+    low, high = ASSEMBLY_HOMOLOGY.get(kit, (15, 25))
+    high = min(high, getattr(cfg, "overlap_length", high) or high)
+    budget = 2 * FOLD_TARGET_TAIL - len(element)
+    return max(low, min(high, budget))
+
+
+def _split_into_tails(up_rev: Primer, down_fwd: Primer, element: str,
+                      overlap: int, route: "Route",
+                      cfg: Config | None = None) -> None:
+    """Write a short element into the two primer tails that flank it.
+
+    P2A is 66 bp. Amplifying it means a PCR whose primers are longer
+    than its product, and piling all 66 onto one neighbour's tail makes
+    a 110-mer. The way it is actually done is to split it: the upstream
+    fragment's reverse primer carries the front of the element, the
+    downstream fragment's forward primer carries the back, and the two
+    share enough of the middle to anneal. The assembly then rebuilds one
+    complete element out of two oligos nobody had to order separately.
+
+        amplicon A   ... CDS1 [element front        ]
+        amplicon B            [   element back ] CDS2 ...
+                              |<-- overlap -->|
+
+    A reverse primer is written against the bottom strand, so its tail
+    is the reverse complement of the top-strand bases that follow the
+    fragment.
+    """
+    total = len(element)
+    if total <= overlap:
+        # Too short to split and still leave an overlap on each side, so
+        # it goes whole onto the one tail. Returning instead silently
+        # dropped the bases: a 15 bp linker vanished out of the design
+        # and the assembly was then a single fragment with nothing to
+        # close on.
+        _carry(down_fwd, element, route, cfg)
+        return
+    # Balanced halves that still share `overlap` bases in the middle.
+    front = (total + overlap + 1) // 2
+    back = total + overlap - front
+
+    # Whatever the annealing site stepped over sits at the end of the
+    # tail, immediately before the binding region, and has to stay
+    # there: it is the part of the fragment the primer skipped, and
+    # dropping it leaves the amplicon short by exactly that much.
+    # Overwriting the whole tail is what lost it the first time, and
+    # the product then had no mCherry in it at all.
+    up_rev.tail = revcomp(element[:front]) + (up_rev.shift_tail or "")
+    up_rev.sequence = up_rev.tail + up_rev.anneal
+    # The downstream primer's old tail was homology with the upstream
+    # fragment's end. That end has moved - it is now inside the element
+    # - so the old homology would anneal to bases that are no longer
+    # at that junction.
+    down_fwd.tail = element[total - back:] + (down_fwd.shift_tail or "")
+    down_fwd.sequence = down_fwd.tail + down_fwd.anneal
+
+    for pr in (up_rev, down_fwd):
+        if len(pr.sequence) > 100:
+            route.warnings.append(
+                f"primer {pr.name} is {len(pr.sequence)} nt because it "
+                f"carries part of a {total} bp element that is too short "
+                f"to amplify; order it as an ultramer")
+        elif len(pr.sequence) > 70:
+            route.warnings.append(
+                f"primer {pr.name} is {len(pr.sequence)} nt - order it at "
+                f"the 100 nmole scale with PAGE purification, since a "
+                f"truncated chain from a long synthesis still anneals and "
+                f"then seeds a deletion")
+
+
+def _insert_joins(construct) -> set:
+    """Where the two pieces meet when one insert goes into one vector.
+
+    The gene-block and restriction routes put a single piece into a
+    single opened vector, so there are exactly two joins however many
+    annotated elements the insert happens to contain. Without this they
+    reported one join per element, each with an overlap arm that does
+    not exist.
+    """
+    items = [it for it in (getattr(construct, "layout", None) or [])]
+    inside = [i for i, it in enumerate(items) if it.get("type") != "backbone"]
+    if not inside:
+        return set()
+    return {items[inside[0]]["start"], items[inside[-1]]["end"]}
+
+
+def _carry(fwd: Primer, extra: str, route: "Route",
+           cfg: Config | None = None) -> None:
     """Put an un-amplifiable arc onto the primer that makes the next piece.
 
     The bases still have to exist in some tube.  Adding them after the
@@ -1080,7 +1372,15 @@ def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
     """
     if not extra:
         return
-    fwd.tail = fwd.tail + extra
+    # The arc is template that sits UPSTREAM of this fragment, so it must
+    # come before the bases the annealing site stepped over - which are the
+    # first bases of the fragment itself. Appending it to the whole tail put
+    # the two the wrong way round and built a different molecule: every one
+    # of the six routes in a 28-construct sweep that used a carried arc on a
+    # shifted primer produced a product that was not the designed sequence.
+    shifted = fwd.shift_tail or ""
+    head = fwd.tail[:len(fwd.tail) - len(shifted)] if shifted else fwd.tail
+    fwd.tail = head + extra + shifted
     fwd.sequence = fwd.tail + fwd.anneal
     if len(fwd.sequence) > 100:
         route.warnings.append(
@@ -1110,7 +1410,13 @@ def _amplification_frame(template: str, start: int, end: int,
     treat the record as a fallback.
     """
     n = len(template)
-    flipped = (revcomp(template), n - end, n - start)
+    # Mapping a region onto the other strand is a subtraction, and on a
+    # region that wraps the origin - end past the last base, which is how
+    # a wrapped occurrence is recorded - the plain subtraction lands
+    # before position zero and the slice comes back empty or short.
+    # Reduce the far end into the sequence first, then measure from it.
+    low = (n - end) % n if n else 0
+    flipped = (revcomp(template), low, low + (end - start))
     if wanted:
         here = slice_region(template, start, end, circular=circular)
         if here == wanted:
@@ -1218,13 +1524,19 @@ def plan_swap_hifi_route(conn: sqlite3.Connection, analysis, cfg: Config,
                                 analysis.donor.plasmid_id],
                          analysis.recipient.plasmid_id, gel_purified=False)
     if dpni["needed"]:
+        note = dpni_note(dpni)
         steps.append(Step(
             0, "DPNI_DIGEST",
             f"Digest both PCR reactions with DpnI to remove the parental "
             f"{rec['name']} and {don['name']} templates",
-            output="template-free amplicons"))
+            output="template-free amplicons",
+            details={"note": note} if note else {}))
     else:
-        route.warnings.append("DpnI is not needed here: " + dpni["reason"])
+        route.warnings.append(dpni_skipped_warning(dpni))
+    for name in dpni.get("uncuttable") or []:
+        route.warnings.append(
+            f"{name} has no GATC site, so DpnI cannot cut it; gel purify "
+            f"that amplicon or expect parental background")
     steps.append(Step(0, "DNA_CLEANUP",
                       "Column purify both PCR products",
                       output="clean amplicons"))
@@ -1356,15 +1668,31 @@ def plan_swap_restriction_route(conn: sqlite3.Connection, analysis, cfg: Config,
     return route
 
 
+#: How far a cut may fall into the region being replaced. An enzyme cuts
+#: a base or two inside its site, and those bases are discarded with the
+#: rest of the region, so insisting the cut land exactly on the boundary
+#: rules out the enzymes that sit on it.
+SWAP_CUT_SLACK = 60
+
+
 def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
                        left_bound: int, right_bound: int, remove,
                        cfg: Config,
                        insert_must_lack_sites: bool = True) -> dict | None:
-    """Find two enzymes that cut only inside the region being replaced.
+    """Find two enzymes that cut at the boundaries of the region being replaced.
 
     Both cuts must lie between the conserved features either side, and
     neither enzyme may cut the incoming insert, or the piece would be
     chopped up in the same reaction.
+
+    The boundary is not a line, though. An enzyme's cut sits a base or
+    two inside its recognition site, so a site that begins exactly where
+    the region does cuts one base into it - and demanding that the cut
+    land before the region starts rejected BamHI at the very boundary of
+    a Voltron-2 cassette, which with EcoRI at the far end would have
+    dropped the whole thing out in one digest. The bases between the
+    boundary and the cut are being discarded anyway, so a cut is allowed
+    to fall a little way into the region.
     """
     names = [n for n in cfg.stocked_enzymes if n in CATALOG]
 
@@ -1385,9 +1713,9 @@ def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
             # as a PCR product joined by homology, the enzyme never touches
             # it and a site inside it is irrelevant.
             continue
-        if left_bound <= cut <= remove.start:
+        if left_bound <= cut <= remove.start + SWAP_CUT_SLACK:
             left_usable.append((n, cut))
-        elif remove.end <= cut <= right_bound:
+        elif remove.end - SWAP_CUT_SLACK <= cut <= right_bound:
             right_usable.append((n, cut))
 
     if not (left_usable and right_usable):
@@ -1398,11 +1726,27 @@ def _find_swap_enzymes(rec_seq: str, rec_circ: bool, insert_seq: str,
         for b, cut_b in right_usable:
             lo, hi = sorted((cut_a, cut_b))
             dropout = hi - lo
-            if dropout < remove.length:
-                continue                 # must excise the whole region
+            if dropout < remove.length - 2 * SWAP_CUT_SLACK:
+                continue                 # must excise essentially the region
             if a != b and dropout < 50:
                 continue                 # ends too close to resolve on a gel
             warnings: list[str] = []
+            # Whatever the cuts leave behind of the old sequence, said out
+            # loud: it lands between the promoter and the new insert, or
+            # just after it, and the person at the bench should know it is
+            # there rather than discover it in the sequencing.
+            left_stub = max(0, lo - remove.start)
+            right_stub = max(0, remove.end - hi)
+            if left_stub:
+                warnings.append(
+                    f"the cut falls {left_stub} bp inside the region being "
+                    f"removed, so that much of the old sequence stays "
+                    f"upstream of the insert as a spacer")
+            if right_stub:
+                warnings.append(
+                    f"{right_stub} bp of the old sequence stays downstream "
+                    f"of the insert; it is after the stop codon, but check "
+                    f"it carries nothing you mind keeping")
             enz_a, enz_b = CATALOG[a], CATALOG[b]
             if a == b:
                 warnings.append(
@@ -1543,10 +1887,25 @@ def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
     upstream = slice_region(rec_seq, max(cut_lo - 60, 0), cut_lo, circular=rec_circ)
     downstream = slice_region(rec_seq, cut_hi, cut_hi + 60, circular=rec_circ)
 
+    # Amplify in the orientation the construct reads, not the one the
+    # donor happens to store. A Cre-lox donor keeps its payload
+    # inverted - that is what DIO is - so taking ASAP7y off a DIO
+    # plasmid with the raw coordinates gives an amplicon that is the
+    # reverse complement of what the design wants, and HiFi puts it in
+    # backwards. The all-PCR swap has always gone through
+    # _amplification_frame for this; this route was passing the donor
+    # sequence straight in.
+    ins_tpl, ins_start, ins_end = _amplification_frame(
+        don["seq"], analysis.insert.start, analysis.insert.end,
+        analysis.insert.strand, wanted=insert_seq,
+        circular=bool(don["circular"]))
     fwd, rev = design_gibson_pair(
-        0, analysis.insert.label or "insert", don["seq"],
-        analysis.insert.start, analysis.insert.end, upstream, downstream,
+        0, analysis.insert.label or "insert", ins_tpl,
+        ins_start, ins_end, upstream, downstream,
         cfg, circular_template=bool(don["circular"]))
+    for pr in (fwd, rev):
+        pr.target_start, pr.target_end = (analysis.insert.start,
+                                          analysis.insert.end)
     steps.append(Step(
         0, "PCR",
         f"Amplify {analysis.insert.label} ({len(insert_seq):,} bp) from "
@@ -1559,12 +1918,14 @@ def plan_swap_hybrid_route(conn: sqlite3.Connection, analysis, cfg: Config,
     dpni = dpni_decision(conn, [analysis.donor.plasmid_id],
                          analysis.recipient.plasmid_id, gel_purified=False)
     if dpni["needed"]:
+        note = dpni_note(dpni)
         steps.append(Step(
             0, "DPNI_DIGEST",
             f"Digest the PCR with DpnI to remove the parental {don['name']}",
-            output="template-free amplicon"))
+            output="template-free amplicon",
+            details={"note": note} if note else {}))
     else:
-        route.warnings.append("DpnI is not needed here: " + dpni["reason"])
+        route.warnings.append(dpni_skipped_warning(dpni))
     steps.append(Step(0, "DNA_CLEANUP", "Column purify the PCR product",
                       output="clean amplicon"))
     steps.append(Step(
@@ -1640,19 +2001,39 @@ def dpni_decision(conn: sqlite3.Connection, template_ids: list,
       template;
     * the template selects on a different antibiotic from the product, so
       the plate removes it;
-    * the template was not a plasmid grown in a dam+ strain, in which case
-      DpnI has nothing to cut.
+    * the template has no GATC sites at all, in which case DpnI has
+      nothing to cut whatever strain it came from.
+
+    The returned dict also carries ``sites``: how many times DpnI cuts
+    each template. That number is the whole mechanism - DpnI reads
+    methylation rather than a rare sequence, so a template cut thirty
+    times is a template destroyed - and printing it is what stops the
+    step reading as "an enzyme that cuts everywhere is being added to my
+    reaction".
     """
-    reasons: list[str] = []
+    sites = {}
+    uncuttable = []
+    for tid in template_ids:
+        row = conn.execute(
+            "SELECT name, seq, circular FROM plasmid WHERE id = ?",
+            (tid,)).fetchone()
+        if row is None:
+            continue
+        n = dam_sites(row["seq"], bool(row["circular"]))
+        sites[row["name"]] = n
+        if n == 0:
+            uncuttable.append(row["name"])
+
     if gel_purified:
-        return {"needed": False,
+        return {"needed": False, "blocked": False, "sites": sites,
+                "uncuttable": uncuttable,
                 "reason": "the amplicon is gel purified, which separates it "
                           "from the parental plasmid; DpnI would be "
                           "belt-and-braces"}
 
     product_marker = (resistance_marker(conn, product_id)
                       if product_id is not None else None)
-    same_selection = []
+    same_selection, reasons = [], []
     for tid in template_ids:
         marker = resistance_marker(conn, tid)
         if marker is None or product_marker is None or marker == product_marker:
@@ -1662,12 +2043,53 @@ def dpni_decision(conn: sqlite3.Connection, template_ids: list,
                            f"on {product_marker}")
 
     if not same_selection:
-        return {"needed": False,
+        return {"needed": False, "blocked": False, "sites": sites,
+                "uncuttable": uncuttable,
                 "reason": "every template selects on a different antibiotic "
                           "from the product, so the plate removes them: "
                           + "; ".join(dict.fromkeys(reasons))}
 
-    return {"needed": True,
+    # The docstring has always claimed this case; nothing ever tested it.
+    # A template with no GATC survives DpnI intact, and if it also
+    # selects like the product it transforms and grows as a false clone -
+    # the exact failure the step is there to prevent, reported as
+    # prevented.
+    if sites and all(n == 0 for n in sites.values()):
+        return {"needed": False, "blocked": True, "sites": sites,
+                "uncuttable": uncuttable,
+                "reason": "no template has a single GATC site, so DpnI "
+                          "cannot cut any of them; gel purify the amplicon "
+                          "instead"}
+
+    return {"needed": True, "blocked": False, "sites": sites,
+            "uncuttable": uncuttable,
             "reason": "a template carries the same selection marker as the "
                       "product, so parental plasmid surviving the reaction "
                       "would grow on the plate and look like a clone"}
+
+
+def dpni_skipped_warning(decision: dict) -> str:
+    """What to say when the step is not emitted.
+
+    "DpnI is not needed here" is the right phrase for a template the
+    plate or the gel already removes, and the wrong one for a template
+    DpnI simply cannot touch: that is parental background nobody is
+    dealing with, reported as a step saved.
+    """
+    if decision.get("blocked"):
+        return ("DpnI cannot be used here: " + decision["reason"]
+                + " - parental plasmid will otherwise transform and grow "
+                  "as false clones")
+    return "DpnI is not needed here: " + decision["reason"]
+
+
+def dpni_note(decision: dict) -> str:
+    """How hard DpnI cuts each template, for the step that runs it."""
+    sites = decision.get("sites") or {}
+    if not sites:
+        return ""
+    parts = [f"{name} has {n} GATC site{'' if n == 1 else 's'}"
+             for name, n in sites.items()]
+    return ("; ".join(parts)
+            + " - DpnI cuts every one of them in the methylated plasmid and "
+              "none in the PCR product, which is unmethylated.")

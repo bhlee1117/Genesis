@@ -22,7 +22,8 @@ import datetime as _dt
 import re
 
 from .config import Config
-from .pdf import PDF, A4, circular_map, plasmid_track
+from .pdf import (PDF, A4, circular_map, cloning_figure,
+                  figure_height, plasmid_track)
 from .seqtools import gc_fraction, tm
 
 # --------------------------------------------------------------------------
@@ -169,15 +170,25 @@ RECIPES = {
     "DPNI_DIGEST": {
         "title": "DpnI treatment",
         "items": [("completed PCR reaction", "all"), ("DpnI", "1 uL")],
-        "conditions": "37 C for 30-60 min, added directly to the PCR. Only "
-                      "cuts methylated (dam+) parental plasmid, not the "
-                      "amplicon.",
+        "conditions": "37 C for 30-60 min, added directly to the PCR. DpnI "
+                      "reads methylation rather than a rare sequence: it "
+                      "cuts GATC only where the A is dam-methylated, which "
+                      "is every GATC in a plasmid grown in a standard "
+                      "(dam+) strain and none in a PCR product, built from "
+                      "unmethylated dNTPs. Cutting the template at many "
+                      "sites is how the step works.",
     },
     "DNA_CLEANUP": {
         "title": "Column or bead clean-up",
         "items": [("PCR or digest reaction", "all"),
                   ("spin column or SPRI beads", "per kit")],
-        "conditions": "Elute in 20-30 uL. Quantify before assembly.",
+        "conditions": "A silica column or SPRI beads, not a gel: it "
+                      "removes enzymes, buffer, dNTPs and primers but "
+                      "keeps every DNA species in the tube whatever its "
+                      "size. Separating one band from another is the gel "
+                      "extraction step, listed separately when the plan "
+                      "needs it. Elute in 20-30 uL; quantify before "
+                      "assembly.",
     },
     "GEL_EXTRACTION": {
         "title": "Gel extraction",
@@ -226,9 +237,9 @@ RECIPES = {
         "items": [("competent cells", "50 uL"),
                   ("assembly or ligation product", "2 uL"),
                   ("SOC medium", "950 uL")],
-        "conditions": "Ice 30 min, 42 C for 30 s, ice 5 min, add SOC, recover "
-                      "37 C for 1 h with shaking, plate on selective agar, "
-                      "incubate overnight at 37 C.",
+        "conditions": "Timings below are for the strain this lab stocks. "
+                      "A construct with no repeats can go into NEB "
+                      "5-alpha instead, recovered at 37 C in SOC.",
     },
     "COLONY_SCREEN": {
         "title": "Colony screen",
@@ -269,9 +280,13 @@ def _pcr_conditions(step: dict, primers: list[dict], cfg: Config) -> str:
             bits.append(f"primer Tm differ by {abs(tms[0] - tms[1]):.0f} C, "
                         f"consider a gradient")
     if length:
-        seconds = max(int(round(length / 1000 * 30)), 15)
+        from .reagents import for_operation
+        product = for_operation("PCR")
+        rate = (product.extension_s_per_kb if product
+                and product.extension_s_per_kb else 30)
+        seconds = max(int(round(length / 1000 * rate)), 15)
         bits.append(f"extension {seconds // 60}:{seconds % 60:02d} for "
-                    f"{length:,} bp at 30 s/kb")
+                    f"{length:,} bp at {rate} s/kb")
     gc = step.get("details", {}).get("gc")
     if gc and gc > 0.68:
         bits.append(f"{gc:.0%} GC, add the high-GC enhancer")
@@ -314,10 +329,40 @@ def build_protocol(plan: dict, cfg: Config | None = None,
             seen.add(item.lower())
             reagents.append((item, amount))
 
-    if "PCR" in used_ops:
-        for item, amount in _pcr_recipe(cfg)["items"]:
-            add_reagent(item, amount)
+    # What to order is what the steps actually call for. The protocol
+    # runs on master mixes, so listing "5x reaction buffer, 10 mM dNTPs,
+    # high-fidelity DNA polymerase" as three line items is a shopping
+    # list for a reaction nobody is setting up - those are inside the
+    # Q5 tube. Where a product is named, its own components are the
+    # reagents; the generic recipe is the fallback for the rest.
+    from .reagents import for_operation as _product_for
+    screen_enzyme = next(
+        ((s.get("details") or {}).get("diagnostic_enzyme")
+         for s in route["steps"]
+         if s["operation"] == "COLONY_SCREEN"), None)
     for op in used_ops:
+        product = _product_for(op)
+        if product is not None and product.setup:
+            for amount, item in product.setup:
+                # A screen is either a colony PCR or a diagnostic
+                # digest. Ordering Taq for a plan that is going to cut
+                # a miniprep with an enzyme already in the freezer is
+                # ordering a reagent nobody will open - but colonies
+                # and water are wanted either way, so only the two
+                # items that belong to one branch are marked.
+                if (op == "COLONY_SCREEN" and screen_enzyme
+                        and ("Taq" in item or "primer pair" in item)):
+                    item += " (colony PCR only)"
+                add_reagent(item, amount)
+            if op == "COLONY_SCREEN" and screen_enzyme:
+                add_reagent(f"{screen_enzyme} and rCutSmart buffer "
+                            f"(diagnostic digest only - no polymerase "
+                            f"needed on this branch)", "per reaction")
+            continue
+        if op == "PCR":
+            for item, amount in _pcr_recipe(cfg)["items"]:
+                add_reagent(item, amount)
+            continue
         for item, amount in RECIPES.get(op, {}).get("items", []):
             add_reagent(item, amount)
 
@@ -335,10 +380,51 @@ def build_protocol(plan: dict, cfg: Config | None = None,
             if r:
                 detail = r.get("conditions", "")
                 recipe = r if r.get("items") else None
+        # A step may carry a fact about this plan rather than about the
+        # operation in general - how many sites DpnI has to cut here, for
+        # instance - and that belongs under the step, not in a table.
+        own = (step.get("details") or {}).get("note")
+        if own:
+            detail = (detail + " " + own).strip()
+        # A generic recipe is right for every kit and exact for none.
+        # Where the purchasing record names the product this bench runs,
+        # that product's own published setup replaces the generic one.
+        from .reagents import for_operation
+        product = for_operation(op)
+        if product is not None and product.setup:
+            recipe = {"title": product.title,
+                      "items": [(item, amount)
+                                for amount, item in product.setup]}
+        # A double digest is one tube at 37 C until the pair does not
+        # share a temperature, and then it is two stages. Which it is
+        # depends on the enzymes this route chose, not on the operation.
+        digest_stages, red = [], []
+        if op == "RE_DIGEST":
+            from .enzymes import digest_plan
+            from .figure import step_enzymes
+            # Routes put the pair in details on some steps and in the
+            # inputs on others; figure.step_enzymes already knows both.
+            names = step_enzymes(step) or route_enzyme_names(route)
+            plan_d = digest_plan(list(names))
+            for i, stage in enumerate(plan_d["stages"], start=1):
+                label = (f"stage {i}: {' + '.join(stage['enzymes'])}"
+                         if plan_d["sequential"]
+                         else " + ".join(stage["enzymes"]))
+                digest_stages.append(
+                    (label, f"{stage['temperature']} C, {stage['minutes']}"))
+                if stage["heat_kill"]:
+                    digest_stages.append(("stop", stage["heat_kill"]))
+            red = list(plan_d["warnings"])
         steps.append({
             "index": step["index"], "operation": op,
             "description": step["description"], "detail": detail,
             "recipe": recipe, "notes": step.get("notes", ""),
+            "product": product, "digest_stages": digest_stages,
+            "red_notes": red,
+            # The step's own findings - the checkpoint, the DpnI site
+            # count - travel with it; the renderers read them from here.
+            "details": step.get("details") or {},
+            "optional": bool(step.get("optional")),
         })
 
     return {
@@ -363,6 +449,237 @@ def build_protocol(plan: dict, cfg: Config | None = None,
 # PDF rendering
 # --------------------------------------------------------------------------
 
+def _anneal_site(pr: dict) -> str:
+    """Where a primer sits on its template, as a position and a strand.
+
+    A primer sequence on its own does not say where it lands, and the one
+    question somebody checks by hand before ordering is whether it sits
+    inside the region being cut out.
+    """
+    start, end = pr.get("target_start"), pr.get("target_end")
+    anneal = len(pr.get("anneal") or "")
+    if start is None or end is None or start == end or not anneal:
+        return "-"
+    if pr.get("direction") == "F":
+        lo, hi, arrow = start, start + anneal, "->"
+    else:
+        lo, hi, arrow = end - anneal, end, "<-"
+    return f"{lo:,}-{hi:,} {arrow}"
+
+
+def _primer_marks(route: dict, template_name: str) -> list[dict]:
+    """Where this route's primers anneal on one named template.
+
+    Drawn on the parent, not on the product, because that is the plasmid
+    somebody is holding when they want to know whether a primer sits
+    inside the region they are cutting out.
+    """
+    # Which fragment names are amplified off this plasmid. A primer only
+    # belongs on the map of the plasmid it anneals to; drawing every pair
+    # on every parent says the backbone primers bind the donor, which
+    # would send somebody to the wrong tube.
+    mine = set()
+    for st in route.get("steps") or []:
+        if st.get("operation") != "PCR":
+            continue
+        if (st.get("details") or {}).get("template") != template_name:
+            continue
+        for item in st.get("inputs") or []:
+            if "+" in item:
+                f, _, r = item.partition("+")
+                mine.update((f.strip(), r.strip()))
+
+    marks = []
+    for pr in route.get("primers") or []:
+        if mine and pr.get("name") not in mine:
+            continue
+        start, end = pr.get("target_start"), pr.get("target_end")
+        if start is None or end is None or start == end:
+            continue
+        anneal = len(pr.get("anneal") or "")
+        if not anneal:
+            continue
+        if pr.get("direction") == "F":
+            lo, hi, strand = start, start + anneal, 1
+        else:
+            lo, hi, strand = end - anneal, end, -1
+        marks.append({"name": pr.get("name", ""), "start": lo, "end": hi,
+                      "strand": strand})
+    return marks
+
+
+#: Phrases that cost a week of cloning when they are skimmed past.
+_RED = ("not 37 C", "do not heat inactivate", "Do not heat inactivate",
+        "not to substitute SOC", "two stages", "column purify between",
+        "star activity", "exactly 30 s", "cannot be heat inactivated")
+
+
+def route_enzyme_names(route: dict) -> list:
+    """Every enzyme the route mentions, for a step that names none."""
+    from .figure import route_enzymes
+    return route_enzymes(route)
+
+
+def _vendor_box(doc, recipe: dict, product, step: dict) -> None:
+    """One kit's own setup, ruled off and set in a serif.
+
+    Reagent names in a monospace column had to be squeezed to fit; a
+    serif at the same point size fits them and reads as what it is - a
+    quotation of somebody else's protocol inside a document otherwise
+    set in the interface's own face.
+    """
+    from .pdf import WARN_RED
+
+    def body():
+        doc.paragraph(recipe["title"], 9, font="F6", indent=4)
+        if product is not None:
+            doc.paragraph(product.label, 8, font="F7", indent=4, gray=0.4)
+        width = max((len(a) for a, _ in
+                     [(x[1], x[0]) for x in recipe["items"]]), default=0)
+        for item, amount in recipe["items"]:
+            doc.paragraph(f"{amount}   {item}", 8.8, indent=14, font="F5",
+                          gray=0.1)
+        stages = (step.get("digest_stages") or
+                  (list(product.program) if product is not None else []))
+        if stages:
+            doc.spacer(2)
+            for stage, condition in stages:
+                doc.paragraph(f"{stage}   {condition}", 8.8, indent=14,
+                              font="F5", gray=0.1)
+        notes = list(step.get("red_notes") or ())
+        rest = [n for n in (product.notes if product is not None else ())]
+        for note in notes:
+            doc.bullet(note, 8.4, indent=10, marker="!", font="F5",
+                       rgb=WARN_RED)
+        for note in rest:
+            red = any(k in note for k in _RED)
+            doc.bullet(note, 8.4, indent=10, font="F5",
+                       rgb=WARN_RED if red else None,
+                       gray=None if red else 0.35)
+        if product is not None and product.url:
+            doc.link(product.url, product.url, 7.6, indent=4, font="F7")
+
+    doc.boxed(body, pad=7, fill=(0.985, 0.985, 0.99))
+
+
+def _top_level_layout(construct: dict) -> list:
+    """The construct's parts, without the ones nested inside others."""
+    from .figure import outermost
+    return outermost(list(construct.get("layout") or []))
+
+
+def _checkpoint_box(doc, step: dict) -> None:
+    """What a good result looks like, and what each bad one means.
+
+    A protocol that says "run a gel" has given advice. One that says
+    "one band at 5,791 bp, and a band at 6,539 bp is uncut template"
+    has given a test - which is the difference between finding a failed
+    PCR now and finding it on a plate in two days.
+    """
+    from .pdf import WARN_RED
+    check = (step.get("details") or {}).get("checkpoint")
+    if not check:
+        return
+
+    def body():
+        doc.paragraph(check["title"], 9.4, font="F2")
+        for line in check.get("how") or ():
+            doc.paragraph(line, 8.8, indent=6, gray=0.25)
+        doc.spacer(1)
+        doc.paragraph("Go on if you see", 8.6, font="F2", indent=6,
+                      gray=0.2)
+        for line in check.get("expect") or ():
+            doc.bullet(line, 8.6, indent=10, gray=0.25)
+        if check.get("troubles"):
+            doc.spacer(1)
+            doc.paragraph("If not", 8.6, font="F2", indent=6, rgb=WARN_RED)
+            doc.table(["What you see", "What it means", "What to do"],
+                      [list(t) for t in check["troubles"]],
+                      widths=[0.24, 0.34, 0.42], size=8.0)
+
+    doc.boxed(body, pad=7, rgb=(0.52, 0.68, 0.52),
+              fill=(0.975, 0.99, 0.975))
+
+
+def _already_made_banner(doc, plan: dict) -> None:
+    """Say it before the protocol, not after it.
+
+    Two weeks of cloning to arrive at a plasmid that is already in the
+    freezer is the most expensive mistake this tool can fail to
+    prevent, and the inventory is the only thing that knows.
+    """
+    from .pdf import WARN_RED
+    hits = plan.get("already_made") or []
+    made = [h for h in hits if h["exact"] or h["coverage"] >= 0.98]
+    close = [h for h in hits if h not in made]
+    if not made and not close:
+        return
+
+    def body():
+        if made:
+            doc.paragraph("The lab already has this construct.", 11,
+                          font="F2", rgb=WARN_RED)
+            for h in made:
+                doc.bullet(
+                    f"{h['name']} - {h['length']:,} bp, {h['owner']}"
+                    + (f" ({h['verified'].replace('_', ' ')})"
+                       if h.get("verified") else "")
+                    + f". {h['why']}.", 9, rgb=WARN_RED)
+            doc.paragraph(
+                "Check one of these by sequencing before cloning it "
+                "again; the protocol below is only worth running if it "
+                "turns out not to be what the name says.", 8.8, gray=0.3)
+        if close:
+            doc.paragraph(
+                "Close relatives already in the inventory - different "
+                "constructs, but worth a look first:", 8.8,
+                font="F2" if not made else "F1", gray=0.25)
+            for h in close:
+                doc.bullet(f"{h['name']} - {h['length']:,} bp, {h['owner']}; "
+                           f"{h['coverage'] * 100:.0f}% shared", 8.6,
+                           gray=0.35)
+
+    doc.boxed(body, pad=8,
+              rgb=WARN_RED if made else (0.80, 0.82, 0.85),
+              fill=(1.0, 0.97, 0.97) if made else (0.985, 0.985, 0.99))
+
+
+def _kit_protocols(doc, steps: list) -> None:
+    """What to buy, and where each set of conditions came from.
+
+    The conditions above are reaction parameters - volumes, temperatures,
+    times. The vendors' own protocol pages carry their figures and their
+    wording, which are theirs; this points at them rather than copying
+    them, and names the catalogue number so the page that opens is the
+    right one.
+    """
+    from .reagents import used_by, alternatives
+    ops = [s["operation"] for s in steps]
+    products = used_by(ops)
+    if not products:
+        return
+    doc.heading("Kits and catalogue numbers", 2)
+    doc.paragraph(
+        "The products this lab buys, with the page each set of conditions "
+        "above was taken from. Open the vendor page for the "
+        "manufacturer's own figures and for the current revision.", 8.6,
+        gray=0.4)
+    doc.table(["Catalogue", "Product", "Protocol"],
+              [[f"{x.vendor} #{x.catalogue}", x.name, x.url]
+               for x in products],
+              widths=[0.17, 0.35, 0.48], size=7.4)
+    extra = []
+    for op in dict.fromkeys(ops):
+        for alt in alternatives(op):
+            if alt not in extra:
+                extra.append(alt)
+    if extra:
+        doc.paragraph("Also on the shelf for these steps:", 8.4, gray=0.4)
+        for alt in extra:
+            doc.bullet(alt, 8.2, gray=0.4)
+    doc.spacer(4)
+
+
 def protocol_pdf(plan: dict, cfg: Config | None = None,
                  route_id: str | None = None) -> bytes:
     cfg = cfg or Config()
@@ -382,10 +699,11 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
     construct = p["construct"]
     v = p["validation"]
 
-    # --- 1. header -----------------------------------------------------
+    # --- 1. header --------------------------------------------------
     doc.heading(name, 1)
     doc.paragraph(route["title"], 10.5, gray=0.35)
     doc.spacer(4)
+    _already_made_banner(doc, plan)
 
     product = (route.get("scheme") or {}).get("product")
     if product:
@@ -406,11 +724,21 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                                       f"({p['backbone']['length']:,} bp, "
                                       f"{p['backbone']['owner']})"))
     facts += [
-        ("Architecture", " - ".join(i["name"] for i in construct["layout"])),
-        ("Workload", f"{route['n_steps']} steps, {route['n_pcr']} PCR(s), "
-                     f"{route['n_assembly']} assembly reaction(s)"),
+        # The same nesting rule the map uses, so the one-line
+        # architecture and the drawing of it agree: a feature inside
+        # another feature is a detail of it, junk annotation included.
+        ("Architecture", " - ".join(
+            i["name"] for i in _top_level_layout(construct))),
+        ("Workload", f"{route['n_steps'] - route.get('n_optional', 0)} "
+                      f"steps, {route['n_pcr']} PCR(s), "
+                     f"{route['n_assembly']} assembly reaction(s)"
+                     + (f", plus {route['n_optional']} optional check(s)"
+                        if route.get("n_optional") else "")),
         ("Time", f"{route['hands_on_minutes'] / 60:.1f} h hands-on, "
-                 f"{route.get('turnaround_minutes', 0) / 1440:.1f} days elapsed"),
+                 f"{route.get('turnaround_minutes', 0) / 1440:.1f} days elapsed"
+                 + (f" (+{route['optional_minutes'] / 60:.1f} h if you run "
+                    f"the optional checks)"
+                    if route.get("optional_minutes") else "")),
     ]
     if p["suggested_name"] and p["suggested_name"] != name:
         facts.append(("Suggested name", p["suggested_name"]))
@@ -424,7 +752,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
             if issue["level"] == "error":
                 doc.bullet(f"{issue['category']}: {issue['message']}", 9)
 
-    # --- 2. the designed construct --------------------------------------
+    # --- 2. the designed construct ----------------------------------
     layout = construct.get("layout") or []
     marks = construct.get("codon_markers") or []
     if layout:
@@ -444,6 +772,22 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         else:
             plasmid_track(doc, name, f"{construct['length']:,} bp",
                           construct["length"], feats, codon_marks=marks)
+        # The map above is the architecture as specified. A swap edits a
+        # real plasmid and keeps whatever spacing that plasmid has around
+        # the region it replaces, so its product is a slightly different
+        # molecule - and printing both sizes with no word about it is how
+        # this document came to state two lengths for one construct.
+        sim_bp = (route.get("simulation") or {}).get("product_bp")
+        if sim_bp and sim_bp != construct["length"]:
+            doc.paragraph(
+                f"The route below does not build this molecule exactly: its "
+                f"steps produce {sim_bp:,} bp, not {construct['length']:,} bp. "
+                f"The difference is the spacing the recipient already has "
+                f"around the region being replaced, which an edit keeps and "
+                f"an assembly from parts does not. The simulation further "
+                f"down is run on what the steps actually produce.",
+                8.4, gray=0.3)
+
         problems = [m for m in marks
                     if m["kind"] in ("premature_stop", "missing_start",
                                      "missing_stop")]
@@ -456,71 +800,51 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                           8.4, gray=0.4)
         doc.spacer(4)
 
-    # --- 3. the scheme --------------------------------------------------
-    scheme = route.get("scheme") or {}
-    if scheme.get("recipient"):
-        doc.heading("Cloning scheme", 2)
-        doc.paragraph("Two parent plasmids. Cut the marked region out of the "
-                      "recipient, take the marked region from the donor, and "
-                      "join them.", 8.8, gray=0.4)
-
-        rec = scheme["recipient"]
-        if rec.get("circular"):
-            circular_map(doc, "RECIPIENT  " + rec["name"],
-                         f"{rec['length']:,} bp, {rec['owner']}",
-                         rec["length"], rec["features"],
-                         highlight=rec.get("highlight"), highlight_kind="cut")
-        else:
-            plasmid_track(
-                doc, "RECIPIENT  " + rec["name"],
-                f"{rec['length']:,} bp, {rec['owner']} - cut here, keep the rest",
-                rec["length"], rec["features"], rec.get("highlight"), "cut")
-
-        don = scheme.get("donor")
-        if don:
-            if don.get("circular"):
-                circular_map(doc, "DONOR  " + don["name"],
-                             f"{don['length']:,} bp, {don['owner']}",
-                             don["length"], don["features"],
-                             highlight=don.get("highlight"),
-                             highlight_kind="take")
-            else:
-                plasmid_track(
-                    doc, "DONOR  " + don["name"],
-                    f"{don['length']:,} bp, {don['owner']} - take the marked region",
-                    don["length"], don["features"], don.get("highlight"), "take")
-
-        options = scheme.get("donor_options") or []
-        if len(options) > 1:
+    # --- 3. how the route builds it ---------------------------------
+    # The scheme below this draws two parents and the regions they give
+    # up, which only exists for a swap; and the simulation section drew
+    # each source as a separate track with a table saying where it
+    # landed. Neither showed the reaction, so "two PCRs and a HiFi" and
+    # "a digest then a ligation" looked identical on the page.
+    from .figure import route_lanes, join_verb
+    lanes = route_lanes(route, route.get("simulation") or {}, plan)
+    if lanes:
+        # Keep the heading and its caption with the drawing: the figure
+        # protects its own height, which left the title stranded at the
+        # foot of the page before.
+        doc._ensure(figure_height(lanes) + 56)
+        doc.heading("How this route builds it", 2)
+        doc.paragraph(
+            "One row per piece that goes in the tube: the plasmid it comes "
+            "out of, the reaction that takes it out, and the piece itself. "
+            "The bracket is the single reaction that closes the circle.",
+            8.8, gray=0.4)
+        sim_fig = route.get("simulation") or {}
+        cloning_figure(doc, lanes, join_verb(route),
+                       plan.get("construct") or {},
+                       sim_fig.get("product_bp") or 0)
+        if not sim_fig.get("simulated"):
             doc.paragraph(
-                "Other plasmids carrying this part: " + ", ".join(
-                    f"{o['name']} ({o['length']:,} bp)" for o in options[1:5]
-                ) + ". Which to use is a lab preference; pin one with "
-                    "backbone_plasmid_id or by naming it.", 8.2, gray=0.4)
+                "Drawn from the planned steps. This route was not "
+                "simulated, so the product shown is the design rather "
+                "than a checked molecule.", 8.2, gray=0.45)
 
-        anchors = []
-        if scheme.get("left_anchor"):
-            anchors.append(f"{scheme['left_anchor']['name']} (ends at "
-                           f"{scheme['left_anchor']['end']:,})")
-        if scheme.get("right_anchor"):
-            anchors.append(f"{scheme['right_anchor']['name']} (starts at "
-                           f"{scheme['right_anchor']['start']:,})")
-        if anchors:
-            verb = "which is kept and is" if len(anchors) == 1 else \
-                   "which are kept and are"
-            doc.paragraph("The cut is bounded by " + " and ".join(anchors) +
-                          f", {verb} what the primers anneal to or the "
-                          f"enzymes cut between.", 8.6, gray=0.35)
-        doc.spacer(4)
+    # The "Cloning scheme" drawing used to sit here: two parent maps
+    # with the swapped regions marked. "How this route builds it" above
+    # draws the same parents and more besides - which piece, by what
+    # reaction, joined where - and the old one was built for the swap
+    # routes only, so on a restriction route it still marked primers
+    # that route never designs. Two figures of one thing, one of them
+    # stale.
 
-    # --- 4. reagents ---------------------------------------------------
+    # --- 5. reagents ------------------------------------------------
     doc.heading("Reagents and consumables", 2)
     doc.paragraph("Quantities are per reaction. Check against the current "
                   "package insert for the kits in use.", 8.6, gray=0.4)
     doc.table(["Item", "Amount"], [[i, a] for i, a in p["reagents"]],
               widths=[0.68, 0.32], size=8.6)
 
-    # --- 3. primers ----------------------------------------------------
+    # --- 6. primers -------------------------------------------------
     if p["primers"]:
         doc.heading("Primers to order", 2)
         doc.paragraph("Lower case is the overlap or adapter tail; upper case "
@@ -533,29 +857,58 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             rows.append([pr["name"], pr["direction"], f"{pr['length']}",
-                         tm_s, f"{pr['gc']:.0%}", seq])
-        doc.table(["Name", "Dir", "nt", "Tm C", "GC", "Sequence (5' to 3')"],
-                  rows, widths=[0.17, 0.05, 0.05, 0.07, 0.06, 0.60],
-                  size=7.8, mono_cols={5})
+                         tm_s, f"{pr['gc']:.0%}", _anneal_site(pr), seq])
+        doc.table(["Name", "Dir", "nt", "Tm C", "GC", "Anneals at",
+                   "Sequence (5' to 3')"],
+                  rows, widths=[0.15, 0.04, 0.04, 0.06, 0.05, 0.14, 0.52],
+                  size=7.8, mono_cols={6})
+        doc.paragraph(
+            "\"Anneals at\" is the position on the template named in the "
+            "step that uses it, in that plasmid's own coordinates; the "
+            "parent maps above draw the same sites in purple.",
+            8.2, gray=0.45)
 
-    # --- 4. the protocol -----------------------------------------------
+    # --- 7. the protocol --------------------------------------------
     doc.heading("Protocol", 2)
+    # A column down the right saying what each step is doing to the
+    # molecule. The figure at the front says what the route does; this
+    # says which part of it you are standing in.
+    from .pdf import step_thumbnail
+    from .figure import route_lanes
+    lanes_for_steps = route_lanes(route, route.get("simulation") or {}, plan)
+    doc.gutter = 96 if lanes_for_steps else 0
     for step in p["steps"]:
+        top = doc.y
         doc.step(f"{step['index']}.", step["description"],
-                 badge=step["operation"])
+                 badge=step["operation"],
+                 optional=bool(step.get("optional")))
+        if lanes_for_steps:
+            # Which lane this step belongs to, not merely which kind of
+            # step it is: two PCRs in a row are two different pieces.
+            here = next(
+                (l for l in lanes_for_steps
+                 if l.get("template")
+                 and str(l["template"]) in (step["description"] or "")),
+                None)
+            step_thumbnail(doc, lanes_for_steps, step["operation"],
+                           doc.width - doc.mr - 86, top, lane=here)
         if step["detail"]:
             doc.paragraph(step["detail"], 8.8, gray=0.3, indent=22)
+        doc.gutter = 0
         recipe = step["recipe"]
+        product = step.get("product")
         if recipe and step["operation"] in ("PCR", "HI_FI_ASSEMBLY",
                                             "GIBSON_ASSEMBLY", "LIGATION",
-                                            "RE_DIGEST", "TRANSFORMATION"):
-            doc.paragraph(recipe["title"], 8.4, font="F2", indent=22)
-            for item, amount in recipe["items"]:
-                doc.paragraph(f"{amount:<22} {item}", 8.2, indent=30,
-                              font="F3", gray=0.2)
-            doc.spacer(2)
+                                            "RE_DIGEST", "DPNI_DIGEST",
+                                            "TRANSFORMATION"):
+            _vendor_box(doc, recipe, product, step)
+        _checkpoint_box(doc, step)
+        doc.gutter = 96 if lanes_for_steps else 0
 
-    # --- 5. everything else --------------------------------------------
+    doc.gutter = 0
+    _kit_protocols(doc, p["steps"])
+
+    # --- 8. everything else -----------------------------------------
     doc.page_break()
     doc.heading("Detail", 1)
     doc.paragraph("Everything behind the protocol above: how the design was "
@@ -623,6 +976,13 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         doc.paragraph("The primers below were amplified off the named templates "
                  "and the products assembled, to check the steps build this "
                  "construct rather than merely describe it.", 8.6)
+        doc.paragraph(
+            "It replays every step that changes DNA - PCR, digestion, "
+            "synthesis, DpnI and the join - against the real inventory "
+            "sequences. Clean-up, transformation and screening are not "
+            "replayed, so this says the intended molecule can form and "
+            "that nothing else in the tube can, not what fraction of "
+            "colonies will carry it.", 8.2, gray=0.45)
         doc.paragraph(f"Result: {sim.get('summary', '')}", 9.0)
         if sim.get("modules"):
             doc.table(["Part", "Length", "In the product"],
@@ -631,6 +991,10 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                         + f" ({m['coverage']*100:.0f}%)"]
                        for m in sim["modules"]],
                       widths=[0.46, 0.18, 0.36], size=8.2)
+        dpni = [x for x in sim.get("steps") or []
+                if x.get("operation") == "DPNI_DIGEST" and x.get("note")]
+        for x in dpni:
+            doc.bullet(x["note"], 8.6)
         for w in sim.get("warnings", []):
             doc.bullet(w, 8.6)
         for pr in sim.get("problems", []):
@@ -640,10 +1004,12 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
         if sources:
             doc.heading("Where each fragment is cut from", 3)
             doc.paragraph(
-                "The marked region is what the primers amplify. Each one is "
-                "drawn on the plasmid it comes out of, in that plasmid's own "
-                "coordinates.", 8.6)
+                "The same pieces as the figure above, each drawn against "
+                "its whole parent so the coordinates can be checked "
+                "against the plasmid's own map.", 8.6)
             for src in sources:
+                if src.get("synthesised"):
+                    continue          # ordered DNA has no parent to draw
                 hi = None
                 if (isinstance(src.get("from_start"), int)
                         and isinstance(src.get("from_end"), int)):
@@ -783,6 +1149,33 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
                 out.append(f"> - {i['category']}: {i['message']}")
         out.append("")
 
+    # The same walk the figure draws, in the form a lab notebook takes.
+    from .figure import route_lanes, join_verb
+    lanes = route_lanes(route, route.get("simulation") or {}, plan)
+    if lanes:
+        out += ["## How this route builds it", ""]
+        for lane in lanes:
+            src = lane.get("src") or {}
+            where = ("ordered as a gBlock" if lane["origin"] == "order"
+                     else f"from `{src.get('template') or lane['template']}`"
+                          + (f" ({src['template_length']:,} bp)"
+                             if src.get("template_length") else ""))
+            # The last stage's size is the piece's size, printed at the
+            # end of the line; saying it twice reads as two numbers.
+            final = f"{src.get('bp', 0):,} bp"
+            how = " then ".join(
+                st["verb"] + (f" ({st['sub']})"
+                              if st.get("sub") and st["sub"] != final else "")
+                for st in lane["stages"])
+            ends = (f", ends {' / '.join(lane['ends'])}"
+                    if lane.get("ends") else "")
+            out.append(f"- **{lane['piece']}** {where} - {how}"
+                       f" -> {src.get('bp', 0):,} bp{ends}")
+        sim_bp = (route.get("simulation") or {}).get("product_bp") or 0
+        out += ["", f"Then {join_verb(route)}: "
+                    f"{len(lanes)} piece{'' if len(lanes) == 1 else 's'}"
+                    + (f" -> {sim_bp:,} bp" if sim_bp else ""), ""]
+
     scheme = route.get("scheme") or {}
     if scheme.get("recipient"):
         rec = scheme["recipient"]
@@ -832,21 +1225,24 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
 
     if p["primers"]:
         out += ["## Primers to order", "",
-                "| Name | Dir | nt | Tm (C) | GC | Sequence (5'->3') |",
-                "|---|---|---|---|---|---|"]
+                "| Name | Dir | nt | Tm (C) | GC | Anneals at | "
+                "Sequence (5'->3') |",
+                "|---|---|---|---|---|---|---|"]
         for pr in p["primers"]:
             seq = (pr["tail"].lower() + pr["anneal"].upper()) if pr["tail"] \
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             out.append(f"| {pr['name']} | {pr['direction']} | {pr['length']} | "
-                       f"{tm_s} | {pr['gc']:.0%} | `{seq}` |")
+                       f"{tm_s} | {pr['gc']:.0%} | {_anneal_site(pr)} | "
+                       f"`{seq}` |")
         out += ["", "Lower case is the overlap or adapter tail; upper case binds "
                 "the template. Tm is for the template-binding region only.", ""]
 
     out += ["## Protocol", ""]
     for step in p["steps"]:
-        out.append(f"{step['index']}. **`{step['operation']}`** "
-                   f"{step['description']}")
+        out.append(f"{step['index']}. **`{step['operation']}`**"
+                   + (" *(optional)*" if step.get("optional") else "")
+                   + f" {step['description']}")
         if step["detail"]:
             out.append(f"   - {step['detail']}")
         recipe = step["recipe"]
@@ -855,6 +1251,14 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
                                             "RE_DIGEST", "TRANSFORMATION"):
             out.append(f"   - *{recipe['title']}*: " +
                        "; ".join(f"{a} {i}" for i, a in recipe["items"]))
+        check = (step.get("details") or {}).get("checkpoint")
+        if check:
+            for line in check["how"]:
+                out.append(f"   - {line}")
+            out.append("   - **Go on if you see:** "
+                       + "; ".join(check["expect"]))
+            for seen, means, do in check["troubles"]:
+                out.append(f"   - *{seen}* - {means}. {do}.")
     out.append("")
 
     out += ["---", "", "## Detail", "",

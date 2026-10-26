@@ -28,7 +28,7 @@ FEATURE_TYPES = [
     "backbone", "promoter", "enhancer", "CDS", "trafficking_motif", "linker",
     "p2A", "IRES", "Cre-lox", "lox_site", "AAV_ITR", "resistance", "origin",
     "tag", "polyA", "WPRE", "restriction_site", "primer_binding_site",
-    "terminator", "intron", "unknown",
+    "terminator", "intron", "Kozak", "unknown",
 ]
 
 #: "DIO" was the old name for the family. Specs and parts saved with it keep
@@ -81,6 +81,14 @@ _LABEL_RULES: list[tuple[str, str]] = [
      "Cre-lox"),
     (r"\bWPRE\b|woodchuck", "WPRE"),
     (r"poly[- ]?A|polyadenylation|\bbGH\b|\bSV40 ?pA\b", "polyA"),
+    # The SV40 "DTS" (DNA nuclear targeting sequence) is the 72-bp repeat
+    # enhancer, put into a plasmid for what it does to the DNA rather than
+    # to transcription: the factors it binds carry nuclear localisation
+    # signals, so the plasmid rides into the nucleus with them.  It is a
+    # cis-acting DNA element and is never translated, which is why it files
+    # with the enhancers and not with the tags - a tag here means a peptide,
+    # and the frame checks would try to read this one as protein.
+    (r"\bDTS\b|SV40[- _]?DTS|DNA nuclear targeting", "enhancer"),
     (r"\bIRES\b", "IRES"),
     (r"\b[PTEF]2A\b|\b2A (peptide|self)|self[- ]?cleav", "p2A"),
     (r"promot|\bCMV\b|\bEF1|\bhSyn\b|\bCaMKII|\bCAG\b|\bU6\b|\bTRE\b|\bPGK\b|\bSV40 ?prom", "promoter"),
@@ -225,6 +233,16 @@ PROTEIN_MOTIFS: list[Motif] = [
     Motif("V5 tag", "tag", "GKPIPNPLLGLDST", level="protein"),
     Motif("6xHis tag", "tag", "HHHHHH", level="protein"),
     Motif("XTEN linker", "linker", "SGSETPGTSESATPES", level="protein"),
+    # The soma-targeting tag that makes a "SomCheRiff" out of a CheRiff. It
+    # is 65 aa; a 24 aa probe from the middle still matches a copy whose
+    # boundaries were annotated short. 111 CDS parts in this inventory
+    # carry it, and none of them said so.
+    Motif("Kv2.1 soma-targeting (ST)", "trafficking_motif",
+          "MSSMPSPVAPLPARTEGVIDMRSM", level="protein"),
+    # The "LR-" that prefixes LR-Voltron2 and LR-CheRiff: a Lucy-Rho
+    # leader, 41 aa, which is a signal peptide and not part of the sensor.
+    Motif("LR / Lucy-Rho leader", "trafficking_motif",
+          "MGRPQILLLLALLTLGLANGTEGPNFYVPFSNKTGVVRSG", level="protein"),
 ]
 
 

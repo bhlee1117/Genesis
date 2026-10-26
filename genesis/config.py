@@ -72,6 +72,12 @@ class Config:
     #: Backbone to reach for when an AAV is requested and none is named.
     #: Vector family assumed when a specification does not mention one.
     #: Set to "" to infer it from the backbone instead.
+    #: Free token from https://developers.addgene.org/. Only ever used to
+    #: search the catalogue for parts the lab has not got; nothing found
+    #: there is used as a donor or a PCR template. The environment
+    #: variable GENESIS_ADDGENE_TOKEN takes precedence.
+    addgene_token: str = ""
+
     default_vector: str = "AAV"
     default_aav_backbone: str = "PP072"
     default_lenti_backbone: str = ""
@@ -92,10 +98,26 @@ class Config:
     primer_leader: str = "TTAATT"
     primer_max_gc: float = 0.65
     primer_min_gc: float = 0.35
+    #: The band NEB asks for in the Q5 protocol - "ideally have a GC
+    #: content of 40-60%". The wider pair above is where Genesis starts
+    #: warning; this narrower one is what it aims at while choosing where
+    #: to put the primer.
+    primer_ideal_min_gc: float = 0.40
+    primer_ideal_max_gc: float = 0.60
+    #: How far the annealing site may move *into* the fragment to find
+    #: better bases. The skipped bases are added to the primer's tail, so
+    #: the product is unchanged and only the oligo gets longer. Without
+    #: this the site is wherever the junction happens to fall, and an
+    #: AT-rich boundary gives a primer that is reported as poor and used
+    #: anyway.
+    primer_max_shift: int = 15
     #: Homology arm. Used as a ceiling: the shortest arm that still reaches
     #: `overlap_tm_min` is taken, because every base of overlap is a base of
     #: oligo somebody pays for and synthesises with some error rate.
     overlap_length: int = 25
+    #: A floor under whatever the kit itself asks for, not a replacement
+    #: for it: homology_range() already holds NEBuilder HiFi at 15-25 and
+    #: Gibson at 20-40, which is what each supplier specifies.
     overlap_min_length: int = 15
     overlap_tm_min: float = 48.0
     primer_conc_nm: float = 500.0

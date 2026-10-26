@@ -202,7 +202,19 @@ def candidate_parts(conn: sqlite3.Connection, module: Module, limit: int = 12) -
              WHERE p.feature_type = ? AND p.seq_length >= ?"""
     args: list = [module.type, min_part_length(module.type)]
     if module.name:
-        sql += " AND (p.name LIKE ? COLLATE NOCASE)"
+        # Also the names this part's own plasmids and folders use for it.
+        # The CDS in BHL021_pAAV_ef1a_FLEX_ASAP6c is annotated "ASAP4c
+        # 413G"; without the alias, ASAP6c is unfindable even though the
+        # folder, the file and the person who made it all say ASAP6c.
+        # Only authoritative aliases count: one that disagrees with the
+        # part's own label about a version number stays out until a human
+        # settles it, because a different number is a different sensor.
+        sql += (" AND (p.name LIKE ? COLLATE NOCASE"
+                "      OR EXISTS (SELECT 1 FROM part_alias a"
+                "                  WHERE a.part_id = p.id"
+                "                    AND a.authoritative = 1"
+                "                    AND a.alias LIKE ? COLLATE NOCASE))")
+        args.append(f"%{module.name}%")
         args.append(f"%{module.name}%")
     # Relevance before popularity. A search for "LR-Voltron2" must not land
     # on "LR-Voltron2-LR-WiChR-eGFP" just because that row has more sources:
@@ -211,11 +223,14 @@ def candidate_parts(conn: sqlite3.Connection, module: Module, limit: int = 12) -
     if module.name:
         sql += """ GROUP BY p.id ORDER BY
                      (p.name = ? COLLATE NOCASE) DESC,
+                     (EXISTS (SELECT 1 FROM part_alias a WHERE a.part_id = p.id
+                              AND a.authoritative = 1
+                              AND a.alias = ? COLLATE NOCASE)) DESC,
                      (p.name LIKE ? COLLATE NOCASE) DESC,
                      LENGTH(p.name) ASC,
                      n_sources DESC
                    LIMIT ?"""
-        args += [module.name, f"{module.name}%", limit]
+        args += [module.name, module.name, f"{module.name}%", limit]
     else:
         sql += " GROUP BY p.id ORDER BY n_sources DESC, p.seq_length DESC LIMIT ?"
         args.append(limit)
@@ -230,20 +245,36 @@ def part_sources(conn: sqlite3.Connection, part_id: int) -> list[dict]:
     amplify. Prefer circular, sequence-verified, annotated plasmids; among
     equals prefer the smaller one, which amplifies more cleanly.
     """
+    # Other rows for the same part. A plasmid holding EGFP under the name
+    # "GFP", or without its start codon, holds EGFP.
+    from .swap import equivalent_part_ids
+
+    ids = equivalent_part_ids(conn, part_id)
+    marks = ",".join("?" * len(ids))
     rows = conn.execute(
-        """SELECT pl.id, pl.name, pl.owner, pl.verified, pl.available_template,
-                  pl.circular, pl.seq_length, o.start, o.end, o.strand
+        f"""SELECT pl.id, pl.name, pl.owner, pl.verified, pl.available_template,
+                  pl.circular, pl.seq_length, o.start, o.end, o.strand,
+                  (o.part_id = ?) AS exact_part,
+                  (pl.circular = 1 AND
+                   (SELECT COUNT(DISTINCT a.feature_type) FROM annotation a
+                     WHERE a.plasmid_id = pl.id
+                       AND a.feature_type IN ('origin', 'resistance')) = 2)
+                  AS growable
            FROM part_occurrence o JOIN plasmid pl ON pl.id = o.plasmid_id
-           WHERE o.part_id = ? AND pl.available_template = 1
+           WHERE o.part_id IN ({marks}) AND pl.available_template = 1
            ORDER BY
-             pl.circular DESC,
+             growable DESC,
+             exact_part DESC,
              (pl.verified != 'unverified') DESC,
-             (SELECT COUNT(*) FROM annotation a
-              WHERE a.plasmid_id = pl.id
-                AND a.feature_type IN ('origin', 'resistance')) DESC,
              pl.seq_length ASC""",
-        (part_id,)).fetchall()
-    return [dict(r) for r in rows]
+        (part_id, *ids)).fetchall()
+    out = [dict(r) for r in rows]
+    # A fragment is a template of last resort, not a cheaper option: it
+    # orders behind every real plasmid, and survives in the list only so a
+    # part that exists nowhere else can still be reported rather than
+    # looking as though nobody has it.
+    real = [r for r in out if r["growable"]]
+    return real if real else out
 
 
 #: Module types that are translated as part of a fusion protein.
@@ -503,7 +534,13 @@ LOXFAS_SEQ = "ACAACTTCGTATATACCTTTCTATACGAAGTTGT"
 
 #: Module types a recombinase cassette encloses. The cassette stops at the
 #: elements that stay outside it, such as the polyA and the WPRE.
+#: "Kozak" belongs here because the Kozak that gets taken from a donor sits
+#: between the cassette and the coding sequence it initiates. Leaving it out
+#: ended the payload scan on it, so a pAAV-CAG-DIO-ASAP7y came out
+#: byte-identical to pAAV-CAG-ASAP7y: no lox sites, no error, a
+#: constitutive construct carrying the word DIO in its name.
 CASSETTE_PAYLOAD_TYPES = {"CDS", "trafficking_motif", "linker", "p2A", "tag",
+                          "Kozak",
                           "IRES"}
 
 
@@ -753,6 +790,12 @@ def expand_dio(resolved: list[ResolvedModule],
 expand_recombinase = expand_dio
 
 
+#: Shorter than this a "coding sequence" is an annotation artefact - a
+#: protease site, a tag fragment - and not something whose start and stop
+#: codons mean anything.
+MIN_TRANSLATED_RUN = 60
+
+
 def codon_markers(construct: AssembledConstruct) -> list[dict]:
     """Locate the start and stop codons of every translated run.
 
@@ -769,6 +812,11 @@ def codon_markers(construct: AssembledConstruct) -> list[dict]:
     """
     markers: list[dict] = []
     for run in translated_span(construct):
+        # A twelve base "CDS" is an annotation artefact, not a protein, and
+        # asking whether it starts with ATG and ends in a stop puts two
+        # false problems on every map that carries one.
+        if run["end"] - run["start"] < MIN_TRANSLATED_RUN:
+            continue
         strand = run.get("strand", 1)
         start, end = run["start"], run["end"]
         span = construct.seq[start:end]
@@ -1099,8 +1147,44 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
         rm.seq = match[1]
         satisfied.append((rm, match[0]))
 
+    # The same courtesy for a regulatory element the recipient already
+    # carries. YD030 holds the very CAG this design asks for - the same
+    # 1,745 bases, sitting exactly where they belong - and rebuilding it
+    # anyway cost a second PCR off the same plasmid and left 61 bp of it
+    # duplicated, because the kept arc and the re-inserted copy overlap.
+    #
+    # The bases have to match exactly. A promoter of the right *type* is
+    # not the promoter that was asked for, and quietly keeping a CAG when
+    # someone asked for hSyn is the same class of mistake as handing them
+    # the wrong sensor.
+    still_needed = []
+    for rm in regulatory:
+        match = None
+        for a in backbone_annotations:
+            if a["feature_type"] != rm.feature_type or id(a) in taken:
+                continue
+            bases = backbone_seq[a["start"]:a["end"]].upper()
+            if bases and bases == (rm.seq or "").upper():
+                match = a
+                break
+        if match is None:
+            still_needed.append(rm)
+            continue
+        taken.add(id(match))
+        satisfied.append((rm, match))
+        warnings.append(
+            f"the recipient already carries exactly this {rm.part_name}; "
+            f"that copy is kept and amplified with the backbone rather than "
+            f"adding a second one")
+    regulatory = still_needed
+
     payload_seq, payload_layout = block(payload)
     regulatory_seq, regulatory_layout = block(regulatory)
+
+    # Where the recipient's own regulatory elements end, so the payload
+    # can be told not to start before them.
+    satisfied_marks = {(a["feature_type"], a["name"], a["start"])
+                       for _rm, a in satisfied}
 
     # --- rotate so the payload region is contiguous ----------------------
     total = len(backbone_seq)
@@ -1116,6 +1200,7 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
         arc_end = (arc[1] - arc[0]) % total or total
 
     rotated_seq = backbone_seq[rotation:] + backbone_seq[:rotation]
+    keep_until = 0
     rotated = []
     for a in backbone_annotations:
         start, end = (a["start"] - rotation) % total, (a["end"] - rotation) % total
@@ -1127,6 +1212,8 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                 f"boundary and was not carried over")
             continue
         rotated.append({**a, "start": start, "end": end})
+        if (a["feature_type"], a["name"], a["start"]) in satisfied_marks:
+            keep_until = max(keep_until, end)
 
     edits: list[dict] = []
 
@@ -1162,6 +1249,14 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                         and a["start"] < arc_end]
             if cassette:
                 lo = min(a["start"] for a in cassette)
+                # A regulatory element the recipient supplies is being kept,
+                # so the payload must begin after it. Without this the start
+                # is the lowest coding annotation in the arc, and YD030 has
+                # a spurious ORF inside its chimeric intron at 899 - inside
+                # the CAG - which cut the promoter in half and reported it
+                # as "disrupted".
+                if keep_until:
+                    lo = max(lo, keep_until)
                 hi = arc_end
                 if not (spec_types & {"polyA", "WPRE"}):
                     after = [a["start"] for a in rotated

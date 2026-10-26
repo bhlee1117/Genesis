@@ -685,6 +685,11 @@ var CODING_TYPES = {
   CDS: 1, p2A: 1, trafficking_motif: 1, tag: 1, linker: 1, IRES: 1
 };
 
+/* Only these have two ends of their own. A 2A peptide or a trafficking
+   motif belongs to somebody else's protein, so labelling it N and C
+   would claim there are more proteins on the map than there are. */
+var PROTEIN_END_TYPES = { CDS: 1 };
+
 function polar(cx, cy, r, f) {
   var a = -Math.PI / 2 + 2 * Math.PI * f;           /* 0 at twelve o'clock */
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
@@ -782,6 +787,22 @@ function circularMap(length, items, opts) {
         g.appendChild(arrowHead(cx, cy, r, reverse ? from : to % 1,
                                 !reverse, colour));
       }
+      /* Which end is the start of the protein and which is the end of it.
+         A reverse-strand coding sequence begins at the end that is drawn
+         second, so the labels follow the strand and not the drawing. */
+      if (PROTEIN_END_TYPES[typeOf(f)] && (to - from) > 0.035) {
+        var nAt = (reverse ? to : from) % 1;
+        var cAt = (reverse ? from : to) % 1;
+        [['N', nAt], ['C', cAt]].forEach(function (pair) {
+          var at = polar(cx, cy, r - 9, pair[1]);
+          var t = svg('text', {
+            x: at[0].toFixed(1), y: (at[1] + 2).toFixed(1),
+            'text-anchor': 'middle', class: 'circ-terminus', fill: colour
+          });
+          t.textContent = pair[0];
+          g.appendChild(t);
+        });
+      }
       node.appendChild(g);
       placed.push({ mid: ((from + to) / 2) % 1, f: f, r: r, colour: colour });
     });
@@ -877,8 +898,8 @@ function circularMap(length, items, opts) {
   else requestAnimationFrame(draw);
 
   var note = h('p', { class: 'map-note muted small' },
-    'Outer ring reads forward, inner ring reverse. Arrowheads point the way ' +
-    'a coding sequence is translated. Position 1 is at the top.');
+    'Outer ring forward, inner ring reverse; arrowheads show which way a '
+    + 'CDS is read. Position 1 at the top.');
   return h('div', null, host, captionHost, note);
 }
 
@@ -1072,8 +1093,12 @@ async function renderInventory() {
     ], rows, { onRow: function (r) { showPlasmid(r.id); } }));
     setStatus(status, plural(rows.length, 'plasmid'));
   } catch (err) {
+    if (progress.node.parentNode) {
+      progress.node.parentNode.removeChild(progress.node);
+    }
     clear(out);
-    out.appendChild(errorBox(err.message));
+    (document.querySelector('.step-pane:not([hidden])') || out)
+      .appendChild(errorBox(err.message));
     setStatus(status, 'failed', 'error');
   }
 }
@@ -1173,14 +1198,184 @@ async function renderParts() {
   }
 }
 
+/* The standard genetic code, as the one table it is. */
+var CODONS = (function () {
+  var aas = 'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG';
+  var b = 'TCAG', table = {}, i = 0;
+  for (var x = 0; x < 4; x++)
+    for (var y = 0; y < 4; y++)
+      for (var z = 0; z < 4; z++)
+        table[b[x] + b[y] + b[z]] = aas[i++];
+  return table;
+})();
+
+function translateDna(seq) {
+  var out = '';
+  seq = String(seq || '').toUpperCase();
+  for (var i = 0; i + 2 < seq.length; i += 3) {
+    out += CODONS[seq.substr(i, 3)] || 'X';
+  }
+  return out;
+}
+
+/** A sequence in numbered rows, the way a sequence is read.
+
+   One unbroken string is technically the same information and is
+   unusable: nobody can tell base 400 from base 430 in it. Sixty to a
+   line, grouped in tens, with the coordinate of the first base. */
+function seqBlock(seq, opts) {
+  opts = opts || {};
+  var per = opts.per || 60, group = opts.group || 10;
+  var pre = h('pre', { class: 'seq-block' });
+  var lines = [];
+  for (var i = 0; i < seq.length; i += per) {
+    var chunk = seq.substr(i, per), parts = [];
+    for (var j = 0; j < chunk.length; j += group) {
+      parts.push(chunk.substr(j, group));
+    }
+    lines.push(String(i + 1).padStart(6, ' ') + '  ' + parts.join(' '));
+  }
+  pre.textContent = lines.join('\n');
+  return pre;
+}
+
+function seqSection(title, seq, note, extra) {
+  var open = false;
+  var body = h('div', { hidden: 'hidden' });
+  var head = h('button', {
+    type: 'button', class: 'link-button',
+    onclick: function () {
+      open = !open;
+      body.hidden = !open;
+      head.textContent = (open ? 'hide ' : 'show ') + title;
+    }
+  }, 'show ' + title);
+  body.appendChild(h('p', { class: 'muted small' }, note));
+  body.appendChild(seqBlock(seq, extra));
+  return h('div', { class: 'seq-wrap' }, head, body);
+}
+
+/** Re-read the shared folder, saying how far it has got.
+
+   The inventory is a snapshot. A folder added after the last scan is
+   simply not there, which looks from the design side like Genesis
+   having lost a plasmid - and the only way to fix it was a terminal
+   and the right command. */
+async function rescanShare() {
+  var box = $('inv-rescan-box');
+  var button = $('inv-rescan');
+  var status = $('inv-status');
+  if (!box) return;
+  box.hidden = false;
+  clear(box);
+  button.disabled = true;
+
+  var fill = h('div', { class: 'bar-fill' });
+  var label = h('div', { class: 'bar-label' }, 'Starting\u2026');
+  var detail = h('p', { class: 'muted small' },
+    'Reading every file on the share. This takes a few minutes the '
+    + 'first time and less after that \u2014 only new and changed '
+    + 'files are parsed.');
+  box.appendChild(h('div', { class: 'card' },
+    h('div', { class: 'bar' }, fill), label, detail));
+  setStatus(status, 'reading the share\u2026', 'busy');
+
+  /* The scan has no total to divide by - it does not know how many
+     files there are until it has walked them - so the bar paces
+     itself against a typical run rather than claiming a fraction it
+     cannot compute. The counts underneath are the real measurement. */
+  var seen = 0;
+  function pace(n) {
+    seen = Math.max(seen, n || 0);
+    return Math.min(0.9, seen / 25000);
+  }
+
+  try {
+    var res = await fetch('/api/rescan/stream', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    if (!res.ok || !res.body) throw new Error('could not start the scan');
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = '', done = null, failed = null;
+    for (;;) {
+      var chunk = await reader.read();
+      if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+      var cut;
+      while ((cut = buffer.indexOf('\n\n')) >= 0) {
+        var raw = buffer.slice(0, cut);
+        buffer = buffer.slice(cut + 2);
+        var event = '', data = '';
+        raw.split('\n').forEach(function (line) {
+          if (line.indexOf('event: ') === 0) event = line.slice(7);
+          else if (line.indexOf('data: ') === 0) data += line.slice(6);
+        });
+        if (!data) continue;
+        var p;
+        try { p = JSON.parse(data); } catch (e) { continue; }
+        if (event === 'progress') {
+          label.textContent = p.label || '';
+          var frac = (typeof p.done === 'number') ? p.done : pace(p.scanned);
+          if (p.phase === 'orfs') frac = 0.9 + 0.1 * (p.done || 0);
+          fill.style.width = Math.round(frac * 100) + '%';
+        } else if (event === 'done') { done = p; }
+        else if (event === 'failed') { failed = p.error; }
+      }
+      if (chunk.done) break;
+    }
+    if (failed) throw new Error(failed);
+    fill.style.width = '100%';
+    var scan = (done && done.scan) || {};
+    label.textContent = 'Done';
+    clear(detail);
+    detail.appendChild(h('span', null,
+      (scan.plasmids || 0).toLocaleString() + ' plasmids from '
+      + (scan.scanned || 0).toLocaleString() + ' files'
+      + (scan.errors && scan.errors.length
+          ? ' \u00b7 ' + scan.errors.length + ' file(s) could not be read'
+          : '')));
+    setStatus(status, 'inventory updated', 'ok');
+    renderInventory();
+  } catch (err) {
+    clear(box);
+    box.appendChild(errorBox(err.message));
+    setStatus(status, 'scan failed', 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function showPartSources(part) {
   var side = $('part-detail');
   clear(side);
   side.appendChild(h('h3', null, part.name || '(unnamed)'));
   side.appendChild(h('p', { class: 'muted small' },
     part.feature_type + ' · ' + bp(part.seq_length)));
+  var seqHolder = h('div', null);
+  side.appendChild(seqHolder);
   var holder = h('div', null, h('p', { class: 'muted' }, 'Loading sources…'));
   side.appendChild(holder);
+
+  /* The sequence itself - which is, after all, what a part is. */
+  api('/api/part/' + part.id).then(function (full) {
+    var dna = String(full.seq || '').toUpperCase();
+    if (!dna) return;
+    clear(seqHolder);
+    seqHolder.appendChild(seqSection(
+      'DNA (' + bp(dna.length) + ")", dna,
+      "5' to 3', numbered from the first base of the part."));
+    if (part.feature_type === 'CDS' || full.feature_type === 'CDS') {
+      var aa = translateDna(dna);
+      var trailing = aa.length && aa[aa.length - 1] === '*';
+      seqHolder.appendChild(seqSection(
+        'protein (' + (aa.length - (trailing ? 1 : 0)) + ' aa)', aa,
+        'Translated in frame 1, N to C. '
+        + (trailing ? 'The terminal * is the stop codon.'
+                    : 'No terminal stop codon in this part.'),
+        { per: 60, group: 10 }));
+    }
+  }).catch(function () { /* the sources below are the point */ });
   try {
     var rows = await api('/api/part/' + part.id + '/sources');
     clear(holder);
@@ -1217,6 +1412,21 @@ function fetchParts(type, query, form) {
       .catch(function (err) { delete PART_CACHE[key]; throw err; });
   }
   return PART_CACHE[key];
+}
+
+var FAMILY_CACHE = {};
+
+/* One entry per protein rather than per annotation. A name search for
+   "CheRiff" returns the same molecule seventeen times and hides the
+   soma-targeted one behind an identical label. */
+function fetchFamilies(type, query) {
+  var key = type + '\u0000' + query.toLowerCase();
+  if (!FAMILY_CACHE[key]) {
+    FAMILY_CACHE[key] = api('/api/parts' + qs({
+      type: type, q: query, group: 'protein', limit: 14
+    })).catch(function (err) { delete FAMILY_CACHE[key]; throw err; });
+  }
+  return FAMILY_CACHE[key];
 }
 
 var SEGMENT_CACHE = {};
@@ -1286,10 +1496,15 @@ function partPicker(mod) {
       if (document.activeElement === input && input.value.trim()) search();
     }
   },
+    h('option', { value: 'protein' }, 'by protein'),
     h('option', { value: 'all' }, 'all forms'),
     h('option', { value: 'whole' }, 'whole only'),
     h('option', { value: 'split' }, 'pieces only'));
-  formSel.value = mod.form || 'all';
+  /* Grouping is the useful default for a coding sequence, where the same
+     protein is catalogued many times over; for everything else the plain
+     list is what people expect. */
+  formSel.value = mod.form || (mod.type === 'CDS' ? 'protein' : 'all');
+  mod.form = formSel.value;
 
   var items = [];      // rows currently shown; see rowFor() for the shape
   var active = -1;     // highlighted row, -1 for none
@@ -1312,7 +1527,8 @@ function partPicker(mod) {
     chip.appendChild(h('button', {
       type: 'button', class: 'pin-clear', title: 'Unpin — match this name loosely again',
       onclick: function () {
-        mod.part_id = null; mod.pin_note = ''; renderChip(); input.focus();
+        mod.part_id = null; mod.pin_note = ''; mod.part_bp = null;
+        renderChip(); renderSpecPreview(); input.focus();
       }
     }, '×'));
   }
@@ -1343,16 +1559,36 @@ function partPicker(mod) {
   }
 
   /** Pin one row — a whole part, a fusion, or one segment of a fusion. */
+  /* Move the highlight, skipping family headings: they name a group, they
+     are not something to pin, so landing on one would be a dead stop. */
+  function step(from, delta) {
+    var n = items.length;
+    if (!n) return -1;
+    var at = from;
+    for (var k = 0; k < n; k++) {
+      at = ((at + delta) % n + n) % n;
+      if (items[at].kind !== 'head') return at;
+    }
+    return from;
+  }
+
   function choose(i) {
     var row = items[i];
     if (!row) return;
+    if (row.kind === 'head') return;   // a family heading names, it does not pin
     if (row.kind === 'back') { showParts(); return; }
     mod.name = row.name || '';
     mod.part_id = row.id;
     mod.pin_note = row.note || '';
+    /* The sketch was drawn from typical lengths for each kind of element.
+       Once a real part is chosen its real length is known, so the drawing
+       stops being a guess for that module. */
+    var src = row.source || {};
+    mod.part_bp = Number(src.bp || src.seq_length) || null;
     input.value = mod.name;
     renderChip();
     close();
+    renderSpecPreview();
   }
 
   function show(node_) {
@@ -1368,8 +1604,13 @@ function partPicker(mod) {
     items.forEach(function (r, i) {
       var el = h('div', {
         class: 'combo-item' + (r.kind === 'back' ? ' combo-back' : '') +
-               (r.kind === 'segment' ? ' combo-segment' : ''),
-        role: 'option', id: listId + '-' + i, 'aria-selected': 'false',
+               (r.kind === 'segment' ? ' combo-segment' : '') +
+               (r.kind === 'head' ? ' combo-head' : '') +
+               (r.kind === 'part' && r.source && r.source.decorations
+                  ? ' combo-variant' : ''),
+        role: r.kind === 'head' ? 'presentation' : 'option',
+        id: listId + '-' + i, 'aria-selected': 'false',
+        title: r.title || null,
         // mousedown fires before blur, and preventDefault keeps focus in the
         // input, so the click always lands on a list that is still open.
         onmousedown: function (e) { e.preventDefault(); choose(i); },
@@ -1402,8 +1643,10 @@ function partPicker(mod) {
     n = Number(n || 0);
     return h('span', {
       class: 'combo-sources' + (n ? '' : ' zero'),
-      title: n + ' plasmid' + (n === 1 ? '' : 's') + ' in the inventory carry this part'
-    }, n + ' src');
+      title: n + ' plasmid' + (n === 1 ? '' : 's') +
+             ' in the inventory carry this part — it is how many tubes you '
+             + 'could amplify it from, not how good it is'
+    }, n + (n === 1 ? ' plasmid' : ' plasmids'));
   }
 
   /** One /api/parts row. */
@@ -1442,6 +1685,99 @@ function partPicker(mod) {
         ];
       }
     };
+  }
+
+  /** A heading row naming the protein a group of variants share. */
+  function familyHead(fam) {
+    return {
+      kind: 'head', id: null, name: fam.core.name,
+      cells: function () {
+        var hosts = (fam.hosts || []).slice(0, 2).join(', ');
+        return [
+          h('span', { class: 'fam-core' }, fam.core.name),
+          h('span', { class: 'fam-aa mono' }, fam.core.aa + ' aa'),
+          /* Several families can carry one name - QuasAr2 is four distinct
+             proteins here - so say how this one differs and where it is. */
+          fam.differs
+            ? h('span', { class: 'fam-differs', title:
+                'a different protein from the most-used one of this name' },
+                fam.differs)
+            : null,
+          hosts
+            ? h('span', { class: 'fam-hosts', title:
+                'plasmids carrying this exact protein: ' +
+                (fam.hosts || []).join(', ') }, 'in ' + hosts)
+            : null,
+          h('span', {
+            class: 'fam-count',
+            title: fam.n_rows + ' catalogued row(s) encode this protein, '
+              + 'across ' + fam.sources + ' plasmid occurrence(s)'
+          }, fam.n_variants + (fam.n_variants === 1 ? ' form' : ' forms'))
+        ];
+      }
+    };
+  }
+
+  /** One member of a family, named for what is fused to the core. */
+  function variantRow(fam, v) {
+    var alsoTitle = v.also && v.also.length
+      ? '\nalso catalogued as: ' + v.also.join(', ') : '';
+    /* Which tubes this exact protein is in. "20 plasmids" answers how
+       many; the only question after that is which, and the answer was
+       nowhere on the page. */
+    var hosts = v.hosts || [];
+    var more = Math.max(0, (v.n_hosts || hosts.length) - hosts.length);
+    var where = hosts.length
+      ? 'In ' + (v.n_hosts || hosts.length) + ' plasmid'
+        + ((v.n_hosts || hosts.length) === 1 ? '' : 's') + ':\n  '
+        + hosts.join('\n  ') + (more ? '\n  …and ' + more + ' more' : '')
+      : 'No plasmid in the inventory carries this.';
+    return {
+      kind: 'part', id: v.part_id, name: fam.core.name, source: v,
+      note: v.label === 'plain' ? '' : v.label,
+      title: where + alsoTitle,
+      cells: function () {
+        return [
+          h('span', {
+            class: 'var-label' + (v.is_core ? ' plain' : ''),
+            title: where
+          }, v.label === 'plain' ? fam.core.name : v.label),
+          v.n_rows > 1
+            ? h('span', {
+                class: 'var-rows',
+                title: v.n_rows + ' catalogued rows are this same protein, '
+                  + 'differing only in where the annotation starts or ends'
+                  + alsoTitle
+              }, '×' + v.n_rows)
+            : null,
+          h('span', { class: 'combo-len mono' }, bp(v.bp)),
+          h('span', {
+            class: 'combo-sources' + (v.n_sources ? '' : ' zero'),
+            title: where
+          }, v.n_sources + (v.n_sources === 1 ? ' plasmid' : ' plasmids')),
+          /* A visible hint that there is something to hover. */
+          hosts.length
+            ? h('span', { class: 'var-where', title: where },
+                hosts[0].length > 22 ? hosts[0].slice(0, 21) + '…' : hosts[0])
+            : null
+        ];
+      }
+    };
+  }
+
+  function drawFamilies(groups, query) {
+    items = [];
+    groups.forEach(function (fam) {
+      items.push(familyHead(fam));
+      fam.variants.forEach(function (v) { items.push(variantRow(fam, v)); });
+    });
+    active = -1;
+    if (!items.length) {
+      show(h('div', { class: 'combo-empty muted' },
+        'No protein matching “' + query + '”'));
+      return;
+    }
+    paintList();
   }
 
   function showParts() {
@@ -1521,6 +1857,18 @@ function partPicker(mod) {
     var form = mod.form || 'all';
     view = 'parts';
     segmentsOf = null;
+    if (form === 'protein' && type === 'CDS') {
+      fetchFamilies(type, query).then(function (data) {
+        if (mine !== reqId || type !== mod.type) return;
+        drawFamilies((data && data.groups) || [], query);
+      }).catch(function (err) {
+        if (mine !== reqId) return;
+        items = [];
+        show(h('div', { class: 'combo-empty inline-warn' },
+          'search failed: ' + err.message));
+      });
+      return;
+    }
     fetchParts(type, query, form).then(function (rows) {
       // Ignore a slow response that a later keystroke or type change replaced.
       if (mine !== reqId || type !== mod.type) return;
@@ -1546,7 +1894,11 @@ function partPicker(mod) {
 
   input.addEventListener('input', function () {
     mod.name = input.value;
-    if (mod.part_id) { mod.part_id = null; mod.pin_note = ''; renderChip(); }
+    if (mod.part_id) {
+      mod.part_id = null; mod.pin_note = ''; mod.part_bp = null; renderChip();
+    }
+    /* Redraw as it is typed, not only when the row list is rebuilt. */
+    renderSpecPreview();
     schedule();
   });
   input.addEventListener('focus', function () {
@@ -1557,11 +1909,11 @@ function partPicker(mod) {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       if (list.hidden) { search(); return; }
-      if (items.length) { active = (active + 1) % items.length; paint(); }
+      if (items.length) { active = step(active, 1); paint(); }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       if (list.hidden || !items.length) return;
-      active = (active <= 0 ? items.length : active) - 1;
+      active = step(active, -1);
       paint();
     } else if (e.key === 'ArrowRight') {
       // Only hijack → when the caret is already at the end of the text, so
@@ -1686,14 +2038,27 @@ function moduleRow(mod, i, focus) {
     requestAnimationFrame(function () { modeSel.focus(); });
   }
 
-  return h('div', { class: 'module-row' + (isCreLox(mod.type) ? ' is-crelox' : '') },
+  var custom = customSeqEditor(mod, i);
+
+  return h('div', { class: 'module-wrap' },
+    h('div', { class: 'module-row' + (isCreLox(mod.type) ? ' is-crelox' : '')
+                      + (mod.seq ? ' is-literal' : '') },
     h('span', { class: 'module-index' }, String(i + 1)),
     typeSel,
     modeSel,
-    picker.node,
-    picker.formFilter,
-    picker.chip,
+    mod.seq ? h('span', { class: 'literal-note' },
+                'own sequence, ' + bp(cleanDna(mod.seq).length)) : picker.node,
+    mod.seq ? null : picker.formFilter,
+    mod.seq ? null : picker.chip,
     h('div', { class: 'row-buttons' },
+      h('button', {
+        type: 'button',
+        class: 'dna-button' + (mod.seq ? ' is-on' : ''),
+        title: mod.seq
+          ? 'Edit the sequence you typed in'
+          : 'Paste your own sequence instead of searching the inventory',
+        onclick: function () { custom.toggle(); }
+      }, mod.seq ? '\u25cf DNA' : 'DNA'),
       h('button', {
         type: 'button', title: 'Move up', disabled: i === 0,
         onclick: function () { swapModules(i, i - 1); }
@@ -1705,7 +2070,8 @@ function moduleRow(mod, i, focus) {
       h('button', {
         type: 'button', class: 'danger', title: 'Remove',
         onclick: function () { state.modules.splice(i, 1); renderModules(); }
-      }, '×')));
+      }, '×'))),
+    custom.node);
 }
 
 /**
@@ -1715,13 +2081,214 @@ function moduleRow(mod, i, focus) {
  * list the server is sent, and the row numbers keep counting straight
  * through the group.
  */
+
+/* ------------------------------------------------------------------ */
+/* Specification: a live sketch of what is being described             */
+/* ------------------------------------------------------------------ */
+/* The module list says what goes in and in what order, but not what the
+   plasmid looks like, and you only found that out by designing. This
+   draws it while you type. It is a sketch: nothing has been resolved, so
+   the lengths are typical ones for each kind of element, and the vector
+   is whatever the backbone will bring. */
+
+var NOMINAL_BP = {
+  promoter: 800, enhancer: 400, CDS: 1000, p2A: 66, linker: 45,
+  tag: 30, trafficking_motif: 60, IRES: 580, polyA: 480, WPRE: 590,
+  lox_site: 34, AAV_ITR: 141, origin: 590, resistance: 860,
+  Kozak: 6, intron: 1000, terminator: 220
+};
+
+/* What a Cre-lox cassette puts around its payload. */
+var LOX_OF = { DIO: ['lox2272', 'loxP'], FLEX: ['lox2272', 'loxP'],
+               FAS: ['loxFAS', 'loxP'], DO: ['lox2272', 'loxP'] };
+
+function nominalBp(mod) {
+  // A sequence that was typed in is not nominal; it is the length.
+  if (mod.seq) return cleanDna(mod.seq).length || 1;
+  if (mod.part_bp) return Number(mod.part_bp);
+  return NOMINAL_BP[mod.type] || 300;
+}
+
+/** Only the bases, out of whatever was pasted.
+
+   People paste FASTA, they paste a GenBank ORIGIN block with its line
+   numbers, they paste something with a space every ten. It is all the
+   same sequence. */
+function cleanDna(text) {
+  return String(text || '')
+    .replace(/^>.*$/gm, '')
+    .replace(/[^A-Za-z]/g, '')
+    .toUpperCase();
+}
+
+/** A box for a sequence the inventory does not have.
+
+   Some parts are not in any plasmid here yet - a tag out of a paper, a
+   linker somebody designed this morning. Genesis has always taken a
+   literal sequence through the API and had nowhere to type one. */
+function customSeqEditor(mod, i) {
+  var box = h('div', { class: 'literal-box', hidden: 'hidden' });
+  var status = h('div', { class: 'literal-status muted small' }, '');
+  var area = h('textarea', {
+    rows: '4', spellcheck: 'false',
+    placeholder: "Paste DNA 5' to 3'. FASTA headers, numbers and spaces "
+                 + "are ignored.",
+    oninput: function (e) { review(e.target.value); }
+  });
+  area.value = mod.seq || '';
+
+  function review(raw) {
+    var dna = cleanDna(raw);
+    var bad = dna.replace(/[ACGTUNRYKMSWBDHV]/g, '');
+    var notes = [], wrong = false;
+    if (!dna) {
+      notes.push('empty - the row goes back to searching the inventory');
+    } else {
+      notes.push(bp(dna.length));
+      if (bad) {
+        wrong = true;
+        notes.push('not DNA: ' + Array.from(new Set(bad.split(''))).join(' '));
+      }
+      if (mod.type === 'CDS') {
+        if (dna.length % 3) {
+          wrong = true;
+          notes.push('NOT a multiple of 3 - this shifts the frame');
+        } else {
+          notes.push('a whole number of codons');
+          var prot = translateDna(dna);
+          var inner = prot.slice(0, -1).indexOf('*');
+          if (inner >= 0) {
+            wrong = true;
+            notes.push('stop codon at residue ' + (inner + 1)
+                       + ', inside the sequence');
+          }
+        }
+      }
+    }
+    clear(status);
+    status.appendChild(h('span', { class: wrong ? 'bad' : '' },
+                         notes.join(' \u00b7 ')));
+    return dna;
+  }
+
+  box.appendChild(area);
+  box.appendChild(status);
+  box.appendChild(h('div', { class: 'button-row' },
+    h('button', {
+      type: 'button', class: 'primary',
+      onclick: function () {
+        mod.seq = cleanDna(area.value);
+        if (mod.seq) mod.part_id = null;   // a literal is not a pinned part
+        renderModules();
+        renderSpecPreview();
+      }
+    }, 'Use this sequence'),
+    h('button', {
+      type: 'button',
+      onclick: function () {
+        mod.seq = '';
+        renderModules();
+        renderSpecPreview();
+      }
+    }, 'Clear')));
+  review(area.value);
+
+  return {
+    node: box,
+    toggle: function () {
+      box.hidden = !box.hidden;
+      if (!box.hidden) area.focus();
+    }
+  };
+}
+
+/** Build the sketch's feature list from the modules as typed. */
+function specPreviewItems() {
+  var items = [];
+  var at = 0;
+  function put(type, name, bp_, strand) {
+    items.push({ feature_type: type, name: name, start: at,
+                 end: at + bp_, strand: strand || 1 });
+    at += bp_;
+  }
+
+  /* The vector the backbone brings, drawn muted so the payload reads as
+     the thing being designed. */
+  put('AAV_ITR', "5' ITR", NOMINAL_BP.AAV_ITR);
+
+  var groups = cassetteGroups(state.modules);
+  var inCassette = {};
+  var lastOf = {};
+  groups.forEach(function (g) {
+    (g.members || []).forEach(function (k) { inCassette[k] = g; });
+    if ((g.members || []).length) {
+      lastOf[g.members[g.members.length - 1]] = g;
+    }
+  });
+
+  state.modules.forEach(function (mod, i) {
+    if (!isCreLox(mod.type) && !(mod.name || '').trim() && !mod.part_id) return;
+    if (isCreLox(mod.type)) {
+      var pair = LOX_OF[(mod.mode || 'DIO').toUpperCase()] || LOX_OF.DIO;
+      put('lox_site', pair[0], NOMINAL_BP.lox_site);
+      put('lox_site', pair[1], NOMINAL_BP.lox_site);
+      return;
+    }
+    var g = inCassette[i];
+    put(mod.type, mod.name || mod.type, nominalBp(mod), g ? -1 : 1);
+    /* Close the cassette after its last enclosed module. */
+    if (lastOf[i]) {
+      g = lastOf[i];
+      var pair2 = LOX_OF[((state.modules[g.head] || {}).mode || 'DIO')
+        .toUpperCase()] || LOX_OF.DIO;
+      put('lox_site', pair2[0], NOMINAL_BP.lox_site, -1);
+      put('lox_site', pair2[1], NOMINAL_BP.lox_site, -1);
+    }
+  });
+
+  put('WPRE', 'WPRE', NOMINAL_BP.WPRE);
+  put('polyA', 'polyA', NOMINAL_BP.polyA);
+  put('AAV_ITR', "3' ITR", NOMINAL_BP.AAV_ITR);
+  put('origin', 'ori', NOMINAL_BP.origin);
+  put('resistance', 'AmpR', NOMINAL_BP.resistance);
+  return { items: items, length: at };
+}
+
+function renderSpecPreview() {
+  var host = $('spec-preview');
+  if (!host) return;
+  clear(host);
+  /* An empty row is not a module yet: drawing a 4.6 kb plasmid from one
+     blank promoter box claimed more than the user had said. */
+  var real = state.modules.filter(function (m) {
+    return m.type && !isCreLox(m.type) && ((m.name || '').trim() || m.part_id);
+  }).length;
+  if (!real) {
+    host.appendChild(h('p', { class: 'muted small' },
+      'Add a module and the plasmid it describes will be sketched here.'));
+    return;
+  }
+  var built = specPreviewItems();
+  host.appendChild(h('div', { class: 'card-head' },
+    h('h3', null, 'Sketch'),
+    h('span', { class: 'muted small' },
+      '~' + bp(built.length) + ' · nothing resolved yet')));
+  host.appendChild(circularMap(built.length, built.items, {
+    label: ($('spec-name') && $('spec-name').value) || 'construct'
+  }));
+  host.appendChild(h('p', { class: 'muted small' },
+    'Typical lengths, not real parts \u2014 Scan source replaces them.'));
+}
+
 function renderModules(focusIndex, focusWhat) {
   var host = $('modules');
   clear(host);
   if (!state.modules.length) {
     host.appendChild(h('p', { class: 'muted' }, 'No modules yet. Add one below.'));
+    renderSpecPreview();
     return;
   }
+  renderSpecPreview();
 
   var groups = cassetteGroups(state.modules);
   var headOf = {};
@@ -1842,6 +2409,9 @@ function collectSpec() {
       // reading the module's *name* as a mode when it is absent, so a
       // Cre-lox row always states it.
       if (isCreLox(m.type)) out.mode = creLoxMode(m.mode).key;
+      // A sequence typed in by hand is the part: the server takes it as
+      // given and orders it rather than hunting the inventory for it.
+      if (m.seq) out.seq = m.seq;
       return out;
     })
   };
@@ -2014,7 +2584,7 @@ function clearSpec() {
   state.saved = null;
   state.appliedSuggestion = null;
 
-  clear($('plan-out'));
+  resetSteps();
   renderModules();
   refreshSaveButtons();   // also clears the saved-design link
   setStatus($('design-status'), 'specification cleared');
@@ -2073,11 +2643,127 @@ async function scanSources() {
   }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Design steps                                                        */
+/* ------------------------------------------------------------------ */
+/* The design is a sequence - say what you want, see it, look for parts,
+   choose parents, pick a route, read the scheme - and it was laid out as
+   one column several screens tall. It is now one pane per step, so the
+   thing you are working on is the thing on screen. */
+
+var STEPS = [
+  { id: 'spec',    n: 1, label: 'Specification',
+    hint: 'what to build' },
+  { id: 'target',  n: 2, label: 'Target construct',
+    hint: 'the molecule asked for' },
+  /* Scanning the source and reading the parents it turned up are one
+     act, not two: the candidates ARE the result of the scan, and
+     splitting them meant clicking across to see what the click did. */
+  { id: 'scan',    n: 3, label: 'Scan source',
+    hint: 'what the inventory has' },
+  /* "Select" was a step of its own, which put a click between choosing
+     a parent and seeing what you had chosen - on a page where the
+     choosing happens. It is a summary at the top of Scan source now. */
+  { id: 'routes',  n: 4, label: 'Routes',
+    hint: 'how to build it' },
+  { id: 'scheme',  n: 5, label: 'Protocol',
+    hint: 'what to do at the bench' }
+];
+
+var stepState = { current: 'spec', ready: { spec: true } };
+
+function stepPane(id) { return $('step-' + id); }
+
+/** Mark a step as having something to show. */
+function stepReady(id, yes) {
+  stepState.ready[id] = yes !== false;
+  paintSteps();
+}
+
+function showStep(id) {
+  if (!stepState.ready[id]) return;
+  stepState.current = id;
+  STEPS.forEach(function (st) {
+    var pane = stepPane(st.id);
+    if (pane) pane.hidden = st.id !== id;
+  });
+  paintSteps();
+  var panel = $('panel-design');
+  if (panel && panel.scrollIntoView) {
+    panel.scrollIntoView({ block: 'start', behavior: 'auto' });
+  }
+}
+
+function paintSteps() {
+  var nav = $('steps');
+  if (!nav) return;
+  clear(nav);
+  /* A step with nothing to show is not a step. Greying them out left the
+     rail cluttered with places you cannot go; the sequence is clearer
+     when it only contains what exists. */
+  var live = STEPS.filter(function (st) { return !!stepState.ready[st.id]; });
+  /* Numbered by where they are in the rail, not by their place in the
+     full sequence: hiding the empty ones left it reading 1, 3, 4, 5. */
+  live.forEach(function (st, i) {
+    var active = stepState.current === st.id;
+    var btn = h('button', {
+      type: 'button',
+      class: 'step' + (active ? ' active' : ''),
+      'aria-current': active ? 'step' : null,
+      title: st.hint,
+      onclick: function () { showStep(st.id); }
+    },
+      h('span', { class: 'step-n' }, String(i + 1)),
+      h('span', { class: 'step-label' }, st.label),
+      h('span', { class: 'step-hint' }, st.hint));
+    nav.appendChild(btn);
+    if (i < live.length - 1) {
+      nav.appendChild(h('span', { class: 'step-sep', 'aria-hidden': 'true' }, ''));
+    }
+  });
+}
+
+/** Put a built section into a step, and light the step up. */
+function fillStep(id, nodes) {
+  var pane = stepPane(id);
+  if (!pane) return false;
+  clear(pane);
+  var list = [].concat(nodes).filter(Boolean);
+  if (!list.length) { stepReady(id, false); return false; }
+  list.forEach(function (n) { pane.appendChild(n); });
+  stepReady(id, true);
+  return true;
+}
+
+/** Clear every step but the specification — a new run starts over. */
+function resetSteps() {
+  STEPS.forEach(function (st) {
+    if (st.id === 'spec') return;
+    var pane = stepPane(st.id);
+    if (pane) clear(pane);
+    stepState.ready[st.id] = false;
+  });
+  showStep('spec');
+}
+
+/** A fingerprint of the specification, to tell a stale plan from a live one. */
+function specSignature() {
+  return JSON.stringify((state.modules || []).map(function (m) {
+    return [m.type, m.name, m.part_id, m.mode];
+  })) + '|' + (($('spec-backbone') || {}).value || '');
+}
+
 function renderScan() {
-  var out = $('plan-out');
-  clear(out);
   var scan = state.scan;
   if (!scan) return;
+  /* Scanning used to clear the rail, so going back for another look at
+     the parents threw away the routes - six steps became three and the
+     way forward vanished. The plan only goes stale when the thing it was
+     built from changes. */
+  if (state.planSignature && state.planSignature !== specSignature()) {
+    resetSteps();
+  }
 
   var card = h('div', { class: 'card' },
     h('div', { class: 'card-head' },
@@ -2102,22 +2788,180 @@ function renderScan() {
       { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
     ], scan.modules));
   }
-  out.appendChild(card);
+  fillStep('scan', [selectionSummary(scan), card, renderCandidates(scan),
+                    nextFromScan()]);
+  showStep('scan');
+}
 
-  var cands = renderCandidates(scan);
-  if (cands) out.appendChild(cands);
+/** The move out of Routes: the protocol for the route now chosen. */
+function nextFromRoutes() {
+  return h('div', { class: 'card step-next' },
+    h('button', {
+      type: 'button', class: 'primary',
+      onclick: function () { showStep('scheme'); }
+    }, 'Move on to Protocol \u2192'),
+    h('span', { class: 'muted small' },
+      'The numbered protocol, the primers to order and the checks.'));
+}
+
+/** The move out of Scan source: straight to the routes. */
+function nextFromScan() {
+  var haveRoutes = !!(state.plan && (state.plan.routes || []).length);
+  return h('div', { class: 'card step-next' },
+    haveRoutes
+      ? h('button', {
+          type: 'button', class: 'primary',
+          onclick: function () { showStep('routes'); }
+        }, 'Move on to Routes \u2192')
+      : h('button', {
+          type: 'button', class: 'primary',
+          title: 'Design with the parents chosen here and rank the ways '
+               + 'to build it',
+          onclick: function () { generatePlan(); }
+        }, 'Move on to Routes \u2192'),
+    h('span', { class: 'muted small' },
+      haveRoutes
+        ? 'Already designed \u2014 this goes back to the ranked routes.'
+        : 'Runs the planner with whatever is chosen above.'));
+}
+
+/* ------------------------------------------------------------------ */
+/* Step 5: the choices currently in force                              */
+/* ------------------------------------------------------------------ */
+/* Candidate parents is a long list to read; this is the short answer to
+   "so what is it going to use?", which is the thing worth checking before
+   spending a protocol on it. */
+
+function selectionSummary(data) {
+  if (!data) return null;
+  var rows = [];
+  var scheme = data.scheme || {};
+  var rec = (scheme.recipient || {}).name || (data.backbone || {}).name;
+  if (rec) rows.push(['Backbone / recipient', rec, pinnedParents.recipient]);
+  var don = (scheme.donor || {}).name;
+  if (don) rows.push(['Donor', don, pinnedParents.donor]);
+
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', null, 'Selected parents')),
+    h('p', { class: 'muted small' },
+      'What the plan will use. A value marked ' +
+      '“pinned” was chosen by hand on the previous step; the rest were ' +
+      'picked by the ranking and can be overridden there.'));
+
+  if (!rows.length && !Object.keys(pinnedSources).length) {
+    card.appendChild(h('p', { class: 'muted' },
+      'Nothing chosen yet — the planner will pick for you.'));
+    return card;
+  }
+  rows.forEach(function (r) {
+    card.appendChild(h('div', { class: 'sel-row' },
+      h('span', { class: 'sel-what' }, r[0]),
+      h('span', { class: 'sel-name' }, r[1]),
+      r[2] ? h('span', { class: 'pill pill-ok' }, 'pinned') : null));
+  });
+
+  var pins = Object.keys(pinnedSources || {});
+  if (pins.length) {
+    card.appendChild(h('h4', null, 'Pinned part sources'));
+    pins.forEach(function (k) {
+      card.appendChild(h('div', { class: 'sel-row' },
+        h('span', { class: 'sel-what' }, 'part #' + k),
+        h('span', { class: 'sel-name' }, 'plasmid #' + pinnedSources[k]),
+        h('span', { class: 'pill pill-ok' }, 'pinned')));
+    });
+  }
+
+  return card;
+}
+
+/** A bar that says which stage the design is in.
+
+   Planning takes the better part of a minute on a four-module
+   construct, and a button that goes grey for forty seconds looks like
+   a button that has broken. The percentage is an estimate - how the
+   time splits depends on how many modules there are - so the label is
+   the part that is always true. */
+function progressCard() {
+  var fill = h('div', { class: 'bar-fill' });
+  var label = h('div', { class: 'bar-label' }, 'Starting…');
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'bar' }, fill), label,
+    h('p', { class: 'muted small' },
+      'Most of the wait is the search through the inventory.'));
+  return {
+    node: card,
+    set: function (done, text) {
+      fill.style.width = Math.round((done || 0) * 100) + '%';
+      if (text) label.textContent = text;
+    }
+  };
+}
+
+/** POST a spec and read the plan back as it is made.
+
+   EventSource only does GET, so this reads the chunks off the POST
+   itself and splits them on the blank line that ends an SSE event. */
+async function streamDesign(spec, onProgress) {
+  var res;
+  try {
+    res = await fetch('/api/design/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ spec: spec })
+    });
+  } catch (e) { res = null; }
+  if (!res || !res.ok || !res.body) {
+    /* No stream to be had: fall back to the plain endpoint rather
+       than failing the design over a progress bar. */
+    return postJSON('/api/design', { spec: spec });
+  }
+  var reader = res.body.getReader();
+  var decoder = new TextDecoder();
+  var buffer = '', plan = null, failed = null;
+  for (;;) {
+    var chunk = await reader.read();
+    if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+    var cut;
+    while ((cut = buffer.indexOf('\n\n')) >= 0) {
+      var raw = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      var event = '', data = '';
+      raw.split('\n').forEach(function (line) {
+        if (line.indexOf('event: ') === 0) event = line.slice(7);
+        else if (line.indexOf('data: ') === 0) data += line.slice(6);
+      });
+      if (!data) continue;
+      var payload;
+      try { payload = JSON.parse(data); } catch (e) { continue; }
+      if (event === 'progress') onProgress(payload);
+      else if (event === 'plan') plan = payload;
+      else if (event === 'failed') failed = payload.error;
+    }
+    if (chunk.done) break;
+  }
+  if (failed) throw new Error(failed);
+  if (!plan) throw new Error('the design ended without producing a plan');
+  return plan;
 }
 
 async function generatePlan() {
   var status = $('design-status');
   var out = $('plan-out');
-  setStatus(status, 'running stages 4–10…', 'busy');
+  setStatus(status, 'designing…', 'busy');
   clear(out);
-  out.appendChild(h('div', { class: 'card' },
-    h('p', { class: 'muted' }, 'Resolving modules, validating and ranking routes…')));
+  var progress = progressCard();
+  /* #plan-out is hidden - it is where the old single-page layout put
+     things - so a bar in it would be a bar nobody sees. It goes in the
+     pane the button that started this is on. */
+  var here = document.querySelector('.step-pane:not([hidden])') || out;
+  here.appendChild(progress.node);
+  progress.node.scrollIntoView({ block: 'center', behavior: 'smooth' });
   try {
     var spec = collectSpec();
-    var plan = await postJSON('/api/design', { spec: spec });
+    var plan = await streamDesign(spec, function (p) {
+      progress.set(p.done, p.label);
+      setStatus(status, (p.label || '').toLowerCase(), 'busy');
+    });
     state.spec = spec;
     state.plan = plan;
     state.appliedSuggestion = null;   // a fresh plan may suggest a new name
@@ -2125,6 +2969,9 @@ async function generatePlan() {
     // `state.saved` is deliberately kept: regenerating after loading design #5
     // is exactly the case Overwrite exists for.
     refreshSaveButtons();
+    if (progress.node.parentNode) {
+      progress.node.parentNode.removeChild(progress.node);
+    }
     renderPlan();
     setStatus(status, 'plan ready', 'ok');
   } catch (err) {
@@ -2386,78 +3233,60 @@ function parentPicker(role, options, chosenId) {
   return box;
 }
 
-function parentCard(role, parent, kind, options) {
-  if (!parent) {
-    if (!(options || []).length) return null;
-    var empty = h('div', { class: 'parent-card' },
-      h('div', { class: 'parent-head' },
-        h('span', { class: 'parent-role ' + role }, role.toUpperCase()),
-        h('span', { class: 'muted' }, 'none chosen')));
-    var pickEmpty = parentPicker(role, options, null);
-    if (pickEmpty) empty.appendChild(pickEmpty);
-    return empty;
-  }
-  var head = h('div', { class: 'parent-head' },
-    h('span', { class: 'parent-role ' + role }, role.toUpperCase()),
-    h('strong', null, parent.name),
-    h('span', { class: 'muted small' },
-      bp(parent.length) + (parent.owner ? ' · ' + parent.owner : '')));
-  var card = h('div', { class: 'parent-card' }, head);
-  card.appendChild(circularMap(parent.length, (parent.features || []).map(
-    function (f) {
-      return { type: f.feature_type, name: f.name, start: f.start,
-               end: f.end, strand: f.strand };
-    }), {
-      label: parent.name, highlight: parent.highlight, highlightKind: kind
-    }));
-  var picker = parentPicker(role, options, parent.id);
-  if (picker) card.appendChild(picker);
-  return card;
-}
+/** Say it before the protocol: the lab may already have this.
 
-function schemeCard(plan) {
-  var scheme = plan.scheme || {};
-  if (!scheme.recipient) return null;
+   Two weeks of cloning to arrive at a plasmid that is in the freezer
+   is the most expensive thing this tool can fail to mention, and the
+   inventory is the only place that knows. */
+function alreadyMade(plan) {
+  var hits = plan.already_made || [];
+  if (!hits.length) return null;
+  var made = hits.filter(function (h) {
+    return h.exact || h.coverage >= 0.98;
+  });
+  var close = hits.filter(function (h) { return made.indexOf(h) < 0; });
 
-  var card = h('div', { class: 'card scheme-card' },
+  var card = h('div', { class: 'card' + (made.length ? ' card-alarm' : '') },
     h('div', { class: 'card-head' },
-      h('h2', null, 'Cloning scheme'),
+      h('h2', null, made.length ? 'The lab already has this construct'
+                                : 'Close relatives already in the inventory'),
       h('span', { class: 'muted small' },
-        'two parents: cut a region out of the recipient, put a region from ' +
-        'the donor in its place')));
+        made.length ? 'check one before cloning it again'
+                    : 'different constructs, but worth a look')));
 
-  var grid = h('div', { class: 'parent-grid' });
-  var rec = parentCard('recipient', scheme.recipient, 'cut',
-                       scheme.recipient_options);
-  var don = parentCard('donor', scheme.donor, 'take', scheme.donor_options);
-  if (rec) grid.appendChild(rec);
-  if (don) grid.appendChild(don);
-  card.appendChild(grid);
-
-  var anchors = [];
-  if (scheme.left_anchor) {
-    anchors.push(scheme.left_anchor.name + ' (ends ' +
-                 bp(scheme.left_anchor.end) + ')');
+  function row(x, strong) {
+    return h('div', { class: 'made-row' },
+      h('span', { class: strong ? 'made-name' : 'made-name muted' }, x.name),
+      h('span', { class: 'muted small' },
+        bp(x.length) + ' · ' + (x.owner || 'unknown owner')
+        + (x.verified ? ' · ' + String(x.verified).replace(/_/g, ' ') : '')),
+      h('span', { class: 'muted small' },
+        x.exact ? 'the same molecule, base for base'
+                : Math.round(x.coverage * 100) + '% shared'));
   }
-  if (scheme.right_anchor) {
-    anchors.push(scheme.right_anchor.name + ' (starts ' +
-                 bp(scheme.right_anchor.start) + ')');
-  }
-  if (anchors.length) {
+  made.forEach(function (x) { card.appendChild(row(x, true)); });
+  if (made.length) {
     card.appendChild(h('p', { class: 'muted small' },
-      'The cut is bounded by ' + anchors.join(' and ') +
-      (anchors.length === 1 ? ', which is kept' : ', which are kept') +
-      ' and is what the primers anneal to or the enzymes cut between.'));
+      'Sequence one of these before building it again. The plan below '
+      + 'is only worth running if it turns out not to be what the name '
+      + 'says.'));
   }
-
+  if (close.length) {
+    if (made.length) {
+      card.appendChild(h('p', { class: 'muted small' },
+        'Close relatives, for comparison:'));
+    }
+    close.forEach(function (x) { card.appendChild(row(x, false)); });
+  }
   return card;
 }
 
 function renderPlan() {
-  var out = $('plan-out');
-  clear(out);
+  resetSteps();
   var plan = state.plan;
   if (!plan) return;
+  var scanCards = [alreadyMade(plan), selectionSummary(plan), scanRecap(plan),
+                   renderCandidates(plan), nextFromScan()].filter(Boolean);
 
   var c = plan.construct || {};
 
@@ -2495,39 +3324,55 @@ function renderPlan() {
             ? h('span', { class: 'pill pill-warn' }, 'required') : 'no'; } }
     ], plan.fragments));
   }
-  out.appendChild(summary);
+  /* --- 2. the molecule that was asked for -------------------------- */
+  fillStep('target', [summary, renderConstruct(c),
+                      plan.vector ? renderVector(plan.vector, plan) : null]);
 
-  var cands = renderCandidates(plan);
-  if (cands) out.appendChild(cands);
+  /* --- 3. where the parts come from, and what to start from -------- */
+  fillStep('scan', scanCards);
 
-  var scheme = schemeCard(plan);
-  if (scheme) out.appendChild(scheme);
-
-  /* --- the designed molecule itself -------------------------------- */
-  out.appendChild(renderConstruct(c));
-
-  /* --- what the protocol actually makes ---------------------------- */
-  var simCard = renderSimulation(selectedRoute(), plan);
-  if (simCard) out.appendChild(simCard);
-
-  /* --- read-back verification -------------------------------------- */
-  if (plan.verification) out.appendChild(renderVerification(plan.verification));
-
-  /* --- vector family ----------------------------------------------- */
-  if (plan.vector) out.appendChild(renderVector(plan.vector, plan));
-
-  /* --- validation -------------------------------------------------- */
-  out.appendChild(renderValidation(plan.validation || {}));
-
-  /* --- routes ------------------------------------------------------ */
-  out.appendChild(renderRoutes(plan.routes || []));
-
-  /* --- selected route detail --------------------------------------- */
+  /* --- 6. how to build it ------------------------------------------ */
   var route = selectedRoute();
-  if (route) out.appendChild(renderRouteDetail(route));
+  fillStep('routes', [renderRoutes(plan.routes || []),
+                      renderCloningFlow(route, plan),
+                      nextFromRoutes()]);
 
-  /* --- export ------------------------------------------------------ */
-  out.appendChild(renderExports());
+  /* --- 7. the plan at the bench, and whether it holds up ------------ */
+  /* schemeCard drew the two parents and the product - which is what
+     "How this route builds it" now does on Routes, for every route
+     rather than only a swap. Two drawings of one thing, on two steps,
+     is one too many. */
+  fillStep('scheme', [route ? renderRouteDetail(route) : null,
+                      renderSimulation(route, plan),
+                      plan.verification
+                        ? renderVerification(plan.verification) : null,
+                      renderValidation(plan.validation || {}),
+                      renderExports()]);
+
+  state.planSignature = specSignature();
+
+  /* Land on the routes: with a plan in hand that is the decision to
+     make, and every earlier step stays one click away. */
+  showStep(stepState.ready.routes ? 'routes' : 'target');
+}
+
+/** Step 3 once a plan exists: where each module resolved to. */
+function scanRecap(plan) {
+  if (!(plan.modules || []).length) return null;
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', null, 'Sources found'),
+      h('span', { class: 'muted small' },
+        plan.modules.length + ' module(s) resolved')));
+  card.appendChild(table([
+    { label: 'Type', cell: function (m) { return typeTag(m.type); } },
+    { label: 'Requested', key: 'requested' },
+    { label: 'Resolved part', key: 'part_name' },
+    { label: 'Length', numeric: true, cell: function (m) { return bp(m.length); } },
+    { label: 'Found in', numeric: true,
+      cell: function (m) { return (m.sources || []).length; } },
+    { label: 'Notes', cell: function (m) { return warnCell(m.warnings); } }
+  ], plan.modules));
+  return card;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2799,6 +3644,78 @@ function renderConstruct(c) {
  * one of these is on their own bench, or sequenced, or simply the one the
  * lab uses. Choosing here re-plans from that choice.
  */
+
+/* ------------------------------------------------------------------ */
+/* Scan source: the plasmid you are pointing at                        */
+/* ------------------------------------------------------------------ */
+/* Choosing a parent off a list of names is choosing blind. This draws
+   whichever one is selected, with the parts the request asked for picked
+   out of it, so "already has CAG" is something you can see rather than
+   something you take on trust. */
+
+var PLASMID_CACHE = {};
+
+function fetchPlasmid(id) {
+  if (!PLASMID_CACHE[id]) {
+    PLASMID_CACHE[id] = api('/api/plasmid/' + id)
+      .catch(function (e) { delete PLASMID_CACHE[id]; throw e; });
+  }
+  return PLASMID_CACHE[id];
+}
+
+/** Does this annotation answer one of the names the request asked for? */
+function wantedBy(ann, wants) {
+  var nm = String(ann.name || '').toLowerCase();
+  if (!nm) return false;
+  return wants.some(function (w) {
+    w = String(w || '').toLowerCase();
+    return w && (nm === w || nm.indexOf(w) >= 0 || w.indexOf(nm) >= 0);
+  });
+}
+
+function showCandidateMap(host, plasmidId, wants, role) {
+  clear(host);
+  if (!plasmidId) {
+    host.appendChild(h('p', { class: 'muted small' },
+      'Pick a plasmid to see what is in it.'));
+    return;
+  }
+  host.appendChild(h('p', { class: 'muted small' }, 'Loading\u2026'));
+  fetchPlasmid(plasmidId).then(function (p) {
+    clear(host);
+    var anns = (p.annotations || []).filter(function (a) {
+      return a && typeof a.start === 'number' && a.end > a.start;
+    });
+    var hits = anns.filter(function (a) { return wantedBy(a, wants); });
+    host.appendChild(h('div', { class: 'card-head' },
+      h('h4', null, p.name || ('plasmid #' + plasmidId)),
+      h('span', { class: 'muted small' },
+        bp(p.seq_length) + ' \u00b7 ' + (role || 'parent'))));
+    host.appendChild(mapWithToggle(p.seq_length, anns.map(function (a) {
+      return {
+        feature_type: a.feature_type, name: a.name,
+        start: a.start, end: a.end, strand: a.strand,
+        /* The thing being looked for, lit up against the rest. */
+        colour: wantedBy(a, wants) ? '#f0a32a' : null
+      };
+    }), { label: p.name, circular: !!p.circular }));
+    if (hits.length) {
+      host.appendChild(h('p', { class: 'muted small' },
+        'In amber: ' + hits.map(function (a) {
+          return a.name + ' (' + (a.start + 1) + '\u2013' + a.end + ')';
+        }).join(', ') + '.'));
+    } else {
+      host.appendChild(h('p', { class: 'muted small' },
+        'None of the requested parts is annotated in this plasmid by name '
+        + '\u2014 it may still carry them under another label.'));
+    }
+  }).catch(function (e) {
+    clear(host);
+    host.appendChild(h('p', { class: 'inline-warn' },
+      'could not load that plasmid: ' + e.message));
+  });
+}
+
 function renderCandidates(plan) {
   var cand = plan.candidates || {};
   var recipients = cand.recipients || [];
@@ -2815,22 +3732,90 @@ function renderCandidates(plan) {
   card.appendChild(h('p', { class: 'muted small' },
     'Read as an architecture: ' + (cand.modules || []).join(' – ') + '.'));
 
+  var wants = (cand.modules || []).slice();
+  /* One panel per parent rather than one shared one. A two-donor plan
+     has three plasmids in it, and a single panel could only ever show
+     the last thing clicked - which is the one you are least likely to
+     be comparing against. */
+  var maps = h('aside', { class: 'cand-maps' });
+  var panels = {};
+  function panelFor(key, role) {
+    if (!panels[key]) {
+      panels[key] = h('div', { class: 'cand-map card' });
+      maps.appendChild(panels[key]);
+    }
+    return panels[key];
+  }
+  var lists = h('div', { class: 'cand-lists' });
+  card.appendChild(h('div', { class: 'cand-split' }, lists, maps));
+
+  /* Draw what is already chosen, so nothing is blank before a click. */
+  showCandidateMap(panelFor('recipient'), chosenBackbone, wants, 'recipient');
+  (cand.donors || []).forEach(function (d, di) {
+    var ids = partIdsFor(plan, d.covers || []);
+    var picked = (d.options || []).filter(function (o) {
+      return ids.length && ids.every(function (id) {
+        return pinnedSources[id] === o.plasmid_id;
+      });
+    })[0] || (d.options || [])[0];
+    if (picked) {
+      showCandidateMap(panelFor('donor' + di), picked.plasmid_id,
+                       d.covers || [],
+                       'donor ' + (di + 1) + ' \u2014 ' +
+                       (d.covers || []).join(' + '));
+    }
+  });
+
   if (recipients.length) {
-    card.appendChild(h('h4', null, 'Start from'));
-    card.appendChild(h('p', { class: 'muted small' },
-      'The score counts how many of these a plasmid really carries, in ' +
-      'order from the start: 2/2 has both and only the vector has to be ' +
-      'opened, 1/2 has the first and the rest must be built. A plasmid ' +
-      'marked variant holds something close rather than the part itself, ' +
-      'which is a reason to start from it and not a reason to take the ' +
-      'part out of it.'));
-    var list = h('div', { class: 'cand-list' });
+    lists.appendChild(h('h4', null, 'Start from'));
+    /* Four lines of prose explaining one column, above the table it
+       explains. The score itself already carries the explanation as a
+       tooltip on every cell; this is for whoever wants it spelled out. */
+    lists.appendChild(disclosure('how the score is read',
+      'The score counts how many of these a plasmid really carries, in '
+      + 'order from the start: 2/2 has both and only the vector has to be '
+      + 'opened, 1/2 has the first and the rest must be built. A plasmid '
+      + 'marked variant holds something close rather than the part itself, '
+      + 'which is a reason to start from it and not a reason to take the '
+      + 'part out of it.'));
+    /* When every candidate carries the same thing the column separates
+       nothing, and six identical cells read as data. */
+    var varies = recipients.some(function (r) {
+      return (r.carries || []).join(',')
+           !== (recipients[0].carries || []).join(',');
+    });
+    /* Six rows of radio buttons to pick one thing is a list pretending
+       to be a control. The chosen one shows as a row - with its score,
+       its owner and its map - and the rest live in the select until
+       somebody wants to change it. */
+    lists.appendChild(candidatePicker(
+      'Start from', recipients, chosenBackbone,
+      function (r) {
+        return r.exact_run + '/' + (cand.modules || []).length + '  '
+             + r.name + '  ' + bp(r.length)
+             + (r.owner ? ' - ' + r.owner : '')
+             + (r.exact ? '' : '  (variant)');
+      },
+      function (r) {
+        $('spec-backbone').value = String(r.plasmid_id);
+        showCandidateMap(panelFor('recipient'), r.plasmid_id, wants,
+                         'recipient');
+        replan();
+      }));
+    var list = h('div', { class: 'cand-list cand-rest'
+                          + (varies ? '' : ' cand-nohas') });
     list.appendChild(h('div', { class: 'cand-row cand-head' },
       h('span', null, ''),
       h('span', { class: 'cand-score' }, 'has'),
       h('span', null, 'plasmid'),
       h('span', null, 'size · owner'),
-      h('span', null, 'already has')));
+      varies ? h('span', null, 'already has')
+             : h('span', { class: 'muted small cand-head-note',
+                           title: 'every candidate here already has '
+                                + ((recipients[0].carries || []).join(', ')
+                                   || 'none of the parts') },
+                 'all carry '
+                 + ((recipients[0].carries || []).join(', ') || 'nothing'))));
     recipients.forEach(function (r) {
       var on = r.plasmid_id === chosenBackbone;
       var row = h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
@@ -2839,6 +3824,8 @@ function renderCandidates(plan) {
           checked: on ? 'checked' : null,
           onchange: function () {
             $('spec-backbone').value = String(r.plasmid_id);
+            showCandidateMap(panelFor('recipient'), r.plasmid_id, wants,
+                             'recipient');
             replan();
           }
         }),
@@ -2859,34 +3846,81 @@ function renderCandidates(plan) {
         h('span', { class: 'muted small' },
           bp(r.length) + (r.owner ? ' · ' + r.owner : '') +
           (r.has_cassette ? ' · has lox cassette' : '')),
-        h('span', { class: 'muted small cand-has' },
-          'already has ' + (r.carries || []).join(', ')));
+        varies ? h('span', { class: 'muted small cand-has' },
+                     'already has ' + (r.carries || []).join(', '))
+               : h('span', { class: 'cand-has' }, ''));
       list.appendChild(row);
     });
-    card.appendChild(list);
+    lists.appendChild(foldAway(
+      'compare all ' + recipients.length + ' side by side', list));
+  }
+
+  /* Parts that ride on a primer tail have no donor to choose: the
+     planner writes them into the two oligos that flank them. Saying so
+     once is the answer to "where did P2A go?"; a picker for them would
+     be offering a choice that changes nothing. */
+  var folded = cand.on_primer_tails || [];
+  if (folded.length) {
+    lists.appendChild(h('p', { class: 'muted small fold-note' },
+      folded.join(', ')
+      + (folded.length === 1 ? ' is' : ' are')
+      + ' too short to amplify, so '
+      + (folded.length === 1 ? 'it is' : 'they are')
+      + ' written into the primer tails of the parts on either side '
+      + '\u2014 there is no plasmid to take '
+      + (folded.length === 1 ? 'it' : 'them') + ' from.'));
   }
 
   if (donors.length) {
     var n = cand.n_donors || 0;
-    card.appendChild(h('h4', null,
+    lists.appendChild(h('h4', null,
       'Then take the rest from ' + n + ' donor' + (n === 1 ? '' : 's')));
-    donors.forEach(function (d) {
+    donors.forEach(function (d, di) {
       var box = h('div', { class: 'cand-donor' },
         h('div', null, h('strong', null, (d.covers || []).join(' – '))));
       if (d.note) {
         box.appendChild(h('p', { class: 'issue issue-warning' }, d.note));
       }
-      (d.options || []).forEach(function (o) {
+      var opts = d.options || [];
+      var ids0 = partIdsFor(plan, d.covers || []);
+      var picked = opts.filter(function (o) {
+        return ids0.length && ids0.every(function (id) {
+          return pinnedSources[id] === o.plasmid_id;
+        });
+      })[0];
+      box.appendChild(candidatePicker(
+        'use', opts, picked ? picked.plasmid_id : null,
+        function (o) {
+          return o.name + '  ' + bp(o.length)
+               + (o.owner ? ' - ' + o.owner : '')
+               + (o.exact ? '  (exact)' : '  (variant)');
+        },
+        function (o) {
+          ids0.forEach(function (id) { pinnedSources[id] = o.plasmid_id; });
+          showCandidateMap(panelFor('donor' + di), o.plasmid_id,
+                           d.covers || [],
+                           'donor ' + (di + 1) + ' \u2014 '
+                           + (d.covers || []).join(' + '));
+          replan();
+        }));
+      var rest = h('div', { class: 'cand-list cand-rest' });
+      opts.forEach(function (o) {
         var ids = partIdsFor(plan, d.covers || []);
         var on = ids.length && ids.every(function (id) {
           return pinnedSources[id] === o.plasmid_id;
         });
-        box.appendChild(h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
+        rest.appendChild(h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
           h('input', {
             type: 'radio', name: 'cand-donor-' + (d.covers || []).join('-'),
             checked: on ? 'checked' : null,
             onchange: function () {
               ids.forEach(function (id) { pinnedSources[id] = o.plasmid_id; });
+              /* Show the donor being pointed at, with the part it is
+                 wanted for picked out of it. */
+              showCandidateMap(panelFor('donor' + di), o.plasmid_id,
+                               d.covers || [],
+                               'donor ' + (di + 1) + ' \u2014 ' +
+                               (d.covers || []).join(' + '));
               replan();
             }
           }),
@@ -2902,14 +3936,18 @@ function renderCandidates(plan) {
           h('span', { class: 'muted small' },
             bp(o.length) + (o.owner ? ' · ' + o.owner : '')),
           h('span', { class: 'muted small cand-has' },
-            'has ' + (o.carries || []).join(', '))));
+            (o.carries || []).length ? 'has ' + o.carries.join(', ') : '')));
       });
-      card.appendChild(box);
+      if (opts.length > 1) {
+        box.appendChild(foldAway(
+          'compare all ' + opts.length + ' side by side', rest));
+      }
+      lists.appendChild(box);
     });
   }
 
   if (Object.keys(pinnedSources).length) {
-    card.appendChild(h('p', { class: 'muted small' },
+    lists.appendChild(h('p', { class: 'muted small' },
       h('button', {
         type: 'button', class: 'secondary',
         onclick: function () { pinnedSources = {}; replan(); }
@@ -3374,18 +4412,785 @@ function renderValidation(validation) {
   return card;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Routes: the cloning drawn the way a paper would draw it             */
+/* ------------------------------------------------------------------ */
+/* The first version put a full plasmid map next to every parent, which
+   draws every annotation the file happens to carry. The question a
+   cloning figure answers is narrower: which plasmid, which piece out of
+   it, by what reaction, and what joins to what. One lane per piece, one
+   column per bench stage, and nothing else on the page. */
+
+var FIG = {
+  r: 56,               /* parent circle */
+  pr: 68,              /* product circle */
+  rowH: 196,
+  colParent: 250,      /* width of the parent column, labels included */
+  colStage: 96,
+  colFrag: 168,
+  bracket: 18,
+  pad: 14
+};
+
+/* One colour per lane, carried from the parent through to the arc it
+   becomes in the product, so "where did this part come from" is answered
+   by looking rather than by reading. */
+var LANE_COLOURS = ['#2f7bd4', '#d4572f', '#2f9e5e', '#8e4fc9', '#b58900'];
+
+/** Drop anything sitting entirely inside something else kept.
+
+   Real files carry nested annotations - the chicken beta-actin promoter
+   inside CAG - and auto-annotation leaves junk inside them too: YD030
+   has a 609 bp reverse-strand "Voltron2" buried in its CAG promoter
+   that has nothing to do with the real Voltron-2 further round the
+   plasmid. At figure scale a feature inside another feature is a detail
+   of that feature, not a part of the construct. The full map on the
+   Protocol step still shows everything. */
+function outermost(items, startKey, endKey) {
+  var sk = startKey || 'start', ek = endKey || 'end';
+  return items.filter(function (a) {
+    var s = a[sk], e = a[ek];
+    if (typeof s !== 'number' || typeof e !== 'number' || e <= s) return true;
+    return !items.some(function (b) {
+      return b !== a && typeof b[sk] === 'number' && typeof b[ek] === 'number'
+        && b[ek] > b[sk] && b[sk] <= s && e <= b[ek]
+        && (b[ek] - b[sk]) > (e - s);
+    });
+  });
+}
+
+/* One colour per junction, so the two halves of a join match by eye.
+   Deliberately away from LANE_COLOURS: a lane colour says "this piece",
+   a junction colour says "these two ends meet". */
+var JUNCTION_COLOURS = ['#d9a60d', '#bd339a', '#0d9ea8', '#73798a'];
+var JUNCTION_LETTERS = 'ABCDEF';
+
+/** {laneIndex|side: [label, colour]} for every end that has a partner.
+
+   Sticky ends pair by enzyme - a HindIII end only goes into a HindIII
+   end - so the enzyme name is the junction's identity. Homology arms
+   have no name of their own, so they are lettered by the order the
+   pieces sit in the product: piece k's right end meets piece k+1's
+   left end, all the way round the circle. */
+function junctionColours(lanes) {
+  var ids = [];
+  var sticky = lanes.filter(function (l) { return l.endKind === 'sticky'; });
+  if (sticky.length && sticky.length === lanes.length) {
+    lanes.forEach(function (lane, i) {
+      ['left', 'right'].forEach(function (side, k) {
+        var name = (lane.ends || [])[k];
+        if (name) ids.push([i, side, name]);
+      });
+    });
+  } else {
+    var placed = lanes.map(function (l, i) { return [i, l]; })
+      .filter(function (t) {
+        return typeof ((t[1].src || {}).at_start) === 'number';
+      });
+    if (placed.length !== lanes.length || lanes.length < 2) return {};
+    placed.sort(function (a, b) {
+      return a[1].src.at_start - b[1].src.at_start;
+    });
+    for (var k = 0; k < placed.length; k++) {
+      var label = JUNCTION_LETTERS[k % JUNCTION_LETTERS.length];
+      ids.push([placed[k][0], 'right', label]);
+      ids.push([placed[(k + 1) % placed.length][0], 'left', label]);
+    }
+  }
+  var order = [];
+  ids.forEach(function (t) {
+    if (order.indexOf(t[2]) < 0) order.push(t[2]);
+  });
+  var out = {};
+  ids.forEach(function (t) {
+    out[t[0] + '|' + t[1]] = [t[2],
+      JUNCTION_COLOURS[order.indexOf(t[2]) % JUNCTION_COLOURS.length]];
+  });
+  return out;
+}
+
+/** The features worth naming on the assembled plasmid. A construct has
+   one promoter and one payload worth labelling at this size; the full
+   map on the Protocol step carries the rest. */
+function productFeatures(layout, span, limit) {
+  span = span || 1;
+  var keep = (layout || []).filter(function (a) {
+    return a && typeof a.start === 'number'
+      && ['promoter', 'CDS'].indexOf(a.type) >= 0
+      && (a.end - a.start) > span * 0.03;
+  });
+  keep = outermost(keep);
+  keep.sort(function (a, b) { return (b.end - b.start) - (a.end - a.start); });
+  return keep.slice(0, limit || 4);
+}
+
+/** The handful of features worth naming on a parent. */
+function figFeatures(src) {
+  var span = src.template_length || 1;
+  var keep = (src.features || []).filter(function (a) {
+    return a && typeof a.start === 'number' && a.end > a.start
+      && (a.end - a.start) > span * 0.05
+      && ['CDS', 'promoter', 'resistance', 'origin'].indexOf(a.feature_type) >= 0;
+  });
+  keep = outermost(keep);
+  keep.sort(function (a, b) { return (b.end - b.start) - (a.end - a.start); });
+  return keep.slice(0, 3);
+}
+
+/** Text just outside a circle, on whichever side of it the angle is.
+ *
+ *  Two cut sites a few hundred bases apart sit at nearly the same angle,
+ *  and their names landed on top of each other - "HindIII" and "EcoRV"
+ *  overprinted into an unreadable smudge. Each circle keeps a list of
+ *  where it has already written, and a clashing label is nudged clear.
+ */
+function ringLabel(g, cx, cy, r, f, text, cls) {
+  if (!text) return;
+  var at = ((f % 1) + 1) % 1;
+  var p = polar(cx, cy, r + 9, at);
+  var right = at < 0.5;
+  var x = p[0] + (right ? 3 : -3), y = p[1] + 3;
+  /* Push a clashing label away from the circle, not across it: nudging
+     everything downwards wrote the second label over the ring whenever
+     both sat near twelve o'clock. */
+  var step = (at < 0.25 || at > 0.75) ? -11 : 11;
+  var used = g.__labels || (g.__labels = []);
+  for (var guard = 0; guard < 6; guard++) {
+    var clash = used.some(function (u) {
+      return u.right === right && Math.abs(u.y - y) < 11
+          && Math.abs(u.x - x) < 70;
+    });
+    if (!clash) break;
+    y += step;
+  }
+  used.push({ x: x, y: y, right: right });
+  var t = svg('text', {
+    x: x, y: y, 'text-anchor': right ? 'start' : 'end',
+    class: cls || 'fig-tag'
+  });
+  t.textContent = text;
+  g.appendChild(t);
+}
+
+/** A primer, drawn as the little arrow a cloning figure uses. */
+function figPrimer(g, cx, cy, r, f, forward, name) {
+  var w = 0.022 * (forward ? 1 : -1);
+  var a = polar(cx, cy, r + 7, f), b = polar(cx, cy, r + 7, f + w * 0.6);
+  var tip = polar(cx, cy, r + 7, f + w);
+  var s1 = polar(cx, cy, r + 3.5, f + w * 0.6);
+  var s2 = polar(cx, cy, r + 10.5, f + w * 0.6);
+  g.appendChild(svg('path', {
+    d: 'M ' + a[0] + ' ' + a[1] + ' L ' + b[0] + ' ' + b[1],
+    class: 'fig-primer', 'stroke-width': 2.4
+  }));
+  var head = svg('path', {
+    d: 'M ' + s1[0] + ' ' + s1[1] + ' L ' + tip[0] + ' ' + tip[1]
+       + ' L ' + s2[0] + ' ' + s2[1] + ' Z', class: 'fig-primer-head'
+  });
+  if (name) {
+    var ti = svg('title', null);
+    ti.textContent = name;
+    head.appendChild(ti);
+  }
+  g.appendChild(head);
+  /* F and R, not the whole primer name: the name belongs on the protocol
+     and what the figure has to say is which end and which way. */
+  ringLabel(g, cx, cy, r + 4, f + w * 0.5, forward ? 'F' : 'R',
+            'fig-prim-tag');
+}
+
+/** An enzyme cut: a tick through the backbone with the enzyme named. */
+function figCut(g, cx, cy, r, f, name) {
+  var a = polar(cx, cy, r - 8, f), b = polar(cx, cy, r + 8, f);
+  g.appendChild(svg('line', { x1: a[0], y1: a[1], x2: b[0], y2: b[1],
+    class: 'fig-cut', 'stroke-width': 2.4 }));
+  if (name) ringLabel(g, cx, cy, r + 5, f, name, 'fig-enz');
+}
+
+/** One parent plasmid: what it is, what comes out, and how. */
+function figParent(lane, cx, cy) {
+  var src = lane.src || {};
+  var span = src.template_length || 1;
+  var r = FIG.r;
+  var g = svg('g', null);
+  g.appendChild(svg('circle', { cx: cx, cy: cy, r: r, fill: 'none',
+    class: 'fig-ring', 'stroke-width': 2.5 }));
+
+  figFeatures(src).forEach(function (a) {
+    var from = (a.start % span) / span, to = (a.end % span) / span;
+    g.appendChild(svg('path', {
+      d: arcPath(cx, cy, r, from, to), fill: 'none', 'stroke-width': 6,
+      stroke: colorFor(a.feature_type), opacity: 0.4
+    }));
+    /* Only the promoter earns a label; the rest are context. */
+    if (a.feature_type === 'promoter') {
+      var mid = from + (((to - from) + 1) % 1) / 2;
+      ringLabel(g, cx, cy, r, mid, shortName(a.name, 15));
+    }
+  });
+
+  if (typeof src.from_start !== 'number'
+      || typeof src.from_end !== 'number' || !src.template_length) {
+    figCaption(g, cx, cy, src.template,
+               src.template_length ? bp(src.template_length)
+                                   : 'size unknown');
+    return g;
+  }
+  var f0 = ((src.from_start || 0) % span) / span;
+  var f1 = ((src.from_end || 0) % span) / span;
+  g.appendChild(svg('path', {
+    d: arcPath(cx, cy, r, f0, f1), fill: 'none',
+    'stroke-width': 8, stroke: lane.colour
+  }));
+  var cuts = lane.cutsParent || [];
+  if (cuts.length) {
+    var second = cuts[1] || cuts[0];
+    /* Two sites a few bases apart are one tick at this scale, and two
+       names stacked on it read as a smudge rather than as two enzymes. */
+    if (Math.min((f0 - f1 + 1) % 1, (f1 - f0 + 1) % 1) < 0.02) {
+      figCut(g, cx, cy, r, f0, cuts[0] + '/' + second);
+    } else {
+      figCut(g, cx, cy, r, f0, cuts[0]);
+      figCut(g, cx, cy, r, f1, second);
+    }
+  } else {
+    var pn = lane.primers || [];
+    figPrimer(g, cx, cy, r, f0, true, pn[0]);
+    figPrimer(g, cx, cy, r, f1, false, pn[1]);
+  }
+
+  figCaption(g, cx, cy, src.template, bp(src.template_length));
+  return g;
+}
+
+/** A piece nobody has a plasmid for: it gets ordered. */
+function figOrder(lane, cx, cy) {
+  var g = svg('g', null);
+  var w = 96, hgt = 52;
+  g.appendChild(svg('rect', { x: cx - w / 2, y: cy - hgt / 2, width: w,
+    height: hgt, rx: 6, class: 'fig-order' }));
+  var t = svg('text', { x: cx, y: cy - 2, 'text-anchor': 'middle',
+    class: 'fig-name' });
+  t.textContent = 'synthesise';
+  g.appendChild(t);
+  var sub = svg('text', { x: cx, y: cy + 13, 'text-anchor': 'middle',
+    class: 'fig-sub' });
+  sub.textContent = bp(lane.src && lane.src.bp) + ' gBlock';
+  g.appendChild(sub);
+  return g;
+}
+
+function figStageArrow(x, y, w, verb, sub, colour) {
+  var g = svg('g', null);
+  var x1 = x + 10, x2 = x + w - 10;
+  g.appendChild(svg('line', { x1: x1, y1: y, x2: x2, y2: y,
+    class: 'fig-arrow', 'stroke-width': 1.8,
+    'marker-end': 'url(#figHead)' }));
+  var t = svg('text', { x: (x1 + x2) / 2, y: y - 8, 'text-anchor': 'middle',
+    class: 'fig-verb' });
+  t.textContent = verb;
+  g.appendChild(t);
+  if (sub) {
+    var s2 = svg('text', { x: (x1 + x2) / 2, y: y + 15,
+      'text-anchor': 'middle', class: 'fig-sub' });
+    s2.textContent = sub;
+    g.appendChild(s2);
+  }
+  return g;
+}
+
+/** The linear piece in the tube, with whatever its ends are. */
+function figFragment(lane, index, joins, x, y, w) {
+  var g = svg('g', null);
+  g.appendChild(svg('rect', { x: x, y: y - 6, width: w, height: 12, rx: 2,
+    fill: lane.colour }));
+  /* Both halves of a join wear the same colour and the same letter, so
+     "which end goes into which" is a thing you see rather than work
+     out. Two grey caps both labelled "overlap" said only that an
+     overlap existed. */
+  ['left', 'right'].forEach(function (side, i) {
+    var pair = joins[index + '|' + side];
+    var fallback = (lane.ends || [])[i];
+    if (!pair && !fallback) return;
+    var label = pair ? pair[0] : fallback;
+    var colour = pair ? pair[1] : null;
+    var ex = i === 0 ? x : x + w;
+    g.appendChild(svg('rect', { x: ex - 3.5, y: y - 10, width: 7, height: 20,
+      rx: 1.5, fill: colour || null,
+      class: colour ? null : (lane.endKind === 'sticky' ? 'fig-end-cut'
+                                                        : 'fig-end-hom') }));
+    var t = svg('text', { x: ex, y: y + 22, 'text-anchor': 'middle',
+      class: 'fig-end-label', fill: colour || null });
+    t.textContent = label;
+    g.appendChild(t);
+  });
+  /* The piece is named here rather than beside its parent: around a
+     circle the name of a near-whole-plasmid arc has no sensible angle
+     to sit at, and it collided with the plasmid's own name. */
+  var nm = svg('text', { x: x + w / 2, y: y - 14, 'text-anchor': 'middle',
+    class: 'fig-piece' });
+  nm.textContent = shortName(lane.piece, 24);
+  g.appendChild(nm);
+  var lab = svg('text', { x: x + w / 2, y: y + 22, 'text-anchor': 'middle',
+    class: 'fig-sub' });
+  lab.textContent = bp(lane.src && lane.src.bp);
+  /* The ends are named at the ends; the size sits between them. */
+  g.appendChild(lab);
+  return g;
+}
+
+/** The new plasmid: which piece is which, and where they join.
+
+   It used to carry two rings - the lane contributions outside and the
+   construct's own promoter and CDS inside - and the labels pointed at
+   the inner one. So the arc labelled ASAP7y was not the arc the
+   fragment on the left was drawn in, and the two colours contradicted
+   each other. One ring now, the pieces, labelled as the pieces they
+   are, with the junctions marked where they actually fall. */
+function figProduct(lanes, plan, sim, cx, cy, joins) {
+  var c = (plan && plan.construct) || {};
+  var span = sim.product_bp || c.length || 1;
+  var r = FIG.pr;
+  var g = svg('g', null);
+  g.appendChild(svg('circle', { cx: cx, cy: cy, r: r, fill: 'none',
+    class: 'fig-ring', 'stroke-width': 3 }));
+
+  var placed = lanes.filter(function (l) {
+    return typeof ((l.src || {}).at_start) === 'number';
+  });
+  placed.forEach(function (lane, i) {
+    var src = lane.src;
+    var from = src.at_start / span, to = src.at_end / span;
+    g.appendChild(svg('path', {
+      d: arcPath(cx, cy, r, from, to), fill: 'none',
+      'stroke-width': 9, stroke: lane.colour
+    }));
+    var mid = from + ((((to - from) % 1) + 1) % 1) / 2;
+    ringLabel(g, cx, cy, r, mid, shortName(lane.piece, 16),
+              'fig-tag fig-tag-strong');
+  });
+
+  /* The overhangs, on the product as well as on the pieces: the join is
+     a place on the finished molecule, not only a property of a tube. */
+  var order = lanes.map(function (l, i) { return i; }).filter(function (i) {
+    return typeof ((lanes[i].src || {}).at_start) === 'number';
+  });
+  order.forEach(function (i) {
+    var pair = joins && joins[i + '|right'];
+    if (!pair) return;
+    var at = (lanes[i].src.at_end % span) / span;
+    var a = polar(cx, cy, r - 7, at), b = polar(cx, cy, r + 7, at);
+    g.appendChild(svg('line', { x1: a[0], y1: a[1], x2: b[0], y2: b[1],
+      stroke: pair[1], 'stroke-width': 2.6, 'stroke-linecap': 'round' }));
+    var t = svg('text', { x: 0, y: 0, class: 'fig-end-label', fill: pair[1] });
+    var o = polar(cx, cy, r + 15, at);
+    t.setAttribute('x', o[0]);
+    t.setAttribute('y', o[1] + 3);
+    t.setAttribute('text-anchor', 'middle');
+    t.textContent = pair[0];
+    g.appendChild(t);
+  });
+
+  figCaption(g, cx, cy, c.name || 'new plasmid', bp(span), r);
+  return g;
+}
+
+/** The plasmid's name under its circle, its size inside it. */
+function figCaption(g, cx, cy, name, size, r) {
+  var mid = svg('text', { x: cx, y: cy + 4, 'text-anchor': 'middle',
+    class: 'fig-sub' });
+  mid.textContent = size;
+  g.appendChild(mid);
+  var t = svg('text', { x: cx, y: cy + (r || FIG.r) + 26,
+    'text-anchor': 'middle', class: 'fig-name' });
+  t.textContent = shortName(String(name || 'template'), 28);
+  var ti = svg('title', null);
+  ti.textContent = String(name || '');
+  t.appendChild(ti);
+  g.appendChild(t);
+}
+
+function shortName(name, n) {
+  name = String(name || '');
+  return name.length > n ? name.slice(0, n - 1) + '…' : name;
+}
+
+/* ------------------------------------------------------------------ */
+
+/** Every enzyme this route mentions anywhere. */
+function routeEnzymes(route) {
+  var all = [];
+  (route.steps || []).forEach(function (st) {
+    stepEnzymes(st).forEach(function (e) {
+      if (all.indexOf(e) < 0) all.push(e);
+    });
+  });
+  return all;
+}
+
+/** The enzyme list one RE_DIGEST step names, wherever it put it. */
+function stepEnzymes(st) {
+  var ez = ((st.details || {}).enzymes || []).slice();
+  if (ez.length) return ez;
+  /* Some steps carry them in the inputs instead, as "HindIII, EcoRV". */
+  (st.inputs || []).forEach(function (i) {
+    if (/^[A-Za-z]+[IVX0-9]+(\s*,\s*[A-Za-z]+[IVX0-9]+)*$/.test(i)) {
+      ez = String(i).split(/\s*,\s*/);
+    }
+  });
+  return ez;
+}
+
+/** Split "Kozak+ASAP7y-F+Kozak+ASAP7y-R" back into its two primers. */
+function stepPrimers(st, route) {
+  var names = (route.primers || []).map(function (p) { return p.name; });
+  var pair = (st.inputs || []).filter(function (i) {
+    return i.indexOf('+') >= 0;
+  })[0] || '';
+  for (var i = 0; i < names.length; i++) {
+    for (var j = 0; j < names.length; j++) {
+      if (i !== j && names[i] + '+' + names[j] === pair) {
+        return [names[i], names[j]];
+      }
+    }
+  }
+  var m = /^(.*-F)\+(.*-R)$/.exec(pair);
+  return m ? [m[1], m[2]] : [];
+}
+
+/** Where a primer sits on its template, when the plan printed it. */
+function primerSpan(route, names) {
+  var by = {};
+  (route.primers || []).forEach(function (p) { by[p.name] = p; });
+  var f = by[names[0]], r = by[names[1]];
+  if (!f || typeof f.target_start !== 'number') return null;
+  return { start: f.target_start,
+           end: typeof f.target_end === 'number' ? f.target_end : r
+                && r.target_end };
+}
+
+/** Walk the route's steps into one lane per piece that enters the tube. */
+function routeLanes(route, sim, plan) {
+  var pool = (sim.sources || []).filter(Boolean).slice();
+  var atlas = (plan && plan.templates) || {};
+  function takeSource(template) {
+    for (var i = 0; i < pool.length; i++) {
+      var s = pool[i];
+      var ok = template === null ? s.synthesised : s.template === template;
+      if (ok) { pool.splice(i, 1); return s; }
+    }
+    return null;
+  }
+  /* An unsimulated route still knows its plasmids and its primers, which
+     is everything the drawing needs. Refusing to draw it was how the
+     restriction route came up blank. */
+  function stand(template, span) {
+    var t = atlas[template] || {};
+    return { name: '', template: t.name || template, template_id: t.id,
+             template_length: t.bp, template_circular: t.circular !== false,
+             features: t.features || [],
+             from_start: span && span.start, from_end: span && span.end,
+             bp: span && span.end > span.start ? span.end - span.start : 0,
+             estimated: true };
+  }
+
+  var lanes = [], last = null;
+  (route.steps || []).forEach(function (st) {
+    var op = st.operation;
+    if (op === 'PCR') {
+      var tmpl = (st.details || {}).template || (st.inputs || [])[0] || '';
+      var names = stepPrimers(st, route);
+      var src = takeSource(tmpl) || stand(tmpl, primerSpan(route, names));
+      if (!src.bp) src.bp = (st.details || {}).length || src.bp;
+      last = { origin: 'plasmid', template: tmpl, src: src,
+               piece: pieceLabel(st.output), primers: names, colour: '',
+               stages: [{ verb: 'PCR', sub: bp(src.bp) }] };
+      lanes.push(last);
+    } else if (op === 'RE_DIGEST') {
+      var ez = stepEnzymes(st);
+      /* An input that is not an enzyme list is the plasmid being cut. */
+      var host = (st.inputs || []).filter(function (i) {
+        return ez.indexOf(i) < 0 && i !== ez.join(', ');
+      })[0];
+      if (!ez.length) ez = routeEnzymes(route);
+      if (host) {
+        var hsrc = takeSource(host) || stand(host, null);
+        last = { origin: 'plasmid', template: host, src: hsrc,
+                 piece: pieceLabel(st.output), colour: '', cutsParent: ez,
+                 stages: [{ verb: 'Digest', sub: ez.join(' + ') }] };
+        lanes.push(last);
+      } else if (last) {
+        /* A bare digest cuts whatever came off the bench last - almost
+           always the amplicon, which is how a hybrid route gets sticky
+           ends onto a PCR product. That is a second stage, not a
+           footnote, so it gets its own column. */
+        last.stages.push({ verb: 'Digest', sub: ez.join(' + ') });
+        last.cutsFragment = ez;
+      }
+    } else if (op === 'SYNTHESIS') {
+      var osrc = takeSource(null)
+              || { bp: (st.details || {}).length || 0, synthesised: true };
+      last = { origin: 'order', template: null, src: osrc,
+               piece: pieceLabel(st.output), colour: '',
+               stages: [{ verb: 'Order', sub: bp(osrc.bp) }] };
+      lanes.push(last);
+    }
+  });
+
+  /* What the ends of each piece are, which is what the join is made of. */
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  var homology = ops.indexOf('HI_FI_ASSEMBLY') >= 0
+               || ops.indexOf('GIBSON_ASSEMBLY') >= 0;
+  lanes.forEach(function (lane, i) {
+    lane.colour = LANE_COLOURS[i % LANE_COLOURS.length];
+    var ez = lane.cutsFragment || lane.cutsParent;
+    if (ez && ez.length) {
+      lane.ends = [ez[0], ez[1] || ez[0]];
+      lane.endKind = 'sticky';
+    } else if (homology) {
+      lane.ends = ['overlap', 'overlap'];
+      lane.endKind = 'homology';
+    } else {
+      lane.ends = [];
+    }
+    if (!lane.src) lane.src = { bp: 0, template: lane.template };
+  });
+  return lanes;
+}
+
+/** "EGFP amplicon with sites" -> "EGFP"; "linearised vector" stays. */
+function pieceLabel(out) {
+  return String(out || 'fragment')
+    .replace(/\s+(amplicon|fragment)(\s+with sites)?$/i, '')
+    .replace(/^(purified|clean|digested)\s+/i, '');
+}
+
+/** The reaction that puts the pieces together. */
+function joinVerb(route) {
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  if (ops.indexOf('HI_FI_ASSEMBLY') >= 0) return 'NEBuilder HiFi';
+  if (ops.indexOf('GIBSON_ASSEMBLY') >= 0) return 'Gibson assembly';
+  if (ops.indexOf('LIGATION') >= 0) return 'T4 ligase';
+  return 'Assemble';
+}
+
+function cloningFigure(route, plan) {
+  var sim = route.simulation || {};
+  var lanes = routeLanes(route, sim, plan);
+  if (!lanes.length) return null;
+
+  var maxStages = lanes.reduce(function (n, l) {
+    return Math.max(n, l.stages.length);
+  }, 1);
+  var xParent = FIG.pad;
+  var xStage = xParent + FIG.colParent;
+  var xFrag = xStage + maxStages * FIG.colStage;
+  var xBracket = xFrag + FIG.colFrag + 10;
+  var xJoin = xBracket + FIG.bracket;
+  var xProd = xJoin + FIG.colStage + FIG.pr;
+  var W = xProd + FIG.pr + FIG.pad + 40;
+  var rows = lanes.length;
+  var H = Math.max(rows * FIG.rowH, 2 * FIG.pr + 56) + 24;
+
+  var root = svg('svg', {
+    viewBox: '0 0 ' + Math.round(W) + ' ' + Math.round(H),
+    class: 'fig-svg', role: 'img',
+    'aria-label': 'how ' + (route.title || 'this route')
+                  + ' builds the construct'
+  });
+  var defs = svg('defs', null);
+  var marker = svg('marker', { id: 'figHead', viewBox: '0 0 10 10',
+    refX: '9', refY: '5', markerWidth: '6', markerHeight: '6',
+    orient: 'auto-start-reverse' });
+  marker.appendChild(svg('path', { d: 'M 0 0 L 10 5 L 0 10 z',
+    class: 'fig-arrow-head' }));
+  defs.appendChild(marker);
+  root.appendChild(defs);
+
+  var joins = junctionColours(lanes);
+  lanes.forEach(function (lane, i) {
+    var cy = i * FIG.rowH + FIG.rowH / 2;
+    var cx = xParent + FIG.colParent / 2;
+    root.appendChild(lane.origin === 'order' ? figOrder(lane, cx, cy)
+                                             : figParent(lane, cx, cy));
+    lane.stages.forEach(function (stage, k) {
+      root.appendChild(figStageArrow(xStage + k * FIG.colStage, cy,
+                                     FIG.colStage, stage.verb, stage.sub));
+    });
+    root.appendChild(figFragment(lane, i, joins, xFrag, cy, FIG.colFrag));
+  });
+
+  /* One bracket gathering the pieces into the single reaction. */
+  var top = FIG.rowH / 2, bot = (rows - 1) * FIG.rowH + FIG.rowH / 2;
+  if (rows > 1) {
+    root.appendChild(svg('path', {
+      d: 'M ' + xBracket + ' ' + top + ' H ' + (xBracket + 10)
+         + ' V ' + bot + ' H ' + xBracket,
+      fill: 'none', class: 'fig-arrow', 'stroke-width': 1.8
+    }));
+  }
+  var mid = (top + bot) / 2;
+  root.appendChild(figStageArrow(xJoin, mid, FIG.colStage, joinVerb(route),
+                                 rows + ' pieces'));
+  root.appendChild(figProduct(lanes, plan, sim, xProd, mid, joins));
+  return root;
+}
+
+function figLegend(route, lanes) {
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  var bits = [];
+  if (ops.indexOf('PCR') >= 0) bits.push('arrows on a circle are primers');
+  if (ops.indexOf('RE_DIGEST') >= 0) bits.push('ticks are enzyme cuts');
+  if (lanes.some(function (l) { return l.origin === 'order'; })) {
+    bits.push('a dashed box is DNA nobody has, so it is ordered');
+  }
+  bits.push('each colour follows one piece into the product');
+  if (Object.keys(junctionColours(lanes)).length) {
+    bits.push(lanes[0] && lanes[0].endKind === 'sticky'
+      ? 'matching end colours are compatible overhangs'
+      : 'the two ends sharing a colour and letter are one overlap');
+  }
+  return bits.join(' · ');
+}
+
+function renderCloningFlow(route, plan) {
+  if (!route) return null;
+  var sim = route.simulation || {};
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'card-head' },
+      h('h2', null, 'How this route builds it'),
+      h('span', { class: 'muted small' }, route.title || '')));
+
+  var lanes = routeLanes(route, sim, plan);
+  if (!lanes.length) {
+    card.appendChild(h('p', { class: 'muted' },
+      'This route has no amplification, digest or synthesis step to draw. '
+      + 'The numbered protocol is on the Protocol step.'));
+    return card;
+  }
+
+  var figure = cloningFigure(route, plan);
+  if (figure) card.appendChild(h('div', { class: 'fig-wrap' }, figure));
+  card.appendChild(h('p', { class: 'fig-legend muted small' },
+    figLegend(route, lanes)));
+  if (!sim.simulated) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'Drawn from the planned steps; this route was not simulated, so the '
+      + 'product shown is the design rather than a checked molecule.'));
+  }
+  return card;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Routes: filter by technique                                         */
+/* ------------------------------------------------------------------ */
+/* Which way a construct gets built is a lab preference before it is an
+   optimisation - some benches have no HiFi master mix, some would rather
+   not design primers - so the ranked list is filterable by what the
+   route actually does. */
+
+var METHOD_FILTERS = [
+  { key: 'pcr',      label: 'PCR',        hint: 'amplifies at least one piece' },
+  { key: 'enzyme',   label: 'Enzyme',     hint: 'cuts with restriction enzymes' },
+  { key: 'assembly', label: 'Homology',   hint: 'HiFi or Gibson assembly' },
+  { key: 'order',    label: 'Synthesis',  hint: 'orders a fragment' }
+];
+
+var routeFilter = {};   // key -> true when that technique is required
+
+/** The set of techniques a route uses. */
+function routeMethods(route) {
+  var ops = (route.steps || []).map(function (s) { return s.operation; });
+  var m = {};
+  if (ops.indexOf('PCR') >= 0) m.pcr = true;
+  if (ops.indexOf('RE_DIGEST') >= 0) m.enzyme = true;
+  if (ops.indexOf('HI_FI_ASSEMBLY') >= 0 ||
+      ops.indexOf('GIBSON_ASSEMBLY') >= 0) m.assembly = true;
+  if (ops.indexOf('SYNTHESIS') >= 0) m.order = true;
+  return m;
+}
+
+/** Ticked boxes are the techniques on offer: a route need only use one.
+
+   Requiring all of them answered "which route does everything I ticked",
+   which is not a question anybody has. The question is "I am willing to
+   do PCR or enzymes - show me those".
+ */
+function routePassesFilter(route) {
+  var want = Object.keys(routeFilter).filter(function (k) {
+    return routeFilter[k];
+  });
+  if (!want.length) return true;
+  var has = routeMethods(route);
+  return want.some(function (k) { return !!has[k]; });
+}
+
+function methodChips(route) {
+  var has = routeMethods(route);
+  var on = METHOD_FILTERS.filter(function (f) { return has[f.key]; });
+  if (!on.length) return null;
+  return h('div', { class: 'route-methods' }, on.map(function (f) {
+    return h('span', { class: 'method-chip method-' + f.key, title: f.hint },
+      f.label);
+  }));
+}
+
+function methodFilterBar(routes) {
+  var bar = h('div', { class: 'method-filter' },
+    h('span', { class: 'muted small' }, 'show routes using:'));
+  METHOD_FILTERS.forEach(function (f) {
+    var n = routes.filter(function (r) { return routeMethods(r)[f.key]; }).length;
+    var box = h('input', {
+      type: 'checkbox', checked: routeFilter[f.key] ? 'checked' : null,
+      disabled: n ? null : 'disabled',
+      onchange: function (e) {
+        routeFilter[f.key] = e.target.checked;
+        renderPlan();
+      }
+    });
+    bar.appendChild(h('label', {
+      class: 'method-box' + (n ? '' : ' muted'),
+      title: f.hint + ' \u2014 ' + n + ' of ' + routes.length + ' route(s)'
+    }, box, h('span', null, f.label + ' (' + n + ')')));
+  });
+  var any = Object.keys(routeFilter).some(function (k) { return routeFilter[k]; });
+  if (any) {
+    bar.appendChild(h('button', {
+      type: 'button', class: 'link-button',
+      onclick: function () { routeFilter = {}; renderPlan(); }
+    }, 'clear'));
+  }
+  return bar;
+}
+
 function renderRoutes(routes) {
   var card = h('div', { class: 'card' },
     h('div', { class: 'card-head' },
       h('h2', null, 'Routes'),
-      h('span', { class: 'muted small' }, 'ranked best first')));
+      h('span', { class: 'muted small' },
+        'ranked best first \u2014 click one to choose it')));
 
   if (!routes.length) {
     card.appendChild(h('p', { class: 'muted' }, 'No routes were generated.'));
     return card;
   }
 
-  card.appendChild(h('div', { class: 'routes' }, routes.map(function (r, i) {
+  card.appendChild(methodFilterBar(routes));
+  var shown = routes.filter(routePassesFilter);
+  if (!shown.length) {
+    card.appendChild(h('p', { class: 'muted' },
+      'No route uses any of the techniques ticked above.'));
+    return card;
+  }
+  if (shown.length < routes.length) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'Showing ' + shown.length + ' of ' + routes.length
+      + '; the rest use none of the techniques ticked.'));
+  }
+
+  card.appendChild(h('div', { class: 'routes' }, shown.map(function (r, i) {
     var selected = r.id === state.routeId;
     var cls = 'route' + (selected ? ' selected' : '') + (r.feasible ? '' : ' infeasible');
     return h('div', {
@@ -3398,26 +5203,142 @@ function renderRoutes(routes) {
       h('div', { class: 'route-head' },
         h('span', { class: 'rank' }, '#' + (i + 1)),
         h('h3', null, r.title || r.id),
-        r.feasible ? null : h('span', { class: 'pill pill-bad' }, 'not feasible')),
+        r.feasible ? null : h('span', { class: 'pill pill-bad' }, 'not feasible'),
+        methodChips(r)),
+      /* What actually decides between two routes at the bench: how many
+         reactions, how many oligos to order, how long it takes. "cost"
+         is a dimensionless ranking score that reads like dollars, and
+         an infeasible route carries a +1000 sort sentinel, so it is
+         named for what it is and the sentinel is not shown at all.
+         "steps" and "assemblies" were the same on every route. */
       h('dl', { class: 'route-stats' },
-        statPair('cost', num(r.cost, 2)),
-        statPair('steps', r.n_steps),
         statPair('PCRs', r.n_pcr),
-        statPair('assemblies', r.n_assembly),
+        statPair('primers', (r.primers || []).length),
         statPair('hands-on', hours(r.hands_on_minutes)),
-        statPair('primers', (r.primers || []).length)),
+        r.feasible ? statPair('effort', Math.round(r.cost)) : null),
       r.feasible
         ? ((r.warnings || []).length
-            ? h('p', { class: 'route-note inline-warn' }, plural(r.warnings.length, 'warning'))
+            ? h('p', { class: 'route-note inline-warn',
+                       title: r.warnings.join('\n') },
+                firstLine(r.warnings[0])
+                + (r.warnings.length > 1
+                    ? '  (+' + (r.warnings.length - 1) + ' more)' : ''))
             : h('p', { class: 'route-note muted' }, 'no warnings'))
-        : h('p', { class: 'route-note reason' },
-            (r.warnings && r.warnings.length) ? r.warnings[0] : 'no reason given'));
+        : h('p', { class: 'route-note reason',
+                    title: (r.warnings || []).join('\n') },
+            (r.warnings && r.warnings.length) ? r.warnings[0]
+                                              : 'no reason given'));
   })));
   return card;
 }
 
+/** A warning's first clause, for the one line a card has room for. */
+function firstLine(text) {
+  var t = String(text || '').replace(/^simulation:\s*/, '');
+  if (t.length > 72) t = t.slice(0, 71).replace(/[\s,;:]+\S*$/, '') + '\u2026';
+  return t;
+}
+
+var STAT_HINTS = {
+  effort: 'relative planning score \u2014 reactions, oligos and ordered '
+        + 'DNA weighted together; lower is cheaper',
+  'hands-on': 'active bench time, not counting overnight growth, '
+            + 'screening or sequencing'
+};
+
+/** A one-line link that opens a paragraph. Used wherever a long
+ *  explanation was being read out before anybody asked for it. */
+function disclosure(label, text) {
+  var body = h('p', { class: 'muted small', hidden: 'hidden' }, text);
+  var link = h('button', {
+    type: 'button', class: 'link-button',
+    onclick: function () {
+      body.hidden = !body.hidden;
+      link.textContent = body.hidden ? label : 'hide';
+    }
+  }, label);
+  return h('div', { class: 'disclosure' }, link, body);
+}
+
+/** The look-before-you-go-on block under a QC step.
+
+   The step people skip is the one that would have told them, so it
+   does not read like the rest of the list: what to run, what a good
+   result is, and a row per way it can go wrong with the thing to try
+   next. Every number in it came from this plan. */
+function checkpointBlock(step) {
+  var c = (step.details || {}).checkpoint;
+  if (!c) return null;
+  var box = h('div', { class: 'check-box' });
+  (c.how || []).forEach(function (line) {
+    box.appendChild(h('p', { class: 'check-how' }, line));
+  });
+  box.appendChild(h('div', { class: 'check-head' }, 'Go on if you see'));
+  var ul = h('ul', { class: 'check-list' });
+  (c.expect || []).forEach(function (line) {
+    ul.appendChild(h('li', null, line));
+  });
+  box.appendChild(ul);
+  if ((c.troubles || []).length) {
+    box.appendChild(h('div', { class: 'check-head check-bad' }, 'If not'));
+    box.appendChild(table([
+      { label: 'What you see', cell: function (t) { return t[0]; } },
+      { label: 'What it means', cell: function (t) { return t[1]; } },
+      { label: 'What to do', cell: function (t) { return t[2]; } }
+    ], c.troubles));
+  }
+  return box;
+}
+
+/** A link that reveals a node, for a table that is worth having and
+   not worth showing until it is asked for. */
+function foldAway(label, node) {
+  node.hidden = true;
+  var link = h('button', {
+    type: 'button', class: 'link-button',
+    onclick: function () {
+      node.hidden = !node.hidden;
+      link.textContent = node.hidden ? label : 'hide';
+    }
+  }, label);
+  return h('div', { class: 'fold-away' }, link, node);
+}
+
+/** One chosen parent, with the rest folded into a select.
+
+   A radio list is the right control for three things and the wrong
+   one for thirty: the picker scrolls, every option is on screen
+   whether or not it is a contender, and the one that matters - the
+   chosen one - looks exactly like the others. */
+function candidatePicker(label, rows, chosenId, describe, onPick) {
+  if (!rows || rows.length < 2) return h('div', null);
+  var chosen = rows.filter(function (r) {
+    return r.plasmid_id === chosenId;
+  })[0] || rows[0];
+
+  var select = h('select', {
+    onchange: function (e) {
+      var pick = rows[Number(e.target.value)];
+      if (pick) onPick(pick);
+    }
+  }, rows.map(function (r, i) {
+    return h('option', {
+      value: String(i),
+      selected: r === chosen ? 'selected' : null
+    }, describe(r));
+  }));
+
+  return h('div', { class: 'cand-pick' },
+    h('label', { class: 'cand-pick-label' }, label),
+    select,
+    h('span', { class: 'muted small' },
+      rows.length + ' candidate' + (rows.length === 1 ? '' : 's')
+      + ' \u00b7 ranked best first'));
+}
+
 function statPair(label, value) {
-  return [h('dt', null, label),
+  if (label === null) return [];
+  return [h('dt', { title: STAT_HINTS[label] || null }, label),
           h('dd', null, value === null || value === undefined ? '' : String(value))];
 }
 
@@ -3426,8 +5347,9 @@ function renderRouteDetail(route) {
     h('div', { class: 'card-head' },
       h('h2', null, route.title || route.id),
       h('span', { class: 'muted small' },
-        'strategy: ' + (route.strategy || '?') + ' · cost ' + num(route.cost, 2) +
-        ' · ' + hours(route.hands_on_minutes) + ' hands-on')));
+        (route.n_pcr || 0) + ' PCR · '
+        + plural((route.primers || []).length, 'primer') + ' · '
+        + hours(route.hands_on_minutes) + ' hands-on')));
 
   if (!route.feasible) {
     card.appendChild(h('div', { class: 'errorbox' },
@@ -3455,7 +5377,13 @@ function renderRouteDetail(route) {
           h('span', { class: 'step-desc' }, s.description || ''),
           h('span', { class: 'step-min muted' }, hours(s.minutes))),
         s.output ? h('div', { class: 'step-io muted small' }, '→ ' + s.output) : null,
-        s.notes ? h('div', { class: 'step-note' }, s.notes) : null);
+        s.notes ? h('div', { class: 'step-note' }, s.notes) : null,
+        /* What this plan found, as opposed to what the operation always
+           does: how many sites DpnI has to cut here, for instance. The
+           PDF has carried it since it was added; the screen did not. */
+        (s.details && s.details.note)
+          ? h('div', { class: 'step-note' }, s.details.note) : null,
+        checkpointBlock(s));
     })));
   }
 
@@ -3481,20 +5409,56 @@ function renderRouteDetail(route) {
     return h('span', null, name,
       h('span', { class: 'muted small' }, ' (' + (type || '') + ')'));
   };
-  card.appendChild(h('h4', null, 'Junctions (' + junctions.length + ')'));
-  card.appendChild(table([
-    { label: '#', numeric: true, key: 'index' },
-    { label: 'Left', cell: function (j) { return side(j.left_name, j.left_type); } },
-    { label: 'Right', cell: function (j) { return side(j.right_name, j.right_type); } },
-    { label: 'Method', key: 'method' },
-    { label: 'Overlap', numeric: true, key: 'overlap_length' },
-    { label: 'Frame shift', numeric: true, key: 'frame_shift' },
-    { label: 'Added residues', cell: function (j) {
-        return h('span', { class: 'mono' }, j.added_residues || ''); } },
-    { label: 'Sequence', cell: function (j) {
-        return h('span', { class: 'mono seq' }, String(j.sequence || '').toUpperCase()); } },
-    { label: 'Warnings', cell: function (j) { return warnCell(j.warnings); } }
-  ], junctions));
+  /* Two different things were in one table. A join is where two
+     amplicons meet and has an overlap arm whose GC decides whether the
+     assembly works; a boundary between two annotated elements matters
+     for the reading frame and nothing is joined there at all. Calling
+     all seventeen of them HiFi joins warned that the arm between the
+     AmpR promoter and AmpR was 24% GC - a redesign of a primer that
+     does not exist. */
+  var joins = junctions.filter(function (j) { return j.is_join; });
+  var rest = junctions.filter(function (j) {
+    return !j.is_join && ((j.warnings || []).length || j.frame_shift);
+  });
+
+  card.appendChild(h('h4', null,
+    'Assembly joins (' + joins.length + ')'));
+  if (!joins.length) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'This route does not itemise its joins; the step list says how '
+      + 'much homology each piece carries.'));
+  } else {
+    card.appendChild(h('p', { class: 'muted small' },
+      'Where two pieces meet. The overlap arm is the shared sequence '
+      + 'that anneals them.'));
+    card.appendChild(table([
+      { label: 'Left', cell: function (j) { return side(j.left_name, j.left_type); } },
+      { label: 'Right', cell: function (j) { return side(j.right_name, j.right_type); } },
+      { label: 'Method', key: 'method' },
+      { label: 'Overlap', numeric: true, key: 'overlap_length' },
+      { label: 'Sequence', cell: function (j) {
+          return h('span', { class: 'mono seq' },
+                   String(j.sequence || '').toUpperCase()); } },
+      { label: 'Warnings', cell: function (j) { return warnCell(j.warnings); } }
+    ], joins));
+  }
+
+  if (rest.length) {
+    card.appendChild(h('h4', null,
+      'Element boundaries worth checking (' + rest.length + ')'));
+    card.appendChild(h('p', { class: 'muted small' },
+      'Inside the pieces, so nothing is joined here - but a part that '
+      + 'is not a multiple of three puts whatever follows it out of '
+      + 'frame.'));
+    card.appendChild(table([
+      { label: 'Left', cell: function (j) { return side(j.left_name, j.left_type); } },
+      { label: 'Right', cell: function (j) { return side(j.right_name, j.right_type); } },
+      { label: 'Frame shift', numeric: true, key: 'frame_shift' },
+      { label: 'Added residues', cell: function (j) {
+          return h('span', { class: 'mono' }, j.added_residues || ''); } },
+      { label: 'Warnings', cell: function (j) { return warnCell(j.warnings); } }
+    ], rest));
+  }
 
   return card;
 }
@@ -3535,6 +5499,9 @@ function renderExports() {
       exportButton('Protocol (.md)', 'protocol', base + '_protocol.md'),
       exportButton('PDF protocol (.pdf)', 'pdf', base + '_protocol.pdf'),
       exportButton('Primers (.csv)', 'primers', base + '_primers.csv'),
+      /* The same primers in the four columns IDT's bulk order page
+         takes, so ordering is a paste rather than a transcription. */
+      exportButton('IDT order (.csv)', 'order', base + '_IDT_order.csv'),
       exportButton('GenBank (.gb)', 'genbank', base + '.gb'),
       status));
 }
@@ -3768,6 +5735,7 @@ function selectTab(name) {
 }
 
 async function init() {
+  paintSteps();
   document.querySelectorAll('#tabs .tab').forEach(function (btn) {
     btn.addEventListener('click', function () { selectTab(btn.dataset.tab); });
   });
@@ -3784,10 +5752,20 @@ async function init() {
   });
   $('part-type').addEventListener('change', renderParts);
 
+  var rescan = $('inv-rescan');
+  if (rescan) rescan.addEventListener('click', rescanShare);
+
   $('add-module').addEventListener('click', function () {
     state.modules.push(newModule('CDS'));
     renderModules();
   });
+  var more = $('builder-more'), help = $('builder-help');
+  if (more && help) {
+    more.addEventListener('click', function () {
+      help.hidden = !help.hidden;
+      more.textContent = help.hidden ? 'what the markers mean' : 'hide';
+    });
+  }
   $('scan').addEventListener('click', scanSources);
   $('generate').addEventListener('click', generatePlan);
   $('clear-spec').addEventListener('click', clearSpecWithConfirm);

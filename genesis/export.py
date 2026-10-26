@@ -32,6 +32,56 @@ def primer_table_csv(plan: dict, route_id: str | None = None) -> str:
     return "\n".join(lines)
 
 
+#: IDT will not synthesise a 25 nmole oligo past this length; the next
+#: scale up takes it to 90. Beyond that it is a gBlock, not a primer.
+IDT_MAX_25NM = 60
+IDT_MAX_100NM = 90
+
+
+def idt_scale(length: int) -> str:
+    """The smallest IDT scale that will make an oligo this long."""
+    if length <= IDT_MAX_25NM:
+        return "25nm"
+    if length <= IDT_MAX_100NM:
+        return "100nm"
+    return "250nm"
+
+
+def idt_purification(length: int) -> str:
+    """Standard desalting, until the length makes it a bad idea.
+
+    Every synthesis cycle leaves some chains unextended, so the longer
+    the oligo the larger the share of the tube that is truncated
+    product. Past about sixty bases that fraction stops being
+    negligible for an assembly primer, where a short chain still
+    anneals and then seeds a deletion.
+    """
+    return "STD" if length <= IDT_MAX_25NM else "PAGE"
+
+
+def primer_order_csv(plan: dict, route_id: str | None = None) -> str:
+    """The primers in the four columns IDT's bulk order page expects.
+
+    Name, Sequence, Scale, Purification - nothing else, because
+    anything else makes the upload fail. The analysis columns live in
+    primer_table_csv; this one is for pasting into an order.
+    """
+    routes = plan.get("routes", [])
+    if not routes:
+        return ""
+    route = next((r for r in routes if r["id"] == route_id), routes[0])
+    lines = ["Name,Sequence,Scale,Purification"]
+    for p in route.get("primers") or []:
+        seq = (p.get("sequence") or "").upper()
+        if not seq:
+            continue
+        # A comma in a name would shift every column after it.
+        name = str(p.get("name") or "primer").replace(",", "-")
+        lines.append(f"{name},{seq},{idt_scale(len(seq))},"
+                     f"{idt_purification(len(seq))}")
+    return "\n".join(lines) + "\n"
+
+
 def to_genbank(plan: dict) -> str:
     """Write the designed construct as an annotated GenBank file."""
     c = plan["construct"]
