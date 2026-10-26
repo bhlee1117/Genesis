@@ -5066,6 +5066,9 @@ function renderExports() {
       exportButton('Protocol (.md)', 'protocol', base + '_protocol.md'),
       exportButton('PDF protocol (.pdf)', 'pdf', base + '_protocol.pdf'),
       exportButton('Primers (.csv)', 'primers', base + '_primers.csv'),
+      /* The same primers in the four columns IDT's bulk order page
+         takes, so ordering is a paste rather than a transcription. */
+      exportButton('IDT order (.csv)', 'order', base + '_IDT_order.csv'),
       exportButton('GenBank (.gb)', 'genbank', base + '.gb'),
       status));
 }

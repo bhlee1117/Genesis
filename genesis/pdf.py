@@ -379,7 +379,7 @@ class PDF:
             self._draw(line, self.ml + indent, self.y, "F3", size, gray)
 
     def step(self, number: str, title: str, body: str = "",
-             badge: str = ""):
+             badge: str = "", optional: bool = False):
         """A numbered protocol step with an optional operation-code badge."""
         size = 10
         lead = size * 1.3
@@ -402,13 +402,17 @@ class PDF:
         if badge:
             self.fill_rect(x - 2, self.y - 1, badge_w, lead, 0.90)
             self._draw(badge, x + 2, self.y + 2.5, "F4", 7.6, 0.15)
-        self._draw(lines[0], text_x, self.y + 2, "F2", size)
+        # An optional step is set lighter, so the eye can skip it on a
+        # second run-through without having to read it again.
+        self._draw(lines[0], text_x, self.y + 2, "F2", size,
+                   0.42 if optional else None)
 
         # Continuation lines align under the title, clear of the number.
         for line in lines[1:]:
             self._ensure(lead)
             self.y -= lead
-            self._draw(line, x, self.y + 2, "F2", size)
+            self._draw(line, x, self.y + 2, "F2", size,
+                       0.42 if optional else None)
 
         if body:
             self.y -= 3
@@ -568,15 +572,17 @@ class PDF:
 
 #: Muted fills per feature type, readable in both print and on screen.
 FEATURE_COLOURS = {
-    "promoter": (0.22, 0.55, 0.28), "enhancer": (0.35, 0.62, 0.40),
-    "CDS": (0.20, 0.40, 0.70), "trafficking_motif": (0.48, 0.35, 0.68),
-    "p2A": (0.85, 0.55, 0.15), "IRES": (0.80, 0.60, 0.25),
-    "linker": (0.55, 0.55, 0.58), "tag": (0.30, 0.60, 0.65),
-    "Kozak": (0.20, 0.62, 0.52),
-    "polyA": (0.40, 0.45, 0.70), "WPRE": (0.35, 0.50, 0.55),
-    "lox_site": (0.78, 0.22, 0.28), "DIO": (0.70, 0.30, 0.45),
-    "AAV_ITR": (0.45, 0.45, 0.45), "origin": (0.60, 0.60, 0.62),
-    "resistance": (0.50, 0.52, 0.55),
+    # The things the construct is for, in strong colour.
+    "promoter": (0.11, 0.62, 0.29), "enhancer": (0.42, 0.74, 0.35),
+    "CDS": (0.13, 0.44, 0.84), "trafficking_motif": (0.53, 0.30, 0.80),
+    "p2A": (0.95, 0.60, 0.07), "IRES": (0.88, 0.70, 0.12),
+    "tag": (0.10, 0.66, 0.70), "Kozak": (0.08, 0.68, 0.56),
+    "lox_site": (0.86, 0.16, 0.22), "DIO": (0.80, 0.22, 0.48),
+    # The things that carry it, in grey, so they recede.
+    "linker": (0.62, 0.64, 0.68),
+    "polyA": (0.47, 0.52, 0.80), "WPRE": (0.36, 0.60, 0.66),
+    "AAV_ITR": (0.38, 0.40, 0.44), "origin": (0.66, 0.68, 0.72),
+    "resistance": (0.58, 0.60, 0.64),
 }
 CUT_RED = (0.80, 0.14, 0.14)
 #: For the one or two lines in a protocol that cost a week when missed.
@@ -846,6 +852,13 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
     doc.text_at("1", cx, cy + radius + 10, "F1", 6.4, rgb=(0.5, 0.5, 0.5),
                 centre=True)
 
+    # The same rule the cloning figure uses: a feature inside another
+    # feature is a detail of that feature. It is what drops the junk
+    # "Voltron2" an auto-annotator left inside a CAG promoter, and the
+    # chicken beta-actin promoter nested in the same CAG - both of
+    # which were crowding the ring with leader lines.
+    from .figure import outermost
+    features = outermost(list(features))
     labelled = []
     for f in features:
         start_f = (f["start"] % length) / length
@@ -876,24 +889,32 @@ def circular_map(doc: "PDF", title: str, subtitle: str, length: int,
         labelled.append((mid % 1.0, f, r))
 
     # labels outside the circle, nudged apart so they stay readable
+    # Lay the labels out per side, top to bottom, each pushed just far
+    # enough below the one above it to clear. Rounding every label onto
+    # one 9 pt grid and then searching downwards piled them up at the
+    # bottom of the circle - which is how "AAV2 ITR" came to print over
+    # "ori".
     labelled.sort(key=lambda item: item[0])
-    last_y = {}
+    rows = {True: [], False: []}
     for mid, f, r in labelled:
         if f["end"] - f["start"] < length * 0.012:
             continue
         lx, ly = _polar(cx, cy, radius + 13, mid)
-        right = lx >= cx
-        name = (f["name"] or f["feature_type"])[:26]
-        w = text_width(name, "F1", 6.6)
-        side = round(ly / 9)
-        while side in last_y:
-            side -= 1
-        last_y[side] = True
-        ly = side * 9
-        doc.line(*_polar(cx, cy, r + 4, mid), lx, ly, rgb=(0.6, 0.6, 0.62),
-                 width=0.4)
-        doc.text_at(name, lx + (3 if right else -3 - w), ly - 2, "F1", 6.6,
-                    rgb=_feature_rgb(f["feature_type"]))
+        rows[lx >= cx].append((ly, mid, f, r, lx))
+    for right, items in rows.items():
+        items.sort(key=lambda t: -t[0])          # top of the page first
+        last = None
+        for ly, mid, f, r, lx in items:
+            if last is not None and last - ly < 9.5:
+                ly = last - 9.5
+            last = ly
+            name = (f["name"] or f["feature_type"])[:26]
+            w = text_width(name, "F1", 6.6)
+            anchor = _polar(cx, cy, r + 4, mid)
+            doc.line(anchor[0], anchor[1], lx, ly, rgb=(0.72, 0.73, 0.76),
+                     width=0.4)
+            doc.text_at(name, lx + (3 if right else -3 - w), ly - 2, "F1",
+                        6.6, rgb=_feature_rgb(f["feature_type"]))
 
     # The region being cut out of a recipient, or taken from a donor, drawn
     # as a ring outside the features with its own boundary markers.

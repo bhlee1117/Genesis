@@ -45,7 +45,8 @@ from .db import connect
 from .design import (delete_construct, delete_design, design, save_design,
                      scan_sources)
 from .enzymes import CATALOG
-from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
+from .export import (primer_order_csv, primer_table_csv,
+                     protocol_markdown, protocol_pdf,
                      to_genbank)
 from .importer import import_tree
 
@@ -585,6 +586,10 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "primers":
                 return self.text(primer_table_csv(plan, route),
                                  "text/csv; charset=utf-8", f"{name}_primers.csv")
+            if kind == "order":
+                return self.text(primer_order_csv(plan, route),
+                                 "text/csv; charset=utf-8",
+                                 f"{name}_IDT_order.csv")
             if kind == "pdf":
                 data = protocol_pdf(plan, self.cfg, route)
                 return self._send(200, data, "application/pdf",

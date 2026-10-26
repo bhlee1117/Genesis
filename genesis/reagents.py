@@ -200,6 +200,57 @@ CATALOGUE: tuple = (
                "than three days old, and keep an unstable construct as "
                "DNA rather than as a glycerol stock."),
     ),
+    Product(
+        vendor="Genesee", catalogue="20-102QD",
+        name="Apex Quick Dissolve LE Agarose, with NEB #N3232 1 kb ladder "
+             "and Biotium GelGreen",
+        url="https://www.neb.com/en-us/products/n3232-1-kb-dna-ladder",
+        title="Analytical gel",
+        operations=("QC_GEL",),
+        setup=(("2-3 uL", "of the reaction, in its own lane"),
+               ("5 uL", "NEB 1 kb DNA Ladder (#N3232)"),
+               ("per gel", "agarose, poured at the percentage in the step"),
+               ("per gel", "GelGreen or GelRed, in the gel")),
+        program=(("run", "100 V until the dye front is two thirds down"),
+                 ("read", "on a blue or long-wave transilluminator")),
+        notes=("This gel is analytical: load a few microlitres and keep "
+               "the rest of the reaction.",
+               "Use a blue or long-wave light, not shortwave UV, if the "
+               "band is going to be cut out and used."),
+    ),
+    Product(
+        vendor="Thermo", catalogue="K0691", name="GeneJET Gel Extraction Kit",
+        url="https://www.thermofisher.com/order/catalog/product/K0691",
+        title="Gel extraction",
+        operations=("GEL_EXTRACTION",),
+        setup=(("excised band", "in a weighed tube"),
+               ("1:1 by weight", "Binding Buffer (#R1331)"),
+               ("per kit", "Wash Buffer (#R1341), with ethanol added"),
+               ("20-30 uL", "Elution Buffer, warmed")),
+        program=(("dissolve", "50-60 C until no gel is left"),
+                 ("bind, wash, elute", "per kit"),
+                 ("then", "quantify before setting up the assembly")),
+        notes=("Cut the band with as little agarose around it as "
+               "possible; yield falls with the volume of gel.",
+               "Warm the elution buffer and leave it on the membrane a "
+               "minute - a cold 30 s elution is where most of the loss "
+               "happens."),
+    ),
+    Product(
+        vendor="Thermo", catalogue="K0502", name="GeneJET Plasmid Miniprep Kit",
+        url="https://www.thermofisher.com/order/catalog/product/K0502",
+        title="Miniprep",
+        operations=("SEQUENCE_VERIFY",),
+        setup=(("1-5 mL", "overnight culture"),
+               ("250 uL each", "Resuspension (#R1213), Lysis (#R1223), "
+                               "Neutralization (#R1233)"),
+               ("per kit", "Wash Solution (#R1243), with ethanol added")),
+        program=(("lyse", "no more than 5 min, inverting - not vortexing"),
+                 ("bind, wash, elute", "per kit"),
+                 ("sequence", "across every junction, then the insert")),
+        notes=("Grow the culture at 30 C if the construct carries "
+               "repeats or ITRs, the same reason the cells were chosen.",),
+    ),
 )
 
 #: Other things on the shelf for the same jobs, named so that a protocol
@@ -211,9 +262,11 @@ ALTERNATIVES = {
                        "Efficiency) - for a construct with no repeats, "
                        "recovered at 37 C in SOC",
                        "NEB #C2988J NEB 5-alpha Subcloning Efficiency"),
-    "GEL_EXTRACTION": ("Thermo #K0691 GeneJET Gel Extraction Kit",),
-    "DNA_CLEANUP": ("Thermo #K0691 GeneJET Gel Extraction Kit (column "
-                    "clean-up without a gel)",),
+    "DNA_CLEANUP": ("Thermo #K0691 GeneJET Gel Extraction Kit, used as a "
+                    "column clean-up without a gel",),
+    "QC_GEL": ("Promega #G5711 or Thomas #C755D52 1 kb ladder",
+               "Thermo #FERR0801 low-melting-point agarose, when the band "
+               "is going to be cut out"),
 }
 
 _BY_OPERATION = {}

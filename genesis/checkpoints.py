@@ -6,8 +6,12 @@ the assembly goes into cells anyway, and the first hard evidence
 arrives two days later as a plate of colonies that are all parental
 vector. The information needed to catch it existed at minute ninety.
 
-So each step that makes a molecule gets a checkpoint after it, and the
-checkpoint is written against *this* plan rather than in general. It
+So each step that makes a molecule gets a checkpoint after it. None of
+them is required - skipping one does not stop the cloning, it only
+moves the moment you find out - so they are marked optional and their
+bench time is reported apart from the hours the protocol demands. What
+makes them worth running is that each is written against *this* plan
+rather than in general. It
 knows the band to expect because the planner computed it, the template
 band that would mean the digest did not go, the annealing temperature
 to drop if nothing comes up, and the no-insert control to compare the
@@ -80,9 +84,10 @@ def after_pcrs(steps: list, route: dict, templates: dict) -> Checkpoint:
     base = after_pcr(steps[0], route, templates)
     return Checkpoint(
         operation="PCR",
-        title=("Check both PCRs on one gel before going on"
+        title=("Optional: check both PCRs on one gel before going on"
                if len(steps) == 2 else
-               f"Check all {len(steps)} PCRs on one gel before going on"),
+               f"Optional: check all {len(steps)} PCRs on one gel before "
+               f"going on"),
         how=(f"Run 3 uL of each reaction in its own lane on a "
              f"{_gel_percent(longest)} agarose gel, against a ladder that "
              f"spans {longest:,} bp.",
@@ -146,7 +151,7 @@ def after_pcr(step: dict, route: dict, templates: dict) -> Checkpoint:
 
     return Checkpoint(
         operation="PCR",
-        title=f"Check the {name} PCR on a gel before going on",
+        title=f"Optional: check the {name} PCR on a gel before going on",
         how=(f"Run 3 uL of the reaction on a {_gel_percent(length)} agarose "
              f"gel against a ladder that spans {length:,} bp."
              if length else
@@ -169,7 +174,7 @@ def after_digest(step: dict, route: dict, bands: list) -> Checkpoint:
                   "smear: either means the digest is partial")
     return Checkpoint(
         operation="RE_DIGEST",
-        title="Check the digest went to completion",
+        title="Optional: check the digest went to completion",
         how=("Run 2 uL on a 1 % agarose gel beside 100 ng of the uncut "
              "plasmid, so partial digestion is obvious by comparison.",),
         expect=tuple(expect),
@@ -197,7 +202,7 @@ def after_assembly(step: dict, route: dict) -> Checkpoint:
     """The assembly cannot be seen, so the control is the measurement."""
     return Checkpoint(
         operation=step.get("operation", "HI_FI_ASSEMBLY"),
-        title="Plate a no-insert control alongside the assembly",
+        title="Optional: plate a no-insert control alongside the assembly",
         how=("Set up a second reaction with the vector and water in place "
              "of the insert, and transform and plate it beside the real "
              "one.",

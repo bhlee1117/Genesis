@@ -5519,6 +5519,167 @@ class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
         conn.close()
 
 
+class TestTheChecksAreOfferedNotDemanded(unittest.TestCase):
+    """A checkpoint gel is worth running and is not required.
+
+    Skipping one does not stop the cloning; it only moves the moment
+    you find out. So the step says optional, and its bench time is
+    reported apart from the hours the protocol actually demands.
+    """
+
+    def test_the_operation_is_marked_optional(self):
+        from genesis.operations import OPERATIONS
+        self.assertTrue(OPERATIONS["QC_GEL"].optional)
+        for code in ("PCR", "HI_FI_ASSEMBLY", "TRANSFORMATION"):
+            self.assertFalse(OPERATIONS[code].optional, code)
+
+    def test_every_checkpoint_says_so_in_its_title(self):
+        from genesis.checkpoints import for_route
+        marks = for_route({"steps": [
+            {"operation": "PCR", "output": "a amplicon",
+             "details": {"length": 900, "template": "pA"}},
+            {"operation": "RE_DIGEST", "inputs": ["pA", "EcoRI, BamHI"]},
+            {"operation": "LIGATION", "inputs": []}]}, {"pA": 4000})
+        self.assertTrue(marks)
+        for _i, check in marks:
+            self.assertTrue(check.title.lower().startswith("optional"),
+                            check.title)
+
+    def test_optional_time_is_not_in_the_headline(self):
+        from genesis.operations import Step
+        from genesis.planner import Route
+        from genesis.config import Config
+        route = Route(id="r", strategy="hifi", title="t", steps=[
+            Step(1, "PCR", "amplify"),
+            Step(2, "QC_GEL", "Optional: check it"),
+        ])
+        d = route.to_dict(Config())
+        pcr = 20            # PCR hands-on, from the operation library
+        self.assertEqual(d["hands_on_minutes"], pcr)
+        self.assertEqual(d["optional_minutes"], 20)
+        self.assertEqual(d["n_optional"], 1)
+        self.assertEqual(d["n_steps"], 2)
+
+    def test_the_tallies_are_recounted_after_the_checks_go_in(self):
+        """They were computed when the route was serialised, which was
+        before these steps existed - so the protocol printed a list of
+        ten under a heading that said eight."""
+        from genesis.design import _recount
+        route = {"steps": [
+            {"operation": "PCR", "hands_on": 20, "minutes": 90},
+            {"operation": "QC_GEL", "hands_on": 20, "minutes": 45,
+             "optional": True},
+            {"operation": "HI_FI_ASSEMBLY", "hands_on": 15, "minutes": 60},
+        ]}
+        _recount(route)
+        self.assertEqual(route["n_steps"], 3)
+        self.assertEqual(route["n_optional"], 1)
+        self.assertEqual(route["hands_on_minutes"], 35)
+        self.assertEqual(route["optional_minutes"], 20)
+
+
+class TestThePrimerOrderGoesStraightToIDT(unittest.TestCase):
+    """Four columns, and nothing else, or the upload fails."""
+
+    PLAN = {"routes": [{"id": "r", "primers": [
+        {"name": "backbone2-F", "sequence": "ACGT" * 11},     # 44 nt
+        {"name": "long-R", "sequence": "ACGT" * 18},          # 72 nt
+        {"name": "very,long-F", "sequence": "ACGT" * 25},     # 100 nt
+    ]}]}
+
+    def test_the_header_is_the_one_idt_expects(self):
+        from genesis.export import primer_order_csv
+        first = primer_order_csv(self.PLAN).splitlines()[0]
+        self.assertEqual(first, "Name,Sequence,Scale,Purification")
+
+    def test_every_row_has_exactly_four_fields(self):
+        from genesis.export import primer_order_csv
+        for line in primer_order_csv(self.PLAN).strip().splitlines()[1:]:
+            self.assertEqual(len(line.split(",")), 4, line)
+
+    def test_a_comma_in_a_name_does_not_shift_the_columns(self):
+        from genesis.export import primer_order_csv
+        rows = primer_order_csv(self.PLAN).strip().splitlines()[1:]
+        self.assertTrue(any(r.startswith("very-long-F") for r in rows), rows)
+
+    def test_the_scale_follows_the_length(self):
+        """IDT will not make a 25 nmole oligo past 60 bases."""
+        from genesis.export import idt_scale, idt_purification
+        self.assertEqual(idt_scale(44), "25nm")
+        self.assertEqual(idt_scale(60), "25nm")
+        self.assertEqual(idt_scale(61), "100nm")
+        self.assertEqual(idt_scale(95), "250nm")
+        # and a long assembly primer is worth purifying: a truncated
+        # chain still anneals, and then seeds a deletion
+        self.assertEqual(idt_purification(44), "STD")
+        self.assertEqual(idt_purification(72), "PAGE")
+
+    def test_the_sequence_is_the_whole_primer_in_upper_case(self):
+        """The tail is lower case in the analysis table because it does
+        not anneal; an order is just bases."""
+        from genesis.export import primer_order_csv
+        plan = {"routes": [{"id": "r", "primers": [
+            {"name": "p", "sequence": "acgtACGT", "tail": "acgt",
+             "anneal": "ACGT"}]}]}
+        row = primer_order_csv(plan).strip().splitlines()[1]
+        self.assertEqual(row.split(",")[1], "ACGTACGT")
+
+
+class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
+    """The protocol runs on master mixes.
+
+    Listing "5x reaction buffer, 10 mM dNTPs, high-fidelity DNA
+    polymerase" as three line items is a shopping list for a reaction
+    nobody is setting up: those are inside the Q5 tube.
+    """
+
+    def _reagents(self):
+        import hashlib
+        from genesis.protocol import build_protocol
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'rgbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 350), 2506)).lastrowid
+        seq = orf(150, 351)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'rgd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 352), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("rg", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        out = build_protocol(plan, cfg)["reagents"]
+        conn.close()
+        return [i.lower() for i, _a in out]
+
+    def test_the_master_mix_replaces_its_own_components(self):
+        items = self._reagents()
+        self.assertTrue(any("q5" in i and "master mix" in i for i in items))
+        for gone in ("5x high-fidelity reaction buffer", "10 mm dntps",
+                     "high-fidelity dna polymerase"):
+            self.assertNotIn(gone, items,
+                             f"{gone} is inside the master mix")
+
+    def test_what_is_left_is_what_you_add_to_it(self):
+        items = self._reagents()
+        for wanted in ("forward primer", "plasmid template",
+                       "nuclease-free water"):
+            self.assertTrue(any(wanted in i for i in items), wanted)
+
+
 class TestEachReactionIsCheckedBeforeTheNextOne(unittest.TestCase):
     """PCR is where a cloning fails, and it fails silently.
 

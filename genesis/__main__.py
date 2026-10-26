@@ -25,7 +25,8 @@ from .config import Config
 from .construct import ConstructSpec
 from .db import connect
 from .design import design as run_design, save_design
-from .export import (primer_table_csv, protocol_markdown, protocol_pdf,
+from .export import (primer_order_csv, primer_table_csv,
+                     protocol_markdown, protocol_pdf,
                      to_genbank)
 from .importer import import_tree, reclassify
 from .orfs import infer_all
@@ -372,6 +373,8 @@ def cmd_design(args, cfg: Config):
 
     if args.primers:
         Path(args.primers).write_text(primer_table_csv(plan, args.route))
+    if getattr(args, "order", None):
+        Path(args.order).write_text(primer_order_csv(plan, args.route))
         print(f"\n<!-- primer table written to {args.primers} -->")
     if args.genbank:
         Path(args.genbank).write_text(to_genbank(plan))
@@ -570,6 +573,9 @@ def main(argv=None):
     s.add_argument("--route", help="route id to detail (default: best ranked)")
     s.add_argument("--json", action="store_true", help="emit the raw plan")
     s.add_argument("--primers", help="also write a primer CSV here")
+    s.add_argument("--order", metavar="FILE",
+                   help="also write an IDT bulk-order CSV here "
+                        "(Name, Sequence, Scale, Purification)")
     s.add_argument("--genbank", help="also write the construct GenBank here")
     s.add_argument("--pdf", help="also write a printable PDF protocol here")
     s.add_argument("--save", action="store_true", help="store this design")

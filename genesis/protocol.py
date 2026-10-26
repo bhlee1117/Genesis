@@ -329,10 +329,23 @@ def build_protocol(plan: dict, cfg: Config | None = None,
             seen.add(item.lower())
             reagents.append((item, amount))
 
-    if "PCR" in used_ops:
-        for item, amount in _pcr_recipe(cfg)["items"]:
-            add_reagent(item, amount)
+    # What to order is what the steps actually call for. The protocol
+    # runs on master mixes, so listing "5x reaction buffer, 10 mM dNTPs,
+    # high-fidelity DNA polymerase" as three line items is a shopping
+    # list for a reaction nobody is setting up - those are inside the
+    # Q5 tube. Where a product is named, its own components are the
+    # reagents; the generic recipe is the fallback for the rest.
+    from .reagents import for_operation as _product_for
     for op in used_ops:
+        product = _product_for(op)
+        if product is not None and product.setup:
+            for amount, item in product.setup:
+                add_reagent(item, amount)
+            continue
+        if op == "PCR":
+            for item, amount in _pcr_recipe(cfg)["items"]:
+                add_reagent(item, amount)
+            continue
         for item, amount in RECIPES.get(op, {}).get("items", []):
             add_reagent(item, amount)
 
@@ -394,6 +407,7 @@ def build_protocol(plan: dict, cfg: Config | None = None,
             # The step's own findings - the checkpoint, the DpnI site
             # count - travel with it; the renderers read them from here.
             "details": step.get("details") or {},
+            "optional": bool(step.get("optional")),
         })
 
     return {
@@ -529,6 +543,12 @@ def _vendor_box(doc, recipe: dict, product, step: dict) -> None:
             doc.link(product.url, product.url, 7.6, indent=4, font="F7")
 
     doc.boxed(body, pad=7, fill=(0.985, 0.985, 0.99))
+
+
+def _top_level_layout(construct: dict) -> list:
+    """The construct's parts, without the ones nested inside others."""
+    from .figure import outermost
+    return outermost(list(construct.get("layout") or []))
 
 
 def _checkpoint_box(doc, step: dict) -> None:
@@ -687,11 +707,21 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                                       f"({p['backbone']['length']:,} bp, "
                                       f"{p['backbone']['owner']})"))
     facts += [
-        ("Architecture", " - ".join(i["name"] for i in construct["layout"])),
-        ("Workload", f"{route['n_steps']} steps, {route['n_pcr']} PCR(s), "
-                     f"{route['n_assembly']} assembly reaction(s)"),
+        # The same nesting rule the map uses, so the one-line
+        # architecture and the drawing of it agree: a feature inside
+        # another feature is a detail of it, junk annotation included.
+        ("Architecture", " - ".join(
+            i["name"] for i in _top_level_layout(construct))),
+        ("Workload", f"{route['n_steps'] - route.get('n_optional', 0)} "
+                      f"steps, {route['n_pcr']} PCR(s), "
+                     f"{route['n_assembly']} assembly reaction(s)"
+                     + (f", plus {route['n_optional']} optional check(s)"
+                        if route.get("n_optional") else "")),
         ("Time", f"{route['hands_on_minutes'] / 60:.1f} h hands-on, "
-                 f"{route.get('turnaround_minutes', 0) / 1440:.1f} days elapsed"),
+                 f"{route.get('turnaround_minutes', 0) / 1440:.1f} days elapsed"
+                 + (f" (+{route['optional_minutes'] / 60:.1f} h if you run "
+                    f"the optional checks)"
+                    if route.get("optional_minutes") else "")),
     ]
     if p["suggested_name"] and p["suggested_name"] != name:
         facts.append(("Suggested name", p["suggested_name"]))
@@ -833,7 +863,8 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
     for step in p["steps"]:
         top = doc.y
         doc.step(f"{step['index']}.", step["description"],
-                 badge=step["operation"])
+                 badge=step["operation"],
+                 optional=bool(step.get("optional")))
         if lanes_for_steps:
             # Which lane this step belongs to, not merely which kind of
             # step it is: two PCRs in a row are two different pieces.
@@ -1192,8 +1223,9 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
 
     out += ["## Protocol", ""]
     for step in p["steps"]:
-        out.append(f"{step['index']}. **`{step['operation']}`** "
-                   f"{step['description']}")
+        out.append(f"{step['index']}. **`{step['operation']}`**"
+                   + (" *(optional)*" if step.get("optional") else "")
+                   + f" {step['description']}")
         if step["detail"]:
             out.append(f"   - {step['detail']}")
         recipe = step["recipe"]

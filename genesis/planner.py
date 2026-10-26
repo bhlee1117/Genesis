@@ -73,8 +73,20 @@ class Route:
             "n_steps": len(self.steps),
             # Active bench time, and total elapsed turnaround including
             # overnight growth, sequencing and any synthesis order.
-            "hands_on_minutes": sum(s.to_dict()["hands_on"] for s in self.steps),
-            "turnaround_minutes": sum(s.to_dict()["minutes"] for s in self.steps),
+            # Optional steps are counted separately: a checkpoint gel is
+            # worth running and is not work the protocol demands, so
+            # folding its time into the headline overstates the job.
+            "hands_on_minutes": sum(d["hands_on"] for d in
+                                    (s.to_dict() for s in self.steps)
+                                    if not d.get("optional")),
+            "turnaround_minutes": sum(d["minutes"] for d in
+                                      (s.to_dict() for s in self.steps)
+                                      if not d.get("optional")),
+            "optional_minutes": sum(d["hands_on"] for d in
+                                    (s.to_dict() for s in self.steps)
+                                    if d.get("optional")),
+            "n_optional": sum(1 for d in (s.to_dict() for s in self.steps)
+                              if d.get("optional")),
         }
 
 

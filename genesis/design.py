@@ -175,6 +175,26 @@ def _add_checkpoints(conn: sqlite3.Connection, plan: dict) -> None:
                             details={"checkpoint": check.to_dict()}))
         route["steps"] = [s if isinstance(s, dict) else s.to_dict()
                           for s in _renumber_mixed(out)]
+        # The route's counters were computed when it was serialised,
+        # which was before these steps existed; recount rather than
+        # print a step list of ten under a heading that says eight.
+        _recount(route)
+
+
+def _recount(route: dict) -> None:
+    """Re-derive a route's tallies after its steps have changed."""
+    steps = route.get("steps") or []
+    required = [s for s in steps if not s.get("optional")]
+    optional = [s for s in steps if s.get("optional")]
+    route["n_steps"] = len(steps)
+    route["n_optional"] = len(optional)
+    route["n_pcr"] = sum(1 for s in steps if s.get("operation") == "PCR")
+    route["n_assembly"] = sum(
+        1 for s in steps if s.get("operation") in
+        ("GIBSON_ASSEMBLY", "HI_FI_ASSEMBLY", "LIGATION"))
+    route["hands_on_minutes"] = sum(s.get("hands_on", 0) for s in required)
+    route["turnaround_minutes"] = sum(s.get("minutes", 0) for s in required)
+    route["optional_minutes"] = sum(s.get("hands_on", 0) for s in optional)
 
 
 def _renumber_mixed(steps: list) -> list:
