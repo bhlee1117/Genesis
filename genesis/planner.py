@@ -325,7 +325,19 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     # PCR.  Anything too short to amplify is carried on the next piece's
     # forward primer instead, which puts the same bases in the same place
     # for the cost of a longer oligo.
+    # Which short fragments have a long piece on both sides, and so can
+    # be written into two tails that will actually exist.
+    def _long(o):
+        return len(o["seq"]) >= cfg.min_pcr_length
+    foldable = {}
+    for pos, o in enumerate(ordered):
+        foldable[id(o)] = (any(_long(x) for x in ordered[:pos])
+                           and any(_long(x) for x in ordered[pos + 1:]))
+
     carried: dict[int, str] = {}
+    #: piece index -> bases that belong between it and the next piece,
+    #: to be written into the two primer tails that meet there.
+    split_after: dict[int, str] = {}
     keep: list[dict] = []
     pending = ""
     for o in ordered:
@@ -340,6 +352,19 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             if o["kind"] == "fragment":
                 absorbed.add(o["index"])
             continue
+        # A short element out of a real plasmid was still getting its own
+        # reaction: P2A is 66 bp, and a PCR whose primers are longer than
+        # its product is not a PCR anybody sets up. It goes into the two
+        # primer tails that flank it instead - but only where there is a
+        # tail on each side to take it. An element with no amplified
+        # neighbour before and after it is a different operation (an
+        # inverse PCR with the insert on the tails), so it keeps the
+        # advice it had rather than getting a fold that does not apply.
+        if short and o["kind"] == "fragment" and keep and foldable[id(o)]:
+            split_after[len(keep) - 1] = (
+                split_after.get(len(keep) - 1, "") + o["seq"])
+            absorbed.add(o["index"])
+            continue
         if pending:
             carried[len(keep)] = pending
             pending = ""
@@ -352,6 +377,14 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     else:
         carried = {}
 
+    # `split_after` is deliberately NOT folded in here. These sequences
+    # are what the overlaps get computed from, and a folded element is
+    # written into the tails afterwards: for a split the computed tail
+    # is overwritten anyway, and for one too short to split the tail
+    # has to stay the real homology with the neighbour's real end.
+    # Appending it made the overlap describe bases that end up
+    # somewhere else, and a single-piece circularisation then had two
+    # ends that shared nothing.
     pieces: list[tuple[str, str]] = [
         (o["name"], carried.get(i, "") + o["seq"])
         for i, o in enumerate(ordered)]
@@ -361,6 +394,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         return route
 
     n = len(pieces)
+    pair_by_piece: dict[int, tuple] = {}
     templates_needing_dpni: list[str] = []
     dpni_template_ids: list = []
 
@@ -378,6 +412,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             carry_downstream=False, unique_in=construct.seq)
         _carry(fwd, carried.get(k, ""), route, cfg)
         _check_unique(fwd, construct.seq, route)
+        pair_by_piece[k] = (fwd, rev)
         primers += [fwd, rev]
         if len(bb_seq) > cfg.max_pcr_length:
             route.warnings.append(
@@ -447,6 +482,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             circular_template=circ, carry_downstream=False,
             unique_in=construct.seq)
         _carry(fwd, carried.get(piece_index, ""), route, cfg)
+        pair_by_piece[piece_index] = (fwd, rev)
         # Report where the part is in the donor, not where it is in the
         # strand the primers were written against.
         for pr in (fwd, rev):
@@ -480,6 +516,19 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         templates_needing_dpni.append(frag.source_name)
         if frag.source_plasmid_id:
             dpni_template_ids.append(frag.source_plasmid_id)
+
+    # Every pair exists now, so the folded elements can be written into
+    # the two tails that meet where each one belongs.
+    for k, element in split_after.items():
+        here = pair_by_piece.get(k)
+        nxt = pair_by_piece.get((k + 1) % n)
+        if not here or not nxt:
+            route.warnings.append(
+                f"a {len(element)} bp element has no amplified neighbour to "
+                f"carry it; order it as annealed oligos")
+            continue
+        _split_into_tails(here[1], nxt[0], element,
+                          _fold_overlap(element, cfg), route, cfg)
 
     # --- template removal and cleanup -------------------------------------
     # Gel extraction is decided first: an amplicon cut out of a gel is
@@ -1201,7 +1250,96 @@ def _merge_contiguous(ordered: list[dict], template_length: int
 GIBSON_EXONUCLEASE_FLOOR = 200
 
 
-def _carry(fwd: Primer, extra: str, route: "Route", cfg: Config) -> None:
+#: Keep a folded element's tails in the band people actually order.
+#: A 40-50 nt tail on a 20 nt annealing site is a 60-70mer, which is
+#: one oligo at the 100 nmole scale; past that it becomes an ultramer
+#: and the truncation fraction starts to matter.
+FOLD_TARGET_TAIL = 45
+
+
+def _fold_overlap(element: str, cfg: Config) -> int:
+    """The longest overlap that still keeps both tails orderable.
+
+    Splitting a 66 bp element down the middle with the assembly's
+    standard 25 bp overlap gives 46 nt tails; dropping to 20 gives 43.
+    Both work, so take the longest overlap the tail budget allows -
+    a longer overlap is the more robust assembly - and never go under
+    what the kit needs to anneal at all.
+    """
+    from .primers import ASSEMBLY_HOMOLOGY
+    kit = "gibson" if "gibson" in (cfg.preferred_assembly_kit or "").lower() \
+        else "hifi"
+    low, high = ASSEMBLY_HOMOLOGY.get(kit, (15, 25))
+    high = min(high, getattr(cfg, "overlap_length", high) or high)
+    budget = 2 * FOLD_TARGET_TAIL - len(element)
+    return max(low, min(high, budget))
+
+
+def _split_into_tails(up_rev: Primer, down_fwd: Primer, element: str,
+                      overlap: int, route: "Route",
+                      cfg: Config | None = None) -> None:
+    """Write a short element into the two primer tails that flank it.
+
+    P2A is 66 bp. Amplifying it means a PCR whose primers are longer
+    than its product, and piling all 66 onto one neighbour's tail makes
+    a 110-mer. The way it is actually done is to split it: the upstream
+    fragment's reverse primer carries the front of the element, the
+    downstream fragment's forward primer carries the back, and the two
+    share enough of the middle to anneal. The assembly then rebuilds one
+    complete element out of two oligos nobody had to order separately.
+
+        amplicon A   ... CDS1 [element front        ]
+        amplicon B            [   element back ] CDS2 ...
+                              |<-- overlap -->|
+
+    A reverse primer is written against the bottom strand, so its tail
+    is the reverse complement of the top-strand bases that follow the
+    fragment.
+    """
+    total = len(element)
+    if total <= overlap:
+        # Too short to split and still leave an overlap on each side, so
+        # it goes whole onto the one tail. Returning instead silently
+        # dropped the bases: a 15 bp linker vanished out of the design
+        # and the assembly was then a single fragment with nothing to
+        # close on.
+        _carry(down_fwd, element, route, cfg)
+        return
+    # Balanced halves that still share `overlap` bases in the middle.
+    front = (total + overlap + 1) // 2
+    back = total + overlap - front
+
+    # Whatever the annealing site stepped over sits at the end of the
+    # tail, immediately before the binding region, and has to stay
+    # there: it is the part of the fragment the primer skipped, and
+    # dropping it leaves the amplicon short by exactly that much.
+    # Overwriting the whole tail is what lost it the first time, and
+    # the product then had no mCherry in it at all.
+    up_rev.tail = revcomp(element[:front]) + (up_rev.shift_tail or "")
+    up_rev.sequence = up_rev.tail + up_rev.anneal
+    # The downstream primer's old tail was homology with the upstream
+    # fragment's end. That end has moved - it is now inside the element
+    # - so the old homology would anneal to bases that are no longer
+    # at that junction.
+    down_fwd.tail = element[total - back:] + (down_fwd.shift_tail or "")
+    down_fwd.sequence = down_fwd.tail + down_fwd.anneal
+
+    for pr in (up_rev, down_fwd):
+        if len(pr.sequence) > 100:
+            route.warnings.append(
+                f"primer {pr.name} is {len(pr.sequence)} nt because it "
+                f"carries part of a {total} bp element that is too short "
+                f"to amplify; order it as an ultramer")
+        elif len(pr.sequence) > 70:
+            route.warnings.append(
+                f"primer {pr.name} is {len(pr.sequence)} nt - order it at "
+                f"the 100 nmole scale with PAGE purification, since a "
+                f"truncated chain from a long synthesis still anneals and "
+                f"then seeds a deletion")
+
+
+def _carry(fwd: Primer, extra: str, route: "Route",
+           cfg: Config | None = None) -> None:
     """Put an un-amplifiable arc onto the primer that makes the next piece.
 
     The bases still have to exist in some tube.  Adding them after the

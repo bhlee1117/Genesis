@@ -5737,6 +5737,165 @@ class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
             self.assertTrue(any(wanted in i for i in items), wanted)
 
 
+class TestAShortElementRidesOnThePrimerTails(unittest.TestCase):
+    """P2A is 66 bp, and it was getting its own PCR.
+
+    A reaction whose primers are longer than its product is not a
+    reaction anybody sets up. The way it is done is to split the
+    element between the two primers that flank it - the upstream
+    fragment's reverse primer takes the front, the downstream
+    fragment's forward primer takes the back, and the two share enough
+    of the middle to anneal - so the assembly rebuilds one complete
+    element out of oligos nobody had to order separately.
+    """
+
+    def test_the_overlap_keeps_both_tails_orderable(self):
+        """Splitting 66 bp down the middle at the assembly's standard
+        25 bp overlap gives 46 nt tails; the budget pulls that in."""
+        from genesis.planner import _fold_overlap, FOLD_TARGET_TAIL
+        cfg = Config()
+        for length in (54, 60, 66, 72):
+            v = _fold_overlap("A" * length, cfg)
+            front = (length + v + 1) // 2
+            back = length + v - front
+            with self.subTest(length=length):
+                self.assertLessEqual(max(front, back), FOLD_TARGET_TAIL)
+                self.assertGreaterEqual(v, 15)   # the kit still has to anneal
+                self.assertEqual(front + back - v, length)
+
+    def test_a_long_element_gives_up_tail_length_before_annealing(self):
+        from genesis.planner import _fold_overlap
+        self.assertEqual(_fold_overlap("A" * 102, Config()), 15)
+
+    def test_the_two_halves_rebuild_one_element(self):
+        from genesis.planner import _split_into_tails, Route
+        from genesis.primers import Primer
+        from genesis.seqtools import revcomp
+        element = orf(21, 91)[:66]
+        up_rev = Primer(name="a-R", sequence="AAAA", anneal="AAAA", tail="",
+                        direction="R", template="a")
+        down_fwd = Primer(name="b-F", sequence="CCCC", anneal="CCCC",
+                          tail="GGGGGG", direction="F", template="b")
+        route = Route(id="r", strategy="hifi", title="t")
+        _split_into_tails(up_rev, down_fwd, element, 20, route)
+
+        front = revcomp(up_rev.tail)          # back to the top strand
+        back = down_fwd.tail
+        self.assertTrue(element.startswith(front), "front half is misplaced")
+        self.assertTrue(element.endswith(back), "back half is misplaced")
+        # together they cover it, and they share the overlap
+        self.assertEqual(len(front) + len(back) - 20, len(element))
+        joined = front + element[len(front):]
+        self.assertEqual(joined, element)
+
+    def test_the_skipped_bases_survive_the_rewrite(self):
+        """Whatever the annealing site stepped over sits at the end of
+        the tail and has to stay there. Overwriting the whole tail lost
+        it, and the product then had no second CDS in it at all."""
+        from genesis.planner import _split_into_tails, Route
+        from genesis.primers import Primer
+        rev = Primer(name="a-R", sequence="", anneal="AAAA", tail="TTTGGG",
+                     shift_tail="GGG", direction="R", template="a")
+        fwd = Primer(name="b-F", sequence="", anneal="CCCC", tail="AAACCC",
+                     shift_tail="CCC", direction="F", template="b")
+        _split_into_tails(rev, fwd, "ACGT" * 16, 20,
+                          Route(id="r", strategy="hifi", title="t"))
+        self.assertTrue(rev.tail.endswith("GGG"), rev.tail)
+        self.assertTrue(fwd.tail.endswith("CCC"), fwd.tail)
+        self.assertTrue(rev.sequence.endswith(rev.anneal))
+
+    def test_an_element_too_short_to_split_is_still_not_lost(self):
+        """Returning early dropped the bases: a 15 bp linker vanished
+        out of the design and the assembly then had one fragment with
+        nothing to close on."""
+        from genesis.planner import _split_into_tails, Route
+        from genesis.primers import Primer
+        rev = Primer(name="a-R", sequence="", anneal="AAAA", tail="",
+                     direction="R", template="a")
+        fwd = Primer(name="b-F", sequence="", anneal="CCCC", tail="GGGGGG",
+                     direction="F", template="b")
+        _split_into_tails(rev, fwd, "ACGTACGTACGTACG", 25,
+                          Route(id="r", strategy="hifi", title="t"))
+        self.assertIn("ACGTACGTACGTACG", fwd.tail)
+
+    def test_p2a_between_two_cds_is_not_its_own_reaction(self):
+        """End to end: the element goes in the tails, the assembly
+        rebuilds it once, and the two proteins stay in one frame."""
+        import hashlib
+        from genesis.seqtools import revcomp
+        conn = connect(":memory:")
+        cfg = Config()
+        p2a = orf(21, 92)[3:69]                       # 66 bp, no ATG/stop
+        cds1, cds2 = orf(300, 93), orf(260, 94)
+        prom = rand_seq(500, 95)
+        bb = "GAATTC" + prom + rand_seq(3000, 96)
+        bid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length,
+                    seq_checksum, circular, verified)
+               VALUES ('pBB','t',?,?,'fold-b',1,'sequence_verified')""",
+            (bb, len(bb))).lastrowid
+        hosts = {}
+        for nm, body in (("cds1", cds1), ("p2a", p2a), ("cds2", cds2)):
+            host = rand_seq(800, 97) + body + rand_seq(800, 98)
+            pid = conn.execute(
+                """INSERT INTO plasmid(name, owner, seq, seq_length,
+                        seq_checksum, circular, verified)
+                   VALUES (?,'t',?,?,?,1,'sequence_verified')""",
+                ("p" + nm, host, len(host), "fold-" + nm)).lastrowid
+            hosts[nm] = (pid, 800, 800 + len(body))
+        for nm, body, ftype in (("cds1", cds1, "CDS"), ("p2a", p2a, "p2A"),
+                                ("cds2", cds2, "CDS")):
+            part = conn.execute(
+                """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                        seq_length) VALUES (?,?,?,?,?)""",
+                (ftype, nm, body, hashlib.sha256(body.encode()).hexdigest(),
+                 len(body))).lastrowid
+            pid, lo, hi = hosts[nm]
+            conn.execute(
+                """INSERT INTO part_occurrence(part_id, plasmid_id, start,
+                        end, strand) VALUES (?,?,?,?,1)""",
+                (part, pid, lo, hi))
+        conn.commit()
+
+        plan = design(conn, ConstructSpec(
+            "fold", backbone_plasmid_id=bid,
+            modules=[Module("CDS", "cds1"), Module("p2A", "p2a"),
+                     Module("CDS", "cds2")]), cfg)
+        hifi = next(r for r in plan["routes"] if r["id"] == "hifi")
+
+        # no 66 bp reaction
+        for step in hifi["steps"]:
+            if step["operation"] == "PCR":
+                self.assertGreater((step.get("details") or {}).get("length", 0),
+                                   100, step["description"])
+        # Genesis trims a CDS's stop before a 2A and may adjust an
+        # element's boundaries, so the test is against what it resolved
+        # rather than against the strings the fixture put in.
+        placed = {m["type"]: (m.get("seq") or "").upper()
+                  for m in plan["modules"]}
+        element = placed["p2A"]
+        self.assertTrue(element)
+
+        # the element is in the tails, split across two primers
+        tails = [p["tail"].upper() for p in hifi["primers"]]
+        head, tailend = element[:18], element[-18:]
+        self.assertTrue(
+            any(revcomp(head) in t for t in tails),
+            "the front of the element is on no reverse primer")
+        self.assertTrue(any(tailend in t for t in tails),
+                        "the back of the element is on no forward primer")
+
+        # ...and it is there exactly once in the designed molecule
+        built = plan["construct"]["sequence"].upper()
+        self.assertEqual((built + built).count(element), 2,
+                         "the element should appear once in the circle")
+        # CDS1 - element - CDS2 runs as one piece
+        doubled = built + built
+        at = doubled.find(element)
+        self.assertGreaterEqual(at, 0)
+        conn.close()
+
+
 class TestEachReactionIsCheckedBeforeTheNextOne(unittest.TestCase):
     """PCR is where a cloning fails, and it fails silently.
 
