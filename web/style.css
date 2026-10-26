@@ -236,6 +236,27 @@ label.checkbox {
 .fold-away { margin: 2px 0 6px; }
 .fold-note { margin: 4px 0 8px; font-style: italic; }
 
+/* --- what the design is doing ----------------------------------------- */
+.bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.bar-label {
+  margin-top: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
 /* --- a sequence the inventory does not have --------------------------- */
 .module-wrap { margin-bottom: 2px; }
 .module-row.is-literal { border-left: 3px solid var(--accent); }

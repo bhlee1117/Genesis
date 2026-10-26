@@ -5737,6 +5737,78 @@ class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
             self.assertTrue(any(wanted in i for i in items), wanted)
 
 
+class TestTheDesignSaysWhatItIsDoing(unittest.TestCase):
+    """Planning takes the better part of a minute, and a button that
+    goes grey for forty seconds looks like a button that has broken."""
+
+    def test_every_stage_reports_before_it_runs(self):
+        import hashlib
+        from genesis.design import DESIGN_STAGES
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'prog',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 500), 3006)).lastrowid
+        seq = orf(150, 501)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'progd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 502), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+
+        seen = []
+        design(conn, ConstructSpec("p", backbone_plasmid_id=bb,
+                                   modules=[Module("CDS", "gene")]), cfg,
+               progress=lambda k, label, done: seen.append((k, label, done)))
+        conn.close()
+
+        self.assertEqual([k for k, _l, _d in seen],
+                         [k for k, _l, _w in DESIGN_STAGES],
+                         "the stages must report in the order they run")
+        # ...monotonic, starting at zero and never reaching one early
+        fractions = [d for _k, _l, d in seen]
+        self.assertEqual(fractions[0], 0.0)
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertLess(fractions[-1], 1.0)
+        for _k, label, _d in seen:
+            self.assertTrue(label and label[0].isupper(), label)
+
+    def test_a_design_without_a_callback_still_works(self):
+        """progress is optional; nothing may depend on it."""
+        import inspect
+        from genesis.design import design as fn
+        sig = inspect.signature(fn)
+        self.assertIn("progress", sig.parameters)
+        self.assertIsNone(sig.parameters["progress"].default)
+
+    def test_the_weights_are_shares_of_one_whole(self):
+        from genesis.design import DESIGN_STAGES
+        self.assertTrue(all(w > 0 for _k, _l, w in DESIGN_STAGES))
+        self.assertEqual(len({k for k, _l, _w in DESIGN_STAGES}),
+                         len(DESIGN_STAGES), "duplicate stage key")
+
+    def test_the_browser_falls_back_when_there_is_no_stream(self):
+        """A progress bar is not worth failing a design over."""
+        app = (Path(__file__).resolve().parent.parent
+               / "web" / "app.js").read_text()
+        self.assertIn("function streamDesign", app)
+        self.assertIn("return postJSON('/api/design', { spec: spec });", app)
+        # and the bar goes where the user is looking, not into the
+        # hidden leftover container
+        self.assertIn(".step-pane:not([hidden])", app)
+
+
 class TestASequenceTypedInIsThePart(unittest.TestCase):
     """Some parts are not in any plasmid here yet.
 

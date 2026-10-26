@@ -1093,8 +1093,12 @@ async function renderInventory() {
     ], rows, { onRow: function (r) { showPlasmid(r.id); } }));
     setStatus(status, plural(rows.length, 'plasmid'));
   } catch (err) {
+    if (progress.node.parentNode) {
+      progress.node.parentNode.removeChild(progress.node);
+    }
     clear(out);
-    out.appendChild(errorBox(err.message));
+    (document.querySelector('.step-pane:not([hidden])') || out)
+      .appendChild(errorBox(err.message));
     setStatus(status, 'failed', 'error');
   }
 }
@@ -2779,16 +2783,94 @@ function selectionSummary(data) {
   return card;
 }
 
+/** A bar that says which stage the design is in.
+
+   Planning takes the better part of a minute on a four-module
+   construct, and a button that goes grey for forty seconds looks like
+   a button that has broken. The percentage is an estimate - how the
+   time splits depends on how many modules there are - so the label is
+   the part that is always true. */
+function progressCard() {
+  var fill = h('div', { class: 'bar-fill' });
+  var label = h('div', { class: 'bar-label' }, 'Starting…');
+  var card = h('div', { class: 'card' },
+    h('div', { class: 'bar' }, fill), label,
+    h('p', { class: 'muted small' },
+      'Most of the wait is the search through the inventory.'));
+  return {
+    node: card,
+    set: function (done, text) {
+      fill.style.width = Math.round((done || 0) * 100) + '%';
+      if (text) label.textContent = text;
+    }
+  };
+}
+
+/** POST a spec and read the plan back as it is made.
+
+   EventSource only does GET, so this reads the chunks off the POST
+   itself and splits them on the blank line that ends an SSE event. */
+async function streamDesign(spec, onProgress) {
+  var res;
+  try {
+    res = await fetch('/api/design/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ spec: spec })
+    });
+  } catch (e) { res = null; }
+  if (!res || !res.ok || !res.body) {
+    /* No stream to be had: fall back to the plain endpoint rather
+       than failing the design over a progress bar. */
+    return postJSON('/api/design', { spec: spec });
+  }
+  var reader = res.body.getReader();
+  var decoder = new TextDecoder();
+  var buffer = '', plan = null, failed = null;
+  for (;;) {
+    var chunk = await reader.read();
+    if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+    var cut;
+    while ((cut = buffer.indexOf('\n\n')) >= 0) {
+      var raw = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      var event = '', data = '';
+      raw.split('\n').forEach(function (line) {
+        if (line.indexOf('event: ') === 0) event = line.slice(7);
+        else if (line.indexOf('data: ') === 0) data += line.slice(6);
+      });
+      if (!data) continue;
+      var payload;
+      try { payload = JSON.parse(data); } catch (e) { continue; }
+      if (event === 'progress') onProgress(payload);
+      else if (event === 'plan') plan = payload;
+      else if (event === 'failed') failed = payload.error;
+    }
+    if (chunk.done) break;
+  }
+  if (failed) throw new Error(failed);
+  if (!plan) throw new Error('the design ended without producing a plan');
+  return plan;
+}
+
 async function generatePlan() {
   var status = $('design-status');
   var out = $('plan-out');
-  setStatus(status, 'running stages 4–10…', 'busy');
+  setStatus(status, 'designing…', 'busy');
   clear(out);
-  out.appendChild(h('div', { class: 'card' },
-    h('p', { class: 'muted' }, 'Resolving modules, validating and ranking routes…')));
+  var progress = progressCard();
+  /* #plan-out is hidden - it is where the old single-page layout put
+     things - so a bar in it would be a bar nobody sees. It goes in the
+     pane the button that started this is on. */
+  var here = document.querySelector('.step-pane:not([hidden])') || out;
+  here.appendChild(progress.node);
+  progress.node.scrollIntoView({ block: 'center', behavior: 'smooth' });
   try {
     var spec = collectSpec();
-    var plan = await postJSON('/api/design', { spec: spec });
+    var plan = await streamDesign(spec, function (p) {
+      progress.set(p.done, p.label);
+      setStatus(status, (p.label || '').toLowerCase(), 'busy');
+    });
     state.spec = spec;
     state.plan = plan;
     state.appliedSuggestion = null;   // a fresh plan may suggest a new name
@@ -2796,6 +2878,9 @@ async function generatePlan() {
     // `state.saved` is deliberately kept: regenerating after loading design #5
     // is exactly the case Overwrite exists for.
     refreshSaveButtons();
+    if (progress.node.parentNode) {
+      progress.node.parentNode.removeChild(progress.node);
+    }
     renderPlan();
     setStatus(status, 'plan ready', 'ok');
   } catch (err) {

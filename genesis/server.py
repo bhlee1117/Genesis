@@ -18,7 +18,7 @@ GET  /api/enzymes                       enzyme catalogue
 GET  /api/vocab                         controlled feature vocabulary
 GET  /api/config                        effective configuration
 POST /api/scan          {spec}          resolve modules, list candidate parents
-POST /api/design        {spec}          run Stages 4-10, return a plan
+POST /api/design        {spec}          run Stages 4-10, return a plan\nPOST /api/design/stream {spec}          the same, as server-sent events: one\n                     `progress` per stage, then `plan`
 POST /api/save   {spec, plan, mode, design_id}\n                     mode: version | overwrite | save_as\nPOST /api/delete-design {design_id} or {construct_id}
 GET  /api/designs                       stored designs
 POST /api/outcome       {...}           record an experimental result
@@ -134,6 +134,40 @@ class Handler(BaseHTTPRequestHandler):
         if filename:
             extra["Content-Disposition"] = f'attachment; filename="{filename}"'
         self._send(200, data.encode(), ctype, extra)
+
+    def design_stream(self, conn, spec):
+        """Run the design, saying what it is doing while it does it.
+
+        Planning takes the better part of a minute on a four-module
+        construct, and a button that goes grey for forty seconds looks
+        like a button that has broken. Each stage is sent as it starts
+        and the finished plan as the last event, so nothing has to be
+        requested twice.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(event, payload):
+            self.wfile.write(
+                f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+                .encode())
+            self.wfile.flush()
+
+        def progress(key, label, done):
+            emit("progress", {"stage": key, "label": label,
+                              "done": round(done, 3)})
+
+        try:
+            plan = design(conn, spec, self.cfg, progress=progress)
+        except Exception as exc:                 # the stream owns the error
+            emit("failed", {"error": str(exc)})
+            return
+        emit("progress", {"stage": "done", "label": "Done", "done": 1})
+        emit("plan", plan)
 
     def body_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -533,14 +567,15 @@ class Handler(BaseHTTPRequestHandler):
                     else ConstructSpec.from_dict(spec_in or {}))
             return self.json(scan_sources(c, spec, self.cfg))
 
-        if path == "/api/design":
+        if path in ("/api/design", "/api/design/stream"):
             spec_in = body.get("spec")
             if isinstance(spec_in, str):
                 spec = ConstructSpec.from_yaml(spec_in)
             else:
                 spec = ConstructSpec.from_dict(spec_in or {})
-            plan = design(c, spec, self.cfg)
-            return self.json(plan)
+            if path == "/api/design":
+                return self.json(design(c, spec, self.cfg))
+            return self.design_stream(c, spec)
 
         if path == "/api/save":
             spec = ConstructSpec.from_dict(body["spec"]) if isinstance(

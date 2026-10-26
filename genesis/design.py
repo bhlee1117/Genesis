@@ -942,10 +942,45 @@ def _extend_to_stop(conn: sqlite3.Connection, resolved: list) -> list[str]:
     return notes
 
 
-def design(conn: sqlite3.Connection, spec: ConstructSpec,
-           cfg: Config | None = None) -> dict:
-    cfg = cfg or Config()
+#: What design() does, in the order it does it. The weights are rough
+#: shares of the wall clock, measured rather than guessed. Resolving
+#: and searching for parents are most of it, and a bar that moved a
+#: seventh per stage would sit at 57% for most of the wait. The split
+#: shifts with the number of modules, so the percentage is an estimate
+#: and the label is the part that is always true.
+DESIGN_STAGES = (
+    ("resolve", "Resolving each part against the inventory", 35),
+    ("assemble", "Building the molecule you asked for", 2),
+    ("validate", "Checking it before planning anything", 5),
+    ("routes", "Working out the ways to build it", 8),
+    ("parents", "Looking for plasmids to start from", 40),
+    ("simulate", "Running each protocol on paper", 8),
+    ("finish", "Checking whether the lab already has it", 2),
+)
 
+
+def design(conn: sqlite3.Connection, spec: ConstructSpec,
+           cfg: Config | None = None, progress=None) -> dict:
+    """Plan the cloning.
+
+    ``progress`` is called as ``progress(key, label, done_fraction)``
+    before each stage starts, so a caller can say what is happening
+    during the half minute this takes rather than showing a spinner.
+    """
+    cfg = cfg or Config()
+    _total = sum(w for _k, _l, w in DESIGN_STAGES)
+    _seen = {"at": 0}
+
+    def _step(key):
+        if progress is None:
+            return
+        for k, label, weight in DESIGN_STAGES:
+            if k == key:
+                progress(k, label, _seen["at"] / _total)
+                _seen["at"] += weight
+                return
+
+    _step("resolve")
     # Stage 4: resolve modules against the inventory
     resolved = resolve(conn, spec)
 
@@ -1048,6 +1083,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     reuse_sites = backbone_cassette(backbone_rows) is not None
     resolved, dio_notes = expand_dio(resolved, sites_from_backbone=reuse_sites)
 
+    _step("assemble")
     # Stage 4: build the intended final molecule. With a backbone the
     # payload replaces that plasmid's existing cassette, so the result is a
     # real plasmid carrying its ITRs, WPRE, polyA, origin and resistance -
@@ -1107,6 +1143,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     if inferred.get("warning"):
         vector_info["warning"] = inferred["warning"]
 
+    _step("validate")
     # Stage 5: validate before planning anything
     # Compare against the expanded architecture: after a DIO expansion the
     # assembled order legitimately differs from the order that was typed.
@@ -1217,6 +1254,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     scheme = (build_scheme(conn, analysis)
               if analysis and analysis.feasible else {})
 
+    _step("routes")
     # Stages 7-8: generate routes
     fragments = group_contiguous(resolved, construct, cfg)
     routes = [
@@ -1252,6 +1290,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
                    "mode": (m.get("mode") if isinstance(m, dict) else m.mode)}
                   for m in spec.modules]
 
+    _step("parents")
     plan = {
         "construct": {
             "name": spec.name,
@@ -1314,6 +1353,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     from .protocol import suggest_name
     plan["construct"]["suggested_name"] = suggest_name(plan)
 
+    _step("simulate")
     # Stage 11b: run the protocol on paper.  Verification reads the designed
     # molecule back, which cannot catch a design that verifies perfectly
     # while the steps underneath it build something else; this amplifies the
@@ -1343,6 +1383,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
             for w in sim.get("warnings", []):
                 route["warnings"].append(f"simulation: {w}")
 
+    _step("finish")
     # Stage 11c: a look before the next step hides the answer.
     # Spliced in here rather than in each route planner: every route
     # that makes a molecule wants the same checkpoints, and six copies
