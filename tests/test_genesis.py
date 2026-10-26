@@ -5519,6 +5519,133 @@ class TestDpnIKnowsWhatItCanCut(unittest.TestCase):
         conn.close()
 
 
+class TestEachReactionIsCheckedBeforeTheNextOne(unittest.TestCase):
+    """PCR is where a cloning fails, and it fails silently.
+
+    The amplicon that is not there goes into the assembly anyway, and
+    the first hard evidence is a plate of parental vector two days
+    later. The information to catch it existed at minute ninety.
+    """
+
+    def _plan(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'qcbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 340), 2506)).lastrowid
+        seq = orf(150, 341)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'qcd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 342), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("qc test", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        return conn, cfg, plan
+
+    def test_a_pcr_is_followed_by_a_gel(self):
+        conn, _cfg, plan = self._plan()
+        checked = 0
+        for route in plan["routes"]:
+            ops = [s["operation"] for s in route["steps"]]
+            if "PCR" not in ops:
+                continue
+            checked += 1
+            self.assertIn("QC_GEL", ops,
+                          f"{route['id']} amplifies and never looks")
+            # ...and it comes after the amplifying, not at the end
+            self.assertLess(ops.index("QC_GEL"), len(ops) - 2)
+        self.assertTrue(checked)
+        conn.close()
+
+    def test_the_gel_names_the_band_this_plan_expects(self):
+        """"Run a gel" is advice. "One band at 5,791 bp, and a band at
+        6,539 bp is uncut template" is a test."""
+        conn, _cfg, plan = self._plan()
+        for route in plan["routes"]:
+            for step in route["steps"]:
+                check = (step.get("details") or {}).get("checkpoint")
+                if not check or check["operation"] != "PCR":
+                    continue
+                joined = " ".join(check["expect"])
+                self.assertIn("bp", joined)
+                self.assertRegex(joined, r"\d,?\d*\s*bp")
+                # and a way out of each failure
+                self.assertTrue(check["troubles"])
+                for seen, means, todo in check["troubles"]:
+                    self.assertTrue(seen and means and todo)
+                conn.close()
+                return
+        conn.close()
+        self.fail("no PCR checkpoint was generated")
+
+    def test_two_pcrs_share_one_gel(self):
+        """Nobody pours a second gel to look at the second tube."""
+        from genesis.checkpoints import for_route
+        route = {"steps": [
+            {"operation": "PCR", "output": "a amplicon",
+             "details": {"length": 1000, "template": "pA"}},
+            {"operation": "PCR", "output": "b amplicon",
+             "details": {"length": 2000, "template": "pB"}},
+            {"operation": "HI_FI_ASSEMBLY", "inputs": []}]}
+        marks = for_route(route, {"pA": 5000, "pB": 6000})
+        pcr = [c for _i, c in marks if c.operation == "PCR"]
+        self.assertEqual(len(pcr), 1, "one gel, not two")
+        joined = " ".join(pcr[0].expect)
+        self.assertIn("1,000 bp", joined)
+        self.assertIn("2,000 bp", joined)
+        self.assertIn("5,000 bp", joined)   # the template band to avoid
+
+    def test_the_digest_checkpoint_knows_the_real_bands(self):
+        """The simulator already cuts these molecules, so the sizes are
+        known rather than guessed."""
+        conn, _cfg, plan = self._plan()
+        found = False
+        for route in plan["routes"]:
+            for step in route["steps"]:
+                check = (step.get("details") or {}).get("checkpoint")
+                if check and check["operation"] == "RE_DIGEST":
+                    found = True
+                    self.assertTrue(any("uncut" in e
+                                        for e in check["expect"]))
+        conn.close()
+        if not found:
+            self.skipTest("this fixture produced no restriction route")
+
+    def test_an_assembly_is_checked_against_a_no_insert_control(self):
+        """An assembly cannot be read on a gel; the plate is the
+        readout, and a plate alone says nothing."""
+        from genesis.checkpoints import for_route
+        marks = for_route({"steps": [
+            {"operation": "HI_FI_ASSEMBLY", "inputs": []}]})
+        self.assertEqual(len(marks), 1)
+        check = marks[0][1]
+        self.assertIn("control", check.title)
+        self.assertTrue(any("vector-only" in e for e in check.expect))
+
+    def test_the_checkpoint_reaches_the_pdf_and_the_markdown(self):
+        from genesis.export import protocol_pdf, protocol_markdown
+        conn, cfg, plan = self._plan()
+        drawn = pdf_text(protocol_pdf(plan, cfg))
+        self.assertIn(b"Go on if you see", drawn)
+        md = protocol_markdown(plan, cfg)
+        self.assertIn("**Go on if you see:**", md)
+        conn.close()
+
+
 class TestTheProtocolIsReadableAndHonest(unittest.TestCase):
     """The protocol's own presentation, where it had gone wrong."""
 

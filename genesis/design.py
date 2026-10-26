@@ -120,6 +120,73 @@ def already_made(conn: sqlite3.Connection, construct, resolved) -> list:
     return hits[:6]
 
 
+def _add_checkpoints(conn: sqlite3.Connection, plan: dict) -> None:
+    """Put a QC step after every step that makes a molecule."""
+    from .checkpoints import for_route
+    from .operations import Step, renumber
+    from .simulate import _templates
+
+    for route in plan.get("routes") or []:
+        steps = route.get("steps") or []
+        if not steps or any(s.get("operation") == "QC_GEL" for s in steps):
+            continue
+        try:
+            resolved = _templates(conn, plan, route)
+        except Exception:
+            resolved = {}
+        lengths = {name: len(entry[0]) for name, entry in resolved.items()}
+        # What the gel should show after a digest: the simulation has
+        # already cut these molecules, so the sizes are known rather
+        # than guessed.
+        bands = {}
+        from .enzymes import CATALOG
+        from .figure import step_enzymes
+        from .simulate import digest as cut
+        for i, step in enumerate(steps):
+            if step.get("operation") != "RE_DIGEST":
+                continue
+            enzymes = [e for e in step_enzymes(step) if e in CATALOG]
+            host = next((x for x in step.get("inputs") or []
+                         if x in resolved), None)
+            if not (enzymes and host):
+                continue
+            seq, circular, _name, _tid = resolved[host]
+            try:
+                pieces = cut(seq, circular, enzymes)
+            except Exception:
+                continue
+            if len(pieces) >= 2:
+                bands[i] = sorted((len(x.seq) for x in pieces), reverse=True)
+
+        marks = for_route(route, lengths, bands)
+        if not marks:
+            continue
+        out, by_index = [], {i: c for i, c in marks}
+        for i, step in enumerate(steps):
+            out.append(step)
+            check = by_index.get(i)
+            if check is None:
+                continue
+            # A run of PCRs already shares one checkpoint, attached to
+            # the last of them, so there is nothing to merge here.
+            out.append(Step(0, "QC_GEL", check.title,
+                            output=check.operation == "PCR"
+                            and "a checked amplicon" or "a checked reaction",
+                            details={"checkpoint": check.to_dict()}))
+        route["steps"] = [s if isinstance(s, dict) else s.to_dict()
+                          for s in _renumber_mixed(out)]
+
+
+def _renumber_mixed(steps: list) -> list:
+    """Renumber a list that is part Step objects and part dicts."""
+    for i, s in enumerate(steps, start=1):
+        if isinstance(s, dict):
+            s["index"] = i
+        else:
+            s.index = i
+    return steps
+
+
 def required_architecture(spec: ConstructSpec) -> set:
     """Structural features a recipient must already have for this design.
 
@@ -1206,6 +1273,12 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         else:
             for w in sim.get("warnings", []):
                 route["warnings"].append(f"simulation: {w}")
+
+    # Stage 11c: a look before the next step hides the answer.
+    # Spliced in here rather than in each route planner: every route
+    # that makes a molecule wants the same checkpoints, and six copies
+    # of that decision would drift apart.
+    _add_checkpoints(conn, plan)
 
     # Past a few reactions, ordering the insert stops being the expensive
     # option and starts being the quick one. Cost says otherwise - a gBlock

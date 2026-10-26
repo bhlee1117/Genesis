@@ -391,6 +391,9 @@ def build_protocol(plan: dict, cfg: Config | None = None,
             "recipe": recipe, "notes": step.get("notes", ""),
             "product": product, "digest_stages": digest_stages,
             "red_notes": red,
+            # The step's own findings - the checkpoint, the DpnI site
+            # count - travel with it; the renderers read them from here.
+            "details": step.get("details") or {},
         })
 
     return {
@@ -526,6 +529,39 @@ def _vendor_box(doc, recipe: dict, product, step: dict) -> None:
             doc.link(product.url, product.url, 7.6, indent=4, font="F7")
 
     doc.boxed(body, pad=7, fill=(0.985, 0.985, 0.99))
+
+
+def _checkpoint_box(doc, step: dict) -> None:
+    """What a good result looks like, and what each bad one means.
+
+    A protocol that says "run a gel" has given advice. One that says
+    "one band at 5,791 bp, and a band at 6,539 bp is uncut template"
+    has given a test - which is the difference between finding a failed
+    PCR now and finding it on a plate in two days.
+    """
+    from .pdf import WARN_RED
+    check = (step.get("details") or {}).get("checkpoint")
+    if not check:
+        return
+
+    def body():
+        doc.paragraph(check["title"], 9.4, font="F2")
+        for line in check.get("how") or ():
+            doc.paragraph(line, 8.8, indent=6, gray=0.25)
+        doc.spacer(1)
+        doc.paragraph("Go on if you see", 8.6, font="F2", indent=6,
+                      gray=0.2)
+        for line in check.get("expect") or ():
+            doc.bullet(line, 8.6, indent=10, gray=0.25)
+        if check.get("troubles"):
+            doc.spacer(1)
+            doc.paragraph("If not", 8.6, font="F2", indent=6, rgb=WARN_RED)
+            doc.table(["What you see", "What it means", "What to do"],
+                      [list(t) for t in check["troubles"]],
+                      widths=[0.24, 0.34, 0.42], size=8.0)
+
+    doc.boxed(body, pad=7, rgb=(0.52, 0.68, 0.52),
+              fill=(0.975, 0.99, 0.975))
 
 
 def _already_made_banner(doc, plan: dict) -> None:
@@ -818,6 +854,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                                             "RE_DIGEST", "DPNI_DIGEST",
                                             "TRANSFORMATION"):
             _vendor_box(doc, recipe, product, step)
+        _checkpoint_box(doc, step)
         doc.gutter = 96 if lanes_for_steps else 0
 
     doc.gutter = 0
@@ -1165,6 +1202,14 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
                                             "RE_DIGEST", "TRANSFORMATION"):
             out.append(f"   - *{recipe['title']}*: " +
                        "; ".join(f"{a} {i}" for i, a in recipe["items"]))
+        check = (step.get("details") or {}).get("checkpoint")
+        if check:
+            for line in check["how"]:
+                out.append(f"   - {line}")
+            out.append("   - **Go on if you see:** "
+                       + "; ".join(check["expect"]))
+            for seen, means, do in check["troubles"]:
+                out.append(f"   - *{seen}* - {means}. {do}.")
     out.append("")
 
     out += ["---", "", "## Detail", "",

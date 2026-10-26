@@ -4909,6 +4909,36 @@ function disclosure(label, text) {
   return h('div', { class: 'disclosure' }, link, body);
 }
 
+/** The look-before-you-go-on block under a QC step.
+
+   The step people skip is the one that would have told them, so it
+   does not read like the rest of the list: what to run, what a good
+   result is, and a row per way it can go wrong with the thing to try
+   next. Every number in it came from this plan. */
+function checkpointBlock(step) {
+  var c = (step.details || {}).checkpoint;
+  if (!c) return null;
+  var box = h('div', { class: 'check-box' });
+  (c.how || []).forEach(function (line) {
+    box.appendChild(h('p', { class: 'check-how' }, line));
+  });
+  box.appendChild(h('div', { class: 'check-head' }, 'Go on if you see'));
+  var ul = h('ul', { class: 'check-list' });
+  (c.expect || []).forEach(function (line) {
+    ul.appendChild(h('li', null, line));
+  });
+  box.appendChild(ul);
+  if ((c.troubles || []).length) {
+    box.appendChild(h('div', { class: 'check-head check-bad' }, 'If not'));
+    box.appendChild(table([
+      { label: 'What you see', cell: function (t) { return t[0]; } },
+      { label: 'What it means', cell: function (t) { return t[1]; } },
+      { label: 'What to do', cell: function (t) { return t[2]; } }
+    ], c.troubles));
+  }
+  return box;
+}
+
 function statPair(label, value) {
   if (label === null) return [];
   return [h('dt', { title: STAT_HINTS[label] || null }, label),
@@ -4955,7 +4985,8 @@ function renderRouteDetail(route) {
            does: how many sites DpnI has to cut here, for instance. The
            PDF has carried it since it was added; the screen did not. */
         (s.details && s.details.note)
-          ? h('div', { class: 'step-note' }, s.details.note) : null);
+          ? h('div', { class: 'step-note' }, s.details.note) : null,
+        checkpointBlock(s));
     })));
   }
 

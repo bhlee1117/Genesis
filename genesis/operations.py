@@ -75,6 +75,12 @@ OPERATIONS: dict[str, Operation] = {o.code: o for o in [
     Operation("SEQUENCE_VERIFY", "Confirm the final construct by sequencing",
               ("candidate clone",), "verified plasmid", mandatory=True,
               default_minutes=1440, hands_on_minutes=20),
+    Operation("QC_GEL", "Check the last reaction worked before going on",
+              ("an aliquot of the reaction",), "a go / no-go answer",
+              default_minutes=45, hands_on_minutes=20,
+              notes="The cheapest step in the protocol and the one that "
+                    "saves the most: a failed PCR costs an hour here and "
+                    "two days if it is found on the plate instead."),
     Operation("SYNTHESIS", "Order a synthetic DNA fragment",
               ("sequence",), "synthetic fragment", changes_sequence=True,
               default_minutes=10080, hands_on_minutes=10, notes="Use only when no lab template exists."),

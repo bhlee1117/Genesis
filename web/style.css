@@ -214,6 +214,30 @@ label.checkbox {
 }
 .made-name { font-weight: 600; }
 
+/* --- stop and look before the next step ------------------------------- */
+/* The step people skip is the one that would have told them, so it does
+   not look like the rest of the list. */
+.check-box {
+  margin: 6px 0 4px 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--ok-border);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--ok-bg);
+  font-size: 11.5px;
+}
+.check-how { margin: 0 0 4px; color: var(--text-muted); }
+.check-head {
+  font-weight: 700;
+  font-size: 11px;
+  color: var(--ok-text);
+  margin-top: 4px;
+}
+.check-head.check-bad { color: var(--error-text); }
+.check-list { margin: 2px 0 4px; padding-left: 18px; }
+.check-list li { margin: 1px 0; }
+.check-box table { margin-top: 4px; font-size: 11px; }
+
 /* --- a part's own sequence -------------------------------------------- */
 .seq-wrap { margin: 6px 0 10px; }
 .seq-block {
