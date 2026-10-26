@@ -1957,10 +1957,13 @@ function moduleRow(mod, i, focus) {
     mod.seq ? null : picker.chip,
     h('div', { class: 'row-buttons' },
       h('button', {
-        type: 'button', class: mod.seq ? 'is-on' : '',
-        title: mod.seq ? 'Edit the sequence' : 'Paste your own sequence',
+        type: 'button',
+        class: 'dna-button' + (mod.seq ? ' is-on' : ''),
+        title: mod.seq
+          ? 'Edit the sequence you typed in'
+          : 'Paste your own sequence instead of searching the inventory',
         onclick: function () { custom.toggle(); }
-      }, 'DNA'),
+      }, mod.seq ? '\u25cf DNA' : 'DNA'),
       h('button', {
         type: 'button', title: 'Move up', disabled: i === 0,
         onclick: function () { swapModules(i, i - 1); }

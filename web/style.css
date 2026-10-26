@@ -245,10 +245,33 @@ label.checkbox {
   font-weight: 600;
   align-self: center;
 }
+/* The one button on the row that does something other than move or
+   delete, so it does not look like the arrows and the cross. Outlined
+   in the accent while it is an offer, filled once the row is actually
+   carrying a sequence - and the filled state is what tells you, at a
+   glance down the builder, which rows are not coming from the
+   inventory. */
+.dna-button {
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--row-selected);
+}
+.dna-button:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+.dna-button.is-on,
 .row-buttons button.is-on {
   background: var(--accent);
   color: var(--accent-text);
   border-color: var(--accent);
+}
+.dna-button.is-on:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-text);
 }
 .literal-box {
   margin: 2px 0 8px 26px;
