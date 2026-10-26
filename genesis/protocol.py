@@ -336,11 +336,28 @@ def build_protocol(plan: dict, cfg: Config | None = None,
     # Q5 tube. Where a product is named, its own components are the
     # reagents; the generic recipe is the fallback for the rest.
     from .reagents import for_operation as _product_for
+    screen_enzyme = next(
+        ((s.get("details") or {}).get("diagnostic_enzyme")
+         for s in route["steps"]
+         if s["operation"] == "COLONY_SCREEN"), None)
     for op in used_ops:
         product = _product_for(op)
         if product is not None and product.setup:
             for amount, item in product.setup:
+                # A screen is either a colony PCR or a diagnostic
+                # digest. Ordering Taq for a plan that is going to cut
+                # a miniprep with an enzyme already in the freezer is
+                # ordering a reagent nobody will open - but colonies
+                # and water are wanted either way, so only the two
+                # items that belong to one branch are marked.
+                if (op == "COLONY_SCREEN" and screen_enzyme
+                        and ("Taq" in item or "primer pair" in item)):
+                    item += " (colony PCR only)"
                 add_reagent(item, amount)
+            if op == "COLONY_SCREEN" and screen_enzyme:
+                add_reagent(f"{screen_enzyme} and rCutSmart buffer "
+                            f"(diagnostic digest only - no polymerase "
+                            f"needed on this branch)", "per reaction")
             continue
         if op == "PCR":
             for item, amount in _pcr_recipe(cfg)["items"]:

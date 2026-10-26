@@ -5673,6 +5673,63 @@ class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
             self.assertNotIn(gone, items,
                              f"{gone} is inside the master mix")
 
+    def test_a_polymerase_is_only_ordered_for_the_branch_that_needs_one(self):
+        """The screen is a colony PCR or a diagnostic digest. The
+        digest reads size and orientation off a miniprep with an enzyme
+        already in the freezer, and needs no polymerase at all."""
+        import hashlib
+        from genesis.protocol import build_protocol
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'scbb',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(2500, 360), 2506)).lastrowid
+        seq = orf(150, 361)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'scd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 362), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("sc", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        p = build_protocol(plan, cfg)
+        enzyme = next(((s.get("details") or {}).get("diagnostic_enzyme")
+                       for s in p["steps"]
+                       if s["operation"] == "COLONY_SCREEN"), None)
+        taq = [i for i, _a in p["reagents"] if "taq" in i.lower()]
+        conn.close()
+        if not enzyme:
+            self.assertTrue(taq, "colony PCR is the only screen here")
+            return
+        self.assertTrue(taq)
+        self.assertTrue(all("colony PCR only" in i for i in taq),
+                        "Taq is for one branch of the screen, not both")
+        self.assertTrue(
+            any(enzyme in i and "digest only" in i
+                for i, _a in p["reagents"]),
+            "the other branch needs the enzyme and no polymerase")
+
+    def test_the_screening_polymerase_is_the_one_they_own(self):
+        from genesis.reagents import for_operation
+        screen = for_operation("COLONY_SCREEN")
+        self.assertIsNotNone(screen)
+        self.assertEqual(screen.catalogue, "76620-472")
+        joined = " ".join(screen.notes)
+        self.assertIn("Q5", joined)          # says the alternative
+        self.assertIn("No polymerase at all", joined)
+
     def test_what_is_left_is_what_you_add_to_it(self):
         items = self._reagents()
         for wanted in ("forward primer", "plasmid template",

@@ -237,6 +237,33 @@ CATALOGUE: tuple = (
                "happens."),
     ),
     Product(
+        vendor="VWR", catalogue="76620-472",
+        name="RED Taq 2X Master Mix (colony PCR only)",
+        url="https://www.neb.com/en-us/applications/cloning-and-synthetic-"
+            "biology/dna-analysis/colony-pcr",
+        title="Colony screen",
+        operations=("COLONY_SCREEN",),
+        setup=(("4-8", "colonies, patched onto a fresh plate first"),
+               ("10 uL", "RED Taq 2X Master Mix, per reaction"),
+               ("0.5 uL each", "screening primer pair, 10 uM"),
+               ("to 20 uL", "nuclease-free water")),
+        program=(("lyse", "95 C, 5 min, straight off the colony"),
+                 ("30 cycles", "95 C 20 s / anneal 20 s / 68 C 1 min per kb"),
+                 ("read", "on a gel: a band only from a clone with the "
+                          "insert")),
+        notes=("Taq rather than the Q5 on the shelf because colony "
+               "lysate inhibits a proofreading polymerase more, and a "
+               "screen only has to answer yes or no - fidelity is the "
+               "sequencing step's job. Q5 does work if the Taq has run "
+               "out.",
+               "No polymerase at all is needed if the plan screens by "
+               "diagnostic digest instead: that reads size and "
+               "orientation off a miniprep with an enzyme already in "
+               "the freezer, at the cost of an overnight culture.",
+               "Patch every colony before screening, or a positive is a "
+               "result with nothing left to grow."),
+    ),
+    Product(
         vendor="Thermo", catalogue="K0502", name="GeneJET Plasmid Miniprep Kit",
         url="https://www.thermofisher.com/order/catalog/product/K0502",
         title="Miniprep",
