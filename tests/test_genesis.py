@@ -5737,6 +5737,52 @@ class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
             self.assertTrue(any(wanted in i for i in items), wanted)
 
 
+class TestTheInventoryCanBeRefreshedFromTheApp(unittest.TestCase):
+    """The inventory is a snapshot, and a snapshot goes stale.
+
+    pPH003 was saved to the share on 19 October; the last scan was on
+    the 8th. From the design side that looks like Genesis having lost
+    a plasmid, and the only way to fix it was a terminal and the right
+    command.
+    """
+
+    def test_the_endpoint_exists_and_writes_so_needs_a_role(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "server.py").read_text()
+        self.assertIn('"/api/rescan/stream"', src)
+        self.assertIn('"/api/rescan/stream": "member"', src,
+                      "re-reading the share writes to the shared inventory")
+
+    def test_it_says_so_rather_than_failing_when_the_share_is_away(self):
+        """A laptop off the VPN is the common case, and "is not
+        reachable - is the share mounted?" is the answer to it."""
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "server.py").read_text()
+        self.assertIn("share mounted?", src)
+        self.assertIn("os.path.isdir(root)", src)
+
+    def test_the_refresh_is_both_passes(self):
+        """A scan picks up the file; inferring the ORFs is what makes
+        a new plasmid usable as a donor."""
+        src = (Path(__file__).resolve().parent.parent
+               / "genesis" / "server.py").read_text()
+        start = src.index("def rescan_stream")
+        body = src[start:src.index("def design_stream")]
+        self.assertIn("import_tree", body)
+        self.assertIn("infer_all", body)
+
+    def test_the_button_is_on_the_inventory_tab(self):
+        root = Path(__file__).resolve().parent.parent / "web"
+        html = (root / "index.html").read_text()
+        app = (root / "app.js").read_text()
+        self.assertIn('id="inv-rescan"', html)
+        self.assertIn("function rescanShare", app)
+        # and it redraws the table afterwards, or the new plasmid is
+        # in the database and not on the screen
+        tail = app[app.index("async function rescanShare"):]
+        self.assertIn("renderInventory()", tail[:tail.index("async function showPartSources")])
+
+
 class TestAJoinIsNotEveryBoundary(unittest.TestCase):
     """Two different things were being called a junction.
 

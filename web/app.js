@@ -1255,6 +1255,97 @@ function seqSection(title, seq, note, extra) {
   return h('div', { class: 'seq-wrap' }, head, body);
 }
 
+/** Re-read the shared folder, saying how far it has got.
+
+   The inventory is a snapshot. A folder added after the last scan is
+   simply not there, which looks from the design side like Genesis
+   having lost a plasmid - and the only way to fix it was a terminal
+   and the right command. */
+async function rescanShare() {
+  var box = $('inv-rescan-box');
+  var button = $('inv-rescan');
+  var status = $('inv-status');
+  if (!box) return;
+  box.hidden = false;
+  clear(box);
+  button.disabled = true;
+
+  var fill = h('div', { class: 'bar-fill' });
+  var label = h('div', { class: 'bar-label' }, 'Starting\u2026');
+  var detail = h('p', { class: 'muted small' },
+    'Reading every file on the share. This takes a few minutes the '
+    + 'first time and less after that \u2014 only new and changed '
+    + 'files are parsed.');
+  box.appendChild(h('div', { class: 'card' },
+    h('div', { class: 'bar' }, fill), label, detail));
+  setStatus(status, 'reading the share\u2026', 'busy');
+
+  /* The scan has no total to divide by - it does not know how many
+     files there are until it has walked them - so the bar paces
+     itself against a typical run rather than claiming a fraction it
+     cannot compute. The counts underneath are the real measurement. */
+  var seen = 0;
+  function pace(n) {
+    seen = Math.max(seen, n || 0);
+    return Math.min(0.9, seen / 25000);
+  }
+
+  try {
+    var res = await fetch('/api/rescan/stream', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    if (!res.ok || !res.body) throw new Error('could not start the scan');
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = '', done = null, failed = null;
+    for (;;) {
+      var chunk = await reader.read();
+      if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+      var cut;
+      while ((cut = buffer.indexOf('\n\n')) >= 0) {
+        var raw = buffer.slice(0, cut);
+        buffer = buffer.slice(cut + 2);
+        var event = '', data = '';
+        raw.split('\n').forEach(function (line) {
+          if (line.indexOf('event: ') === 0) event = line.slice(7);
+          else if (line.indexOf('data: ') === 0) data += line.slice(6);
+        });
+        if (!data) continue;
+        var p;
+        try { p = JSON.parse(data); } catch (e) { continue; }
+        if (event === 'progress') {
+          label.textContent = p.label || '';
+          var frac = (typeof p.done === 'number') ? p.done : pace(p.scanned);
+          if (p.phase === 'orfs') frac = 0.9 + 0.1 * (p.done || 0);
+          fill.style.width = Math.round(frac * 100) + '%';
+        } else if (event === 'done') { done = p; }
+        else if (event === 'failed') { failed = p.error; }
+      }
+      if (chunk.done) break;
+    }
+    if (failed) throw new Error(failed);
+    fill.style.width = '100%';
+    var scan = (done && done.scan) || {};
+    label.textContent = 'Done';
+    clear(detail);
+    detail.appendChild(h('span', null,
+      (scan.plasmids || 0).toLocaleString() + ' plasmids from '
+      + (scan.scanned || 0).toLocaleString() + ' files'
+      + (scan.errors && scan.errors.length
+          ? ' \u00b7 ' + scan.errors.length + ' file(s) could not be read'
+          : '')));
+    setStatus(status, 'inventory updated', 'ok');
+    renderInventory();
+  } catch (err) {
+    clear(box);
+    box.appendChild(errorBox(err.message));
+    setStatus(status, 'scan failed', 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function showPartSources(part) {
   var side = $('part-detail');
   clear(side);
@@ -5660,6 +5751,9 @@ async function init() {
     if (e.key === 'Enter') renderParts();
   });
   $('part-type').addEventListener('change', renderParts);
+
+  var rescan = $('inv-rescan');
+  if (rescan) rescan.addEventListener('click', rescanShare);
 
   $('add-module').addEventListener('click', function () {
     state.modules.push(newModule('CDS'));

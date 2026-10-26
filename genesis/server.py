@@ -29,6 +29,7 @@ POST /api/import        {limit}         rescan the share
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import traceback
@@ -77,6 +78,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/save": "member", "/api/outcome": "member",
         "/api/delete-design": "member",
         "/api/import": "admin", "/api/users": "admin",
+        # Re-reading the share writes to the shared inventory.
+        "/api/rescan/stream": "member",
     }
 
     def cookie_token(self) -> str:
@@ -134,6 +137,70 @@ class Handler(BaseHTTPRequestHandler):
         if filename:
             extra["Content-Disposition"] = f'attachment; filename="{filename}"'
         self._send(200, data.encode(), ctype, extra)
+
+    def rescan_stream(self, conn, force: bool = False):
+        """Re-read the share, saying how far it has got.
+
+        The inventory is a snapshot, and a snapshot goes stale the
+        moment somebody saves a plasmid: a folder added after the last
+        scan simply is not there, which looks like Genesis losing it.
+        Running the scan took a terminal and knowing the command, so
+        in practice it was run when something was already missing.
+
+        Two passes, because that is what a refresh is: read the tree
+        for files that are new or changed, then look for payload
+        coding sequences in whatever arrived that nobody annotated.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(event, payload):
+            self.wfile.write(
+                f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+                .encode())
+            self.wfile.flush()
+
+        root = str(self.cfg.dna_root)
+        if not os.path.isdir(root):
+            emit("failed", {"error": f"{root} is not reachable - is the "
+                                     f"share mounted?"})
+            return
+        emit("progress", {"phase": "scan", "label": f"Reading {root}",
+                          "done": 0})
+        try:
+            def scanning(st):
+                emit("progress", {
+                    "phase": "scan", "done": None,
+                    "label": f"{st.scanned:,} files read, "
+                             f"{st.plasmids:,} plasmids",
+                    "scanned": st.scanned, "plasmids": st.plasmids,
+                    "reads": st.reads, "duplicates": st.duplicates})
+
+            stats = import_tree(conn, self.cfg, progress=scanning,
+                                motif_scan=True, force=force)
+
+            from .orfs import infer_all
+            emit("progress", {"phase": "orfs", "done": None,
+                              "label": "Looking for coding sequences "
+                                       "nobody annotated"})
+
+            def orfing(done, total, found, skipped):
+                emit("progress", {
+                    "phase": "orfs",
+                    "done": (done / total) if total else None,
+                    "label": f"{done:,}/{total:,} plasmids, "
+                             f"{found:,} coding sequences inferred"})
+
+            orfs = infer_all(conn, progress=orfing)
+        except Exception as exc:
+            emit("failed", {"error": str(exc)})
+            return
+
+        emit("done", {"scan": stats.as_dict(), "orfs": orfs})
 
     def design_stream(self, conn, spec):
         """Run the design, saying what it is doing while it does it.
@@ -640,6 +707,9 @@ class Handler(BaseHTTPRequestHandler):
             stats = import_tree(c, self.cfg, limit=limit,
                                 motif_scan=body.get("motif_scan", True))
             return self.json(stats.as_dict())
+
+        if path == "/api/rescan/stream":
+            return self.rescan_stream(c, bool(body.get("force")))
 
         if path.startswith("/api/plasmid/") and path.endswith("/annotate"):
             if not self.cfg.allow_annotation_edits:

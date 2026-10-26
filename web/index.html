@@ -37,8 +37,16 @@
         <select id="inv-owner"><option value="">all owners</option></select>
       </label>
       <button type="button" id="inv-go">Search</button>
+      <!-- The inventory is a snapshot, and a snapshot goes stale the
+           moment somebody saves a plasmid. Re-reading the share took a
+           terminal and knowing the command, so in practice it happened
+           only after something had already gone missing. -->
+      <button type="button" id="inv-rescan" class="rescan">
+        Update from the share
+      </button>
       <span class="status" id="inv-status"></span>
     </div>
+    <div id="inv-rescan-box" hidden></div>
     <div class="split">
       <div class="split-main">
         <div id="inv-table" class="scroll-y"></div>

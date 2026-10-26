@@ -250,6 +250,18 @@ label.checkbox {
   background: var(--accent);
   transition: width 0.3s ease;
 }
+button.rescan {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--row-selected);
+  font-weight: 600;
+}
+button.rescan:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+#inv-rescan-box { margin: 0 0 10px; }
+
 .bar-label {
   margin-top: 7px;
   font-size: 12.5px;
