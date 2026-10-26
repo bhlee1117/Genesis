@@ -214,6 +214,58 @@ label.checkbox {
 }
 .made-name { font-weight: 600; }
 
+/* --- picking a parent -------------------------------------------------- */
+/* A radio list is the right control for three things and the wrong one
+   for thirty. */
+.cand-pick {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+}
+.cand-pick-label { font-weight: 600; font-size: 12px; color: var(--text); }
+.cand-pick select {
+  flex: 1 1 320px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+/* The full table stays, behind a disclosure, for comparing them. */
+.cand-rest { margin-top: 2px; }
+.fold-away { margin: 2px 0 6px; }
+
+/* --- a sequence the inventory does not have --------------------------- */
+.module-wrap { margin-bottom: 2px; }
+.module-row.is-literal { border-left: 3px solid var(--accent); }
+.literal-note {
+  font-size: 11.5px;
+  color: var(--accent);
+  font-weight: 600;
+  align-self: center;
+}
+.row-buttons button.is-on {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+.literal-box {
+  margin: 2px 0 8px 26px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.literal-box textarea {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  resize: vertical;
+}
+.literal-status { margin: 4px 0 6px; }
+.literal-status .bad { color: var(--error-text); font-weight: 600; }
+
 /* --- stop and look before the next step ------------------------------- */
 /* The step people skip is the one that would have told them, so it does
    not look like the rest of the list. */

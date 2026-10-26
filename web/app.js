@@ -1943,14 +1943,24 @@ function moduleRow(mod, i, focus) {
     requestAnimationFrame(function () { modeSel.focus(); });
   }
 
-  return h('div', { class: 'module-row' + (isCreLox(mod.type) ? ' is-crelox' : '') },
+  var custom = customSeqEditor(mod, i);
+
+  return h('div', { class: 'module-wrap' },
+    h('div', { class: 'module-row' + (isCreLox(mod.type) ? ' is-crelox' : '')
+                      + (mod.seq ? ' is-literal' : '') },
     h('span', { class: 'module-index' }, String(i + 1)),
     typeSel,
     modeSel,
-    picker.node,
-    picker.formFilter,
-    picker.chip,
+    mod.seq ? h('span', { class: 'literal-note' },
+                'own sequence, ' + bp(cleanDna(mod.seq).length)) : picker.node,
+    mod.seq ? null : picker.formFilter,
+    mod.seq ? null : picker.chip,
     h('div', { class: 'row-buttons' },
+      h('button', {
+        type: 'button', class: mod.seq ? 'is-on' : '',
+        title: mod.seq ? 'Edit the sequence' : 'Paste your own sequence',
+        onclick: function () { custom.toggle(); }
+      }, 'DNA'),
       h('button', {
         type: 'button', title: 'Move up', disabled: i === 0,
         onclick: function () { swapModules(i, i - 1); }
@@ -1962,7 +1972,8 @@ function moduleRow(mod, i, focus) {
       h('button', {
         type: 'button', class: 'danger', title: 'Remove',
         onclick: function () { state.modules.splice(i, 1); renderModules(); }
-      }, '×')));
+      }, '×'))),
+    custom.node);
 }
 
 /**
@@ -1994,8 +2005,103 @@ var LOX_OF = { DIO: ['lox2272', 'loxP'], FLEX: ['lox2272', 'loxP'],
                FAS: ['loxFAS', 'loxP'], DO: ['lox2272', 'loxP'] };
 
 function nominalBp(mod) {
+  // A sequence that was typed in is not nominal; it is the length.
+  if (mod.seq) return cleanDna(mod.seq).length || 1;
   if (mod.part_bp) return Number(mod.part_bp);
   return NOMINAL_BP[mod.type] || 300;
+}
+
+/** Only the bases, out of whatever was pasted.
+
+   People paste FASTA, they paste a GenBank ORIGIN block with its line
+   numbers, they paste something with a space every ten. It is all the
+   same sequence. */
+function cleanDna(text) {
+  return String(text || '')
+    .replace(/^>.*$/gm, '')
+    .replace(/[^A-Za-z]/g, '')
+    .toUpperCase();
+}
+
+/** A box for a sequence the inventory does not have.
+
+   Some parts are not in any plasmid here yet - a tag out of a paper, a
+   linker somebody designed this morning. Genesis has always taken a
+   literal sequence through the API and had nowhere to type one. */
+function customSeqEditor(mod, i) {
+  var box = h('div', { class: 'literal-box', hidden: 'hidden' });
+  var status = h('div', { class: 'literal-status muted small' }, '');
+  var area = h('textarea', {
+    rows: '4', spellcheck: 'false',
+    placeholder: "Paste DNA 5' to 3'. FASTA headers, numbers and spaces "
+                 + "are ignored.",
+    oninput: function (e) { review(e.target.value); }
+  });
+  area.value = mod.seq || '';
+
+  function review(raw) {
+    var dna = cleanDna(raw);
+    var bad = dna.replace(/[ACGTUNRYKMSWBDHV]/g, '');
+    var notes = [], wrong = false;
+    if (!dna) {
+      notes.push('empty - the row goes back to searching the inventory');
+    } else {
+      notes.push(bp(dna.length));
+      if (bad) {
+        wrong = true;
+        notes.push('not DNA: ' + Array.from(new Set(bad.split(''))).join(' '));
+      }
+      if (mod.type === 'CDS') {
+        if (dna.length % 3) {
+          wrong = true;
+          notes.push('NOT a multiple of 3 - this shifts the frame');
+        } else {
+          notes.push('a whole number of codons');
+          var prot = translateDna(dna);
+          var inner = prot.slice(0, -1).indexOf('*');
+          if (inner >= 0) {
+            wrong = true;
+            notes.push('stop codon at residue ' + (inner + 1)
+                       + ', inside the sequence');
+          }
+        }
+      }
+    }
+    clear(status);
+    status.appendChild(h('span', { class: wrong ? 'bad' : '' },
+                         notes.join(' \u00b7 ')));
+    return dna;
+  }
+
+  box.appendChild(area);
+  box.appendChild(status);
+  box.appendChild(h('div', { class: 'button-row' },
+    h('button', {
+      type: 'button', class: 'primary',
+      onclick: function () {
+        mod.seq = cleanDna(area.value);
+        if (mod.seq) mod.part_id = null;   // a literal is not a pinned part
+        renderModules();
+        renderSpecPreview();
+      }
+    }, 'Use this sequence'),
+    h('button', {
+      type: 'button',
+      onclick: function () {
+        mod.seq = '';
+        renderModules();
+        renderSpecPreview();
+      }
+    }, 'Clear')));
+  review(area.value);
+
+  return {
+    node: box,
+    toggle: function () {
+      box.hidden = !box.hidden;
+      if (!box.hidden) area.focus();
+    }
+  };
 }
 
 /** Build the sketch's feature list from the modules as typed. */
@@ -2205,6 +2311,9 @@ function collectSpec() {
       // reading the module's *name* as a mode when it is absent, so a
       // Cre-lox row always states it.
       if (isCreLox(m.type)) out.mode = creLoxMode(m.mode).key;
+      // A sequence typed in by hand is the part: the server takes it as
+      // given and orders it rather than hunting the inventory for it.
+      if (m.seq) out.seq = m.seq;
       return out;
     })
   };
@@ -3496,7 +3605,26 @@ function renderCandidates(plan) {
       return (r.carries || []).join(',')
            !== (recipients[0].carries || []).join(',');
     });
-    var list = h('div', { class: 'cand-list' + (varies ? '' : ' cand-nohas') });
+    /* Six rows of radio buttons to pick one thing is a list pretending
+       to be a control. The chosen one shows as a row - with its score,
+       its owner and its map - and the rest live in the select until
+       somebody wants to change it. */
+    lists.appendChild(candidatePicker(
+      'Start from', recipients, chosenBackbone,
+      function (r) {
+        return r.exact_run + '/' + (cand.modules || []).length + '  '
+             + r.name + '  ' + bp(r.length)
+             + (r.owner ? ' - ' + r.owner : '')
+             + (r.exact ? '' : '  (variant)');
+      },
+      function (r) {
+        $('spec-backbone').value = String(r.plasmid_id);
+        showCandidateMap(panelFor('recipient'), r.plasmid_id, wants,
+                         'recipient');
+        replan();
+      }));
+    var list = h('div', { class: 'cand-list cand-rest'
+                          + (varies ? '' : ' cand-nohas') });
     list.appendChild(h('div', { class: 'cand-row cand-head' },
       h('span', null, ''),
       h('span', { class: 'cand-score' }, 'has'),
@@ -3544,7 +3672,8 @@ function renderCandidates(plan) {
                : h('span', { class: 'cand-has' }, ''));
       list.appendChild(row);
     });
-    lists.appendChild(list);
+    lists.appendChild(foldAway(
+      'compare all ' + recipients.length + ' side by side', list));
   }
 
   if (donors.length) {
@@ -3557,12 +3686,35 @@ function renderCandidates(plan) {
       if (d.note) {
         box.appendChild(h('p', { class: 'issue issue-warning' }, d.note));
       }
-      (d.options || []).forEach(function (o) {
+      var opts = d.options || [];
+      var ids0 = partIdsFor(plan, d.covers || []);
+      var picked = opts.filter(function (o) {
+        return ids0.length && ids0.every(function (id) {
+          return pinnedSources[id] === o.plasmid_id;
+        });
+      })[0];
+      box.appendChild(candidatePicker(
+        'use', opts, picked ? picked.plasmid_id : null,
+        function (o) {
+          return o.name + '  ' + bp(o.length)
+               + (o.owner ? ' - ' + o.owner : '')
+               + (o.exact ? '  (exact)' : '  (variant)');
+        },
+        function (o) {
+          ids0.forEach(function (id) { pinnedSources[id] = o.plasmid_id; });
+          showCandidateMap(panelFor('donor' + di), o.plasmid_id,
+                           d.covers || [],
+                           'donor ' + (di + 1) + ' \u2014 '
+                           + (d.covers || []).join(' + '));
+          replan();
+        }));
+      var rest = h('div', { class: 'cand-list cand-rest' });
+      opts.forEach(function (o) {
         var ids = partIdsFor(plan, d.covers || []);
         var on = ids.length && ids.every(function (id) {
           return pinnedSources[id] === o.plasmid_id;
         });
-        box.appendChild(h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
+        rest.appendChild(h('label', { class: 'cand-row' + (on ? ' cand-on' : '') },
           h('input', {
             type: 'radio', name: 'cand-donor-' + (d.covers || []).join('-'),
             checked: on ? 'checked' : null,
@@ -3591,6 +3743,10 @@ function renderCandidates(plan) {
           h('span', { class: 'muted small cand-has' },
             (o.carries || []).length ? 'has ' + o.carries.join(', ') : '')));
       });
+      if (opts.length > 1) {
+        box.appendChild(foldAway(
+          'compare all ' + opts.length + ' side by side', rest));
+      }
       lists.appendChild(box);
     });
   }
@@ -4937,6 +5093,52 @@ function checkpointBlock(step) {
     ], c.troubles));
   }
   return box;
+}
+
+/** A link that reveals a node, for a table that is worth having and
+   not worth showing until it is asked for. */
+function foldAway(label, node) {
+  node.hidden = true;
+  var link = h('button', {
+    type: 'button', class: 'link-button',
+    onclick: function () {
+      node.hidden = !node.hidden;
+      link.textContent = node.hidden ? label : 'hide';
+    }
+  }, label);
+  return h('div', { class: 'fold-away' }, link, node);
+}
+
+/** One chosen parent, with the rest folded into a select.
+
+   A radio list is the right control for three things and the wrong
+   one for thirty: the picker scrolls, every option is on screen
+   whether or not it is a contender, and the one that matters - the
+   chosen one - looks exactly like the others. */
+function candidatePicker(label, rows, chosenId, describe, onPick) {
+  if (!rows || rows.length < 2) return h('div', null);
+  var chosen = rows.filter(function (r) {
+    return r.plasmid_id === chosenId;
+  })[0] || rows[0];
+
+  var select = h('select', {
+    onchange: function (e) {
+      var pick = rows[Number(e.target.value)];
+      if (pick) onPick(pick);
+    }
+  }, rows.map(function (r, i) {
+    return h('option', {
+      value: String(i),
+      selected: r === chosen ? 'selected' : null
+    }, describe(r));
+  }));
+
+  return h('div', { class: 'cand-pick' },
+    h('label', { class: 'cand-pick-label' }, label),
+    select,
+    h('span', { class: 'muted small' },
+      rows.length + ' candidate' + (rows.length === 1 ? '' : 's')
+      + ' \u00b7 ranked best first'));
 }
 
 function statPair(label, value) {

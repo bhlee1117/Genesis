@@ -5737,6 +5737,76 @@ class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
             self.assertTrue(any(wanted in i for i in items), wanted)
 
 
+class TestASequenceTypedInIsThePart(unittest.TestCase):
+    """Some parts are not in any plasmid here yet.
+
+    A tag out of a paper, a linker somebody designed this morning:
+    Genesis has always taken a literal sequence through the API and had
+    nowhere to type one.
+    """
+
+    def test_a_literal_sequence_resolves_without_the_inventory(self):
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'lit',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 400), 3006)).lastrowid
+        conn.commit()
+        mine = orf(40, 401)
+        plan = design(conn, ConstructSpec(
+            "literal", backbone_plasmid_id=bb,
+            modules=[Module("CDS", "myTag", seq=mine)]), cfg)
+        self.assertIn(mine.upper(),
+                      plan["construct"]["sequence"].upper())
+        got = [m for m in plan["modules"] if m["part_name"] == "myTag"]
+        self.assertTrue(got)
+        self.assertEqual(got[0]["length"], len(mine))
+        conn.close()
+
+    def test_it_is_ordered_rather_than_hunted_for(self):
+        """There is no lab source for a sequence nobody has, so the
+        plan has to say it gets synthesised rather than quietly pick a
+        plasmid that looks similar."""
+        import hashlib
+        conn = connect(":memory:")
+        cfg = Config()
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'lit2',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 402), 3006)).lastrowid
+        conn.commit()
+        mine = orf(60, 403)
+        plan = design(conn, ConstructSpec(
+            "literal", backbone_plasmid_id=bb,
+            modules=[Module("CDS", "myTag", seq=mine)]), cfg)
+        frag = [f for f in plan["fragments"] if f["name"] == "myTag"]
+        self.assertTrue(frag)
+        self.assertTrue(frag[0]["needs_synthesis"])
+        conn.close()
+
+    def test_the_browser_sends_it_and_cleans_it_first(self):
+        """People paste FASTA, and GenBank ORIGIN blocks with their
+        line numbers. All of it is the same sequence."""
+        app = (Path(__file__).resolve().parent.parent
+               / "web" / "app.js").read_text()
+        self.assertIn("function cleanDna", app)
+        self.assertIn("function customSeqEditor", app)
+        # the spec payload has to carry it, or none of it reaches here
+        self.assertIn("if (m.seq) out.seq = m.seq;", app)
+        # and the server has to accept it
+        self.assertIn("seq", str(Module.__dataclass_fields__))
+
+    def test_the_spec_round_trips_a_literal(self):
+        spec = ConstructSpec.from_dict({
+            "name": "x", "circular": True,
+            "modules": [{"type": "CDS", "name": "mine", "seq": "acgtACGT"}]})
+        self.assertEqual(spec.modules[0].seq, "acgtACGT")
+
+
 class TestAShortElementRidesOnThePrimerTails(unittest.TestCase):
     """P2A is 66 bp, and it was getting its own PCR.
 
