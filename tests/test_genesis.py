@@ -5737,6 +5737,113 @@ class TestTheReagentListIsWhatYouActuallyMix(unittest.TestCase):
             self.assertTrue(any(wanted in i for i in items), wanted)
 
 
+class TestAJoinIsNotEveryBoundary(unittest.TestCase):
+    """Two different things were being called a junction.
+
+    A join is where two amplicons meet, and only there is there an
+    overlap arm whose GC and Tm decide whether the assembly works. A
+    boundary between two annotated elements matters for the reading
+    frame and is usually in the middle of one PCR product, with no arm
+    between them at all.
+
+    Reporting all of them as HiFi joins gave seventeen rows for a
+    three-fragment assembly and warned that "the overlap arm is only
+    24% GC" between the AmpR promoter and AmpR - a redesign of a
+    primer that does not exist.
+    """
+
+    LAYOUT = [
+        {"name": "CAG", "type": "promoter", "start": 0, "end": 300},
+        {"name": "gene", "type": "CDS", "start": 300, "end": 900},
+        {"name": "AmpR promoter", "type": "promoter",
+         "start": 900, "end": 1000},
+        {"name": "AmpR", "type": "resistance", "start": 1000, "end": 1600},
+    ]
+
+    def _seq(self):
+        return (rand_seq(300, 600) + orf(199, 601)[:600]
+                + "AT" * 50 + "AT" * 300)[:1600]
+
+    def test_only_the_named_positions_are_joins(self):
+        from genesis.primers import analyse_junctions
+        js = analyse_junctions(self.LAYOUT, self._seq(), "hifi", Config(),
+                               joins={300})
+        self.assertEqual([j.is_join for j in js], [True, False, False])
+        self.assertEqual([j.overlap_length for j in js], [25, 0, 0])
+        self.assertEqual([j.method for j in js], ["hifi", "", ""])
+
+    def test_no_overlap_warning_where_there_is_no_overlap(self):
+        """An AT-rich boundary inside one amplicon is not a low-Tm
+        overlap arm; it is not an arm."""
+        from genesis.primers import analyse_junctions
+        js = analyse_junctions(self.LAYOUT, self._seq(), "hifi", Config(),
+                               joins={300})
+        for j in js:
+            if j.is_join:
+                continue
+            self.assertFalse([w for w in j.warnings if "overlap" in w],
+                             j.warnings)
+
+    def test_the_frame_check_still_runs_everywhere(self):
+        """A CDS that is not a multiple of three puts the next one out
+        of frame whether or not anything is joined there."""
+        from genesis.primers import analyse_junctions
+        layout = [{"name": "a", "type": "CDS", "start": 0, "end": 100},
+                  {"name": "b", "type": "CDS", "start": 100, "end": 400}]
+        js = analyse_junctions(layout, rand_seq(400, 602), "hifi", Config(),
+                               joins=set())
+        self.assertFalse(js[0].is_join)
+        self.assertEqual(js[0].frame_shift, 1)
+        self.assertTrue(any("out of frame" in w for w in js[0].warnings))
+
+    def test_without_a_join_set_every_boundary_counts(self):
+        """The old behaviour, for a caller that has not worked out its
+        pieces."""
+        from genesis.primers import analyse_junctions
+        js = analyse_junctions(self.LAYOUT, self._seq(), "hifi", Config())
+        self.assertTrue(all(j.is_join for j in js))
+
+    def test_a_real_plan_has_one_join_per_piece(self):
+        import sqlite3
+        from genesis.config import Config as C
+        conn = connect(":memory:")
+        cfg = C()
+        import hashlib
+        bb = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pBB','t',?,?,'jn',1,'sequence_verified')""",
+            ("GAATTC" + rand_seq(3000, 603), 3006)).lastrowid
+        seq = orf(150, 604)
+        donor = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pD','t',?,?,'jnd',1,'sequence_verified')""",
+            (seq + rand_seq(2000, 605), len(seq) + 2000)).lastrowid
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length) VALUES ('CDS','gene',?,?,?)""",
+            (seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("""INSERT INTO part_occurrence(part_id, plasmid_id,
+                        start, end, strand) VALUES (?,?,0,?,1)""",
+                     (part, donor, len(seq)))
+        conn.commit()
+        plan = design(conn, ConstructSpec("j", backbone_plasmid_id=bb,
+                                          modules=[Module("CDS", "gene")]),
+                      cfg)
+        hifi = next(r for r in plan["routes"] if r["id"] == "hifi")
+        pcrs = sum(1 for s in hifi["steps"] if s["operation"] == "PCR")
+        joins = [j for j in hifi["junctions"] if j["is_join"]]
+        self.assertLessEqual(len(joins), pcrs,
+                             "more joins than there are pieces to join")
+        for j in hifi["junctions"]:
+            if not j["is_join"]:
+                self.assertEqual(j["overlap_length"], 0)
+                self.assertEqual(j["method"], "")
+        conn.close()
+
+
 class TestTheDesignSaysWhatItIsDoing(unittest.TestCase):
     """Planning takes the better part of a minute, and a button that
     goes grey for forty seconds looks like a button that has broken."""

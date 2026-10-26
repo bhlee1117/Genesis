@@ -5318,20 +5318,56 @@ function renderRouteDetail(route) {
     return h('span', null, name,
       h('span', { class: 'muted small' }, ' (' + (type || '') + ')'));
   };
-  card.appendChild(h('h4', null, 'Junctions (' + junctions.length + ')'));
-  card.appendChild(table([
-    { label: '#', numeric: true, key: 'index' },
-    { label: 'Left', cell: function (j) { return side(j.left_name, j.left_type); } },
-    { label: 'Right', cell: function (j) { return side(j.right_name, j.right_type); } },
-    { label: 'Method', key: 'method' },
-    { label: 'Overlap', numeric: true, key: 'overlap_length' },
-    { label: 'Frame shift', numeric: true, key: 'frame_shift' },
-    { label: 'Added residues', cell: function (j) {
-        return h('span', { class: 'mono' }, j.added_residues || ''); } },
-    { label: 'Sequence', cell: function (j) {
-        return h('span', { class: 'mono seq' }, String(j.sequence || '').toUpperCase()); } },
-    { label: 'Warnings', cell: function (j) { return warnCell(j.warnings); } }
-  ], junctions));
+  /* Two different things were in one table. A join is where two
+     amplicons meet and has an overlap arm whose GC decides whether the
+     assembly works; a boundary between two annotated elements matters
+     for the reading frame and nothing is joined there at all. Calling
+     all seventeen of them HiFi joins warned that the arm between the
+     AmpR promoter and AmpR was 24% GC - a redesign of a primer that
+     does not exist. */
+  var joins = junctions.filter(function (j) { return j.is_join; });
+  var rest = junctions.filter(function (j) {
+    return !j.is_join && ((j.warnings || []).length || j.frame_shift);
+  });
+
+  card.appendChild(h('h4', null,
+    'Assembly joins (' + joins.length + ')'));
+  if (!joins.length) {
+    card.appendChild(h('p', { class: 'muted small' },
+      'This route does not itemise its joins; the step list says how '
+      + 'much homology each piece carries.'));
+  } else {
+    card.appendChild(h('p', { class: 'muted small' },
+      'Where two pieces meet. The overlap arm is the shared sequence '
+      + 'that anneals them.'));
+    card.appendChild(table([
+      { label: 'Left', cell: function (j) { return side(j.left_name, j.left_type); } },
+      { label: 'Right', cell: function (j) { return side(j.right_name, j.right_type); } },
+      { label: 'Method', key: 'method' },
+      { label: 'Overlap', numeric: true, key: 'overlap_length' },
+      { label: 'Sequence', cell: function (j) {
+          return h('span', { class: 'mono seq' },
+                   String(j.sequence || '').toUpperCase()); } },
+      { label: 'Warnings', cell: function (j) { return warnCell(j.warnings); } }
+    ], joins));
+  }
+
+  if (rest.length) {
+    card.appendChild(h('h4', null,
+      'Element boundaries worth checking (' + rest.length + ')'));
+    card.appendChild(h('p', { class: 'muted small' },
+      'Inside the pieces, so nothing is joined here - but a part that '
+      + 'is not a multiple of three puts whatever follows it out of '
+      + 'frame.'));
+    card.appendChild(table([
+      { label: 'Left', cell: function (j) { return side(j.left_name, j.left_type); } },
+      { label: 'Right', cell: function (j) { return side(j.right_name, j.right_type); } },
+      { label: 'Frame shift', numeric: true, key: 'frame_shift' },
+      { label: 'Added residues', cell: function (j) {
+          return h('span', { class: 'mono' }, j.added_residues || ''); } },
+      { label: 'Warnings', cell: function (j) { return warnCell(j.warnings); } }
+    ], rest));
+  }
 
   return card;
 }

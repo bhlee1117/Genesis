@@ -586,7 +586,12 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
 
     route.steps = renumber(steps)
     route.primers = primers
-    route.junctions = analyse_junctions(construct.layout, construct.seq, "hifi", cfg)
+    # Where the amplicons actually meet, as opposed to every boundary
+    # between two annotated elements: three joins in a three-fragment
+    # assembly, not one per annotation.
+    joins = {o["at"] for o in ordered if isinstance(o.get("at"), int)}
+    route.junctions = analyse_junctions(construct.layout, construct.seq,
+                                        "hifi", cfg, joins=joins)
     route.warnings += check_overlap_uniqueness(construct.layout, construct.seq, cfg)
     for j in route.junctions:
         route.warnings += [f"junction {j.index} ({j.left_name}|{j.right_name}): {w}"
@@ -755,7 +760,8 @@ def plan_gblock_route(conn: sqlite3.Connection, construct: AssembledConstruct,
     route.steps = renumber(steps)
     route.primers = primers
     route.junctions = analyse_junctions(construct.layout, construct.seq,
-                                        "gblock", cfg)
+                                        "gblock", cfg,
+                                        joins=_insert_joins(construct))
     route.warnings.append(
         f"one fragment to order and one reaction to run, against "
         f"{len(construct.backbone_segments)} arc(s) of recipient kept")
@@ -903,7 +909,8 @@ def plan_restriction_route(conn: sqlite3.Connection, construct: AssembledConstru
     route.steps = renumber(steps)
     route.primers = primers
     route.junctions = analyse_junctions(construct.layout, construct.seq,
-                                        "ligation", cfg)
+                                        "ligation", cfg,
+                                        joins=_insert_joins(construct))
     route.warnings += best["warnings"]
     for p in primers:
         route.warnings += [f"primer {p.name}: {w}" for w in p.warnings]
@@ -1336,6 +1343,22 @@ def _split_into_tails(up_rev: Primer, down_fwd: Primer, element: str,
                 f"the 100 nmole scale with PAGE purification, since a "
                 f"truncated chain from a long synthesis still anneals and "
                 f"then seeds a deletion")
+
+
+def _insert_joins(construct) -> set:
+    """Where the two pieces meet when one insert goes into one vector.
+
+    The gene-block and restriction routes put a single piece into a
+    single opened vector, so there are exactly two joins however many
+    annotated elements the insert happens to contain. Without this they
+    reported one join per element, each with an overlap arm that does
+    not exist.
+    """
+    items = [it for it in (getattr(construct, "layout", None) or [])]
+    inside = [i for i, it in enumerate(items) if it.get("type") != "backbone"]
+    if not inside:
+        return set()
+    return {items[inside[0]]["start"], items[inside[-1]]["end"]}
 
 
 def _carry(fwd: Primer, extra: str, route: "Route",

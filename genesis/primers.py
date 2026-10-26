@@ -61,6 +61,9 @@ class Junction:
     overlap_length: int = 0
     frame_shift: int = 0
     added_residues: str = ""
+    #: Whether two amplicons actually meet here, as opposed to this
+    #: being a boundary between two elements inside one of them.
+    is_join: bool = True
     warnings: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -519,19 +522,44 @@ def pick_overlap(neighbour: str, cfg: Config, from_end: bool = True,
 
 
 def analyse_junctions(layout: list[dict], seq: str, method: str,
-                      cfg: Config) -> list[Junction]:
-    """Describe every module boundary, including its effect on the frame."""
+                      cfg: Config, joins: set | None = None) -> list[Junction]:
+    """Describe every module boundary, and which of them are real joins.
+
+    Two different things used to be called a junction. A boundary
+    between two annotated elements matters for the reading frame - a
+    CDS that is not a multiple of three puts the next one out of frame
+    whether or not anything is joined there. A *join* is where two
+    amplicons meet, and only there is there an overlap arm whose GC and
+    Tm decide whether the assembly works.
+
+    Reporting all of them as HiFi joins with a 25 bp overlap gave
+    seventeen rows for a three-fragment assembly, and - worse - warned
+    that "the overlap arm is only 24% GC" at the boundary between the
+    AmpR promoter and AmpR, which sit in the middle of one PCR product
+    with no overlap arm between them at all. That is a redesign of a
+    primer that does not exist.
+
+    ``joins`` is the set of construct positions where one piece ends and
+    the next begins. Without it every boundary is treated as a join,
+    which is the old behaviour and is right for a caller that has not
+    worked out its pieces yet.
+    """
     junctions: list[Junction] = []
     for i in range(len(layout) - 1):
         left, right = layout[i], layout[i + 1]
         pos = left["end"]
         window = seq[max(pos - 15, 0): pos + 15]
+        is_join = joins is None or pos in joins
         j = Junction(
             index=i + 1, left_name=left["name"], right_name=right["name"],
-            left_type=left["type"], right_type=right["type"], method=method,
-            sequence=window,
-            overlap_length=cfg.overlap_length if method in ("gibson", "hifi") else 0,
+            left_type=left["type"], right_type=right["type"],
+            method=method if is_join else "",
+            sequence=window, is_join=is_join,
+            overlap_length=(cfg.overlap_length
+                            if is_join and method in ("gibson", "hifi")
+                            else 0),
         )
+
 
         both_coding = left["type"] in TRANSLATED and right["type"] in TRANSLATED
         if both_coding:
@@ -547,8 +575,9 @@ def analyse_junctions(layout: list[dict], seq: str, method: str,
                     f"{left['name']} ends in a stop codon, which will terminate "
                     f"translation before {right['name']}")
 
-        # GC-rich junctions are the ones that fail in HiFi assembly.
-        if method in ("gibson", "hifi"):
+        # GC-rich junctions are the ones that fail in HiFi assembly -
+        # and only where there is an arm to be GC-rich.
+        if is_join and method in ("gibson", "hifi"):
             arm = seq[max(pos - cfg.overlap_length, 0):pos]
             g = gc_fraction(arm)
             if g > 0.75:
