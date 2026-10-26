@@ -652,6 +652,53 @@ def _prefer_backbone_as_source(resolved: list, backbone: dict) -> list[str]:
     return moved
 
 
+def rides_on_a_primer_tail(resolved: list, cfg) -> list[str]:
+    """Parts the planner will write into a primer tail, not amplify.
+
+    P2A is 66 bp. Nobody runs a PCR whose primers are longer than its
+    product, so the planner splits a short element between the two
+    primers that flank it - which means there is no donor plasmid for
+    it, and offering a list of plasmids to take it from is offering a
+    choice that changes nothing.
+
+    The same rule the planner uses: short, with something long enough
+    to amplify on each side to carry the halves.
+    """
+    lengths = [len(rm.seq or "") for rm in resolved]
+    names = [rm.part_name or rm.module.name or rm.feature_type
+             for rm in resolved]
+    floor = getattr(cfg, "min_pcr_length", 100)
+    out = []
+    for i, length in enumerate(lengths):
+        if not length or length >= floor:
+            continue
+        before = any(x >= floor for x in lengths[:i])
+        after = any(x >= floor for x in lengths[i + 1:])
+        if before and after:
+            out.append(names[i])
+    return out
+
+
+def _drop_folded_donors(candidates: dict, resolved: list, cfg) -> None:
+    """Take the tail-borne parts out of the donor picker.
+
+    They stay named - "where did P2A go?" is a fair question - but as a
+    statement rather than as a list of plasmids to choose between.
+    """
+    folded = set(rides_on_a_primer_tail(resolved, cfg))
+    if not folded:
+        return
+    kept = []
+    for donor in candidates.get("donors") or []:
+        covers = donor.get("covers") or []
+        if covers and all(c in folded for c in covers):
+            continue           # nothing to choose: it rides on the tails
+        kept.append(donor)
+    candidates["donors"] = kept
+    candidates["n_donors"] = len([d for d in kept if d.get("options")])
+    candidates["on_primer_tails"] = sorted(folded)
+
+
 def _offer_to_order(candidates: dict, cfg) -> None:
     """Say what could be ordered for a part no lab plasmid carries.
 
@@ -715,6 +762,7 @@ def scan_sources(conn: sqlite3.Connection, spec: ConstructSpec,
         conn, spec, cfg,
         preferred_id=ranked[0]["plasmid_id"] if ranked else None)
 
+    _drop_folded_donors(candidates, resolved, cfg)
     _offer_to_order(candidates, cfg)
 
     return {
@@ -928,6 +976,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     candidates = architecture_candidates(
         conn, architecture, family=spec.vector or "",
         prefer_cassette=wants_cassette)
+    _drop_folded_donors(candidates, resolved, cfg)
     ranked = candidates.get("recipients", [])
     backbone = _load_backbone(
         conn, spec, cfg,

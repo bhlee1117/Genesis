@@ -5888,6 +5888,48 @@ class TestAShortElementRidesOnThePrimerTails(unittest.TestCase):
                           Route(id="r", strategy="hifi", title="t"))
         self.assertIn("ACGTACGTACGTACG", fwd.tail)
 
+    def test_it_is_not_offered_as_something_to_pick_a_donor_for(self):
+        """If it rides on the tails there is no plasmid to take it
+        from, and a picker for it offers a choice that changes
+        nothing."""
+        from genesis.design import rides_on_a_primer_tail, _drop_folded_donors
+        from genesis.construct import ResolvedModule, Module
+
+        def rm(name, length, ftype="CDS"):
+            return ResolvedModule(Module(ftype, name), None, name,
+                                  "A" * length, ftype, [], [])
+
+        resolved = [rm("prom", 500, "promoter"), rm("cds1", 900),
+                    rm("P2A", 66, "p2A"), rm("cds2", 800)]
+        self.assertEqual(rides_on_a_primer_tail(resolved, Config()), ["P2A"])
+
+        cands = {"donors": [{"covers": ["cds1"], "options": [{"a": 1}]},
+                            {"covers": ["P2A"], "options": [{"a": 2}]},
+                            {"covers": ["cds2"], "options": [{"a": 3}]}],
+                 "n_donors": 3}
+        _drop_folded_donors(cands, resolved, Config())
+        self.assertEqual([d["covers"] for d in cands["donors"]],
+                         [["cds1"], ["cds2"]])
+        self.assertEqual(cands["n_donors"], 2)
+        self.assertEqual(cands["on_primer_tails"], ["P2A"])
+
+    def test_a_short_part_with_nothing_after_it_keeps_its_picker(self):
+        """The fold needs a tail on each side. A short element at the
+        end of the architecture is not folded, so it still needs a
+        donor and still gets one to choose."""
+        from genesis.design import rides_on_a_primer_tail
+        from genesis.construct import ResolvedModule, Module
+
+        def rm(name, length, ftype="CDS"):
+            return ResolvedModule(Module(ftype, name), None, name,
+                                  "A" * length, ftype, [], [])
+
+        self.assertEqual(
+            rides_on_a_primer_tail(
+                [rm("prom", 500, "promoter"), rm("cds1", 900),
+                 rm("P2A", 66, "p2A")], Config()),
+            [])
+
     def test_p2a_between_two_cds_is_not_its_own_reaction(self):
         """End to end: the element goes in the tails, the assembly
         rebuilds it once, and the two proteins stay in one frame."""

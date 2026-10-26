@@ -234,6 +234,7 @@ label.checkbox {
 /* The full table stays, behind a disclosure, for comparing them. */
 .cand-rest { margin-top: 2px; }
 .fold-away { margin: 2px 0 6px; }
+.fold-note { margin: 4px 0 8px; font-style: italic; }
 
 /* --- a sequence the inventory does not have --------------------------- */
 .module-wrap { margin-bottom: 2px; }

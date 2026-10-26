@@ -3676,6 +3676,22 @@ function renderCandidates(plan) {
       'compare all ' + recipients.length + ' side by side', list));
   }
 
+  /* Parts that ride on a primer tail have no donor to choose: the
+     planner writes them into the two oligos that flank them. Saying so
+     once is the answer to "where did P2A go?"; a picker for them would
+     be offering a choice that changes nothing. */
+  var folded = cand.on_primer_tails || [];
+  if (folded.length) {
+    lists.appendChild(h('p', { class: 'muted small fold-note' },
+      folded.join(', ')
+      + (folded.length === 1 ? ' is' : ' are')
+      + ' too short to amplify, so '
+      + (folded.length === 1 ? 'it is' : 'they are')
+      + ' written into the primer tails of the parts on either side '
+      + '\u2014 there is no plasmid to take '
+      + (folded.length === 1 ? 'it' : 'them') + ' from.'));
+  }
+
   if (donors.length) {
     var n = cand.n_donors || 0;
     lists.appendChild(h('h4', null,
