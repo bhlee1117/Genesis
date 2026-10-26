@@ -24,6 +24,7 @@ import re
 import sqlite3
 
 from .seqtools import find_orfs, translate
+from .vocab import classify_label
 
 #: Shortest inferred CDS worth cataloguing.  Below this the hit rate on
 #: chance reading frames climbs fast, and a real payload is never this small.
@@ -69,7 +70,12 @@ _CODING = ("CDS", "resistance", "trafficking_motif", "tag", "linker", "p2A")
 #: Elements an ORF has no business overlapping.  A reading frame that runs
 #: through the origin or an ITR is an artefact of a circular sequence, not
 #: a payload.
-_STRUCTURAL = ("origin", "AAV_ITR", "lox_site", "WPRE", "polyA", "promoter")
+#: ``intron`` belongs here for the same reason as ``promoter``: the CAG
+#: cassette's chimeric intron is a kilobase of GC-rich DNA, it reads as a
+#: 202 aa Ala/Arg/Pro protein in one frame, and a spliced-out intron is
+#: the one part of a transcript that is certainly not translated.
+_STRUCTURAL = ("origin", "AAV_ITR", "lox_site", "WPRE", "polyA", "promoter",
+               "intron")
 
 #: Name fragments that describe the vector rather than the insert.
 _NAME_NOISE = {
@@ -96,6 +102,9 @@ _NAME_NOISE = {
     "builder", "deisseroth", "boyden", "schnitzer", "synp", "fubi", "tra",
     "pcrprdt", "pcrprdt2", "prdt", "product", "amplicon", "digest",
     "ha", "flag", "myc", "his", "v5",
+    # A named gap between two elements, which several files on the share
+    # carry between the WPRE and the polyA.
+    "spacer", "stuffer", "filler", "linker2", "pad",
 }
 
 #: A lab stock code: initials plus a number, like YD043 or LZF1605.
@@ -132,6 +141,24 @@ def _is_stock_code(token: str, position: int) -> bool:
     return position == 0 or token.upper() == token
 
 
+def _names_an_element(token: str) -> bool:
+    """Whether the vocabulary already knows this token as a non-CDS part.
+
+    `_NAME_NOISE` is hand-kept, so it is always one word behind the share.
+    "pcag-egfp-wpre-spacer-sv40dts" offered "sv40dts" as the name of an
+    EGFP for exactly that reason: nobody had thought to write "sv40dts"
+    down, and it was simply the longest token left standing.
+
+    The vocabulary had thought about it, though - typing labels is what it
+    does - so ask it rather than growing the list by one word per bug
+    report.  Anything it reads as a promoter, a polyA, an enhancer or a
+    resistance marker is a piece of the plasmid that is not the insert.
+    "unknown" is the useful answer here: a protein name is precisely the
+    thing the vocabulary has no rule for.
+    """
+    return classify_label(token) not in ("", "unknown", "CDS")
+
+
 def name_from_plasmid(plasmid_name: str) -> str | None:
     """Pull the likely insert name out of a plasmid name.
 
@@ -145,6 +172,7 @@ def name_from_plasmid(plasmid_name: str) -> str | None:
             if t.lower() not in _NAME_NOISE
             and not _is_vector_name(t)
             and not _is_stock_code(t, i)
+            and not _names_an_element(t)
             and len(t) >= 3
             and not t.isdigit()]
     if not keep:
@@ -230,8 +258,17 @@ def candidate_orfs(seq: str, circular: bool, annotations: list[dict]) -> list[di
         if sum(_overlap(o["start"], o["end"], a["start"], a["end"])
                for a in coding) / span >= COVERED:
             continue
-        if any(_overlap(o["start"], o["end"], a["start"], a["end"])
-               > 0.5 * (a["end"] - a["start"]) for a in structural):
+        # Either way round.  Swallowing a promoter means the reading
+        # frame ran straight through it; sitting *inside* one means the
+        # frame is the promoter, read in a frame nobody transcribes.
+        # Only the first was tested, which is why 108 plasmids carry a
+        # 202 aa "CDS" that is the CAG promoter, and why one of them got
+        # into the catalogue as "Voltron" and then named the same
+        # stretch in thirty-four others.
+        if any(ov > 0.5 * (a["end"] - a["start"]) or ov > 0.5 * span
+               for a in structural
+               for ov in (_overlap(o["start"], o["end"],
+                                   a["start"], a["end"]),)):
             continue
         kept.append(o)
 
@@ -268,8 +305,35 @@ def payload_span(annotations: list[dict]) -> tuple[int, int] | None:
     return (start, stop) if stop - start >= 300 else None
 
 
+def _names_something_else(token: str, orf: dict, anns: list) -> bool:
+    """Is this token already the name of a different feature here?
+
+    "pcag-egfp-wpre-spacer-sv40dts" has five things in its name and the
+    longest leftover token is sv40dts - which is a real element of the
+    plasmid, 144 bp of SV40 nuclear targeting sequence at 3983-4127,
+    and not the 993 bp reading frame at 1533. Naming the ORF after it
+    produced an annotation that claimed to be something the plasmid
+    already had somewhere else, at seven times the length.
+
+    If the file already says where that name lives, and it is not
+    here, then it is not this ORF's name.
+    """
+    want = re.sub(r"[^a-z0-9]", "", (token or "").lower())
+    if not want:
+        return False
+    for a in anns or []:
+        other = re.sub(r"[^a-z0-9]", "", (a.get("name") or "").lower())
+        if other != want:
+            continue
+        if _overlap(orf["start"], orf["end"],
+                    a.get("start", 0), a.get("end", 0)) > 0:
+            return False       # it is this one, under another record
+        return True
+    return False
+
+
 def describe(orf: dict, index: ProteinIndex, plasmid_name: str,
-             is_payload: bool = True) -> dict:
+             is_payload: bool = True, anns: list | None = None) -> dict:
     """Name an inferred ORF, and say why it got that name.
 
     `is_payload` says whether this ORF is the thing the plasmid was built to
@@ -284,6 +348,10 @@ def describe(orf: dict, index: ProteinIndex, plasmid_name: str,
     # A plasmid called "...target..." names its insert no better than a
     # catalogue entry called "target" does.
     if from_name and _GENERIC_NAME.match(from_name):
+        from_name = None
+    # ...and a token that already names a different feature of this
+    # plasmid names that feature, not this reading frame.
+    if from_name and _names_something_else(from_name, orf, anns or []):
         from_name = None
 
     if match and match[0] >= IDENTICAL:
@@ -331,6 +399,37 @@ def infer_all(conn: sqlite3.Connection, limit: int | None = None,
     from .importer import extract_parts, _StoredSeq
 
     if refresh:
+        # The annotations go, but the parts they minted used to stay: an
+        # occurrence is keyed on coordinates, not on the annotation that
+        # argued for it.  So a wrong guess survived the refresh meant to
+        # undo it, kept its place in the protein index, and went on
+        # lending its name to the next run.  Retire any occurrence that
+        # nothing but an inferred ORF vouches for, then drop the parts
+        # that leaves with nothing pointing at them.
+        conn.execute("""CREATE TEMP TABLE _orf_orphans AS
+                        SELECT DISTINCT part_id FROM part_occurrence""")
+        conn.execute(
+            """DELETE FROM part_occurrence
+                WHERE EXISTS (SELECT 1 FROM annotation a
+                               WHERE a.plasmid_id = part_occurrence.plasmid_id
+                                 AND a.start = part_occurrence.start
+                                 AND a.end = part_occurrence.end
+                                 AND a.strand = part_occurrence.strand
+                                 AND a.evidence = 'orf')
+                  AND NOT EXISTS (SELECT 1 FROM annotation a
+                               WHERE a.plasmid_id = part_occurrence.plasmid_id
+                                 AND a.start = part_occurrence.start
+                                 AND a.end = part_occurrence.end
+                                 AND a.strand = part_occurrence.strand
+                                 AND a.evidence <> 'orf')""")
+        # Parts already unreferenced before this ran are somebody else's
+        # business; only the ones this pass stranded are removed.
+        conn.execute(
+            """DELETE FROM part
+                WHERE id IN (SELECT id FROM part WHERE id NOT IN
+                                 (SELECT part_id FROM part_occurrence))
+                  AND id IN (SELECT part_id FROM _orf_orphans)""")
+        conn.execute("DROP TABLE _orf_orphans")
         conn.execute("DELETE FROM annotation WHERE evidence = 'orf'")
 
     index = ProteinIndex(conn)
@@ -367,7 +466,16 @@ def infer_all(conn: sqlite3.Connection, limit: int | None = None,
 
         cands = candidate_orfs(p["seq"], bool(p["circular"]), anns)
         span = payload_span(anns)
-        if span is None and cands:
+        # A file that already annotates a coding sequence has said what
+        # this plasmid expresses.  Whatever reading frame is left over is
+        # not the payload, and must not be given the payload's name -
+        # that is how "CAG-Voltron-ST" came to call a frame inside its
+        # own chimeric intron "Voltron", and then, through the catalogue,
+        # called the same stretch of CAG "Voltron" in thirteen more.
+        spoken_for = any(a["feature_type"] == "CDS"
+                         and a["end"] - a["start"] >= MIN_ORF_AA * 3
+                         for a in anns)
+        if span is None and cands and not spoken_for:
             # No promoter/terminator pair to go on, so the longest reading
             # frame is the best guess at what this plasmid is for.
             longest = max(cands, key=lambda o: o["aa_length"])
@@ -384,7 +492,7 @@ def infer_all(conn: sqlite3.Connection, limit: int | None = None,
 
         for orf in cands:
             is_payload = id(orf) in payload_ids
-            d = describe(orf, index, p["name"], is_payload)
+            d = describe(orf, index, p["name"], is_payload, anns)
             if "identical to" in d["note"]:
                 named_by["catalogue" if d["confidence"] >= 0.8 else "variant"] += 1
             elif d["confidence"] >= 0.5:

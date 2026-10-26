@@ -81,6 +81,14 @@ _LABEL_RULES: list[tuple[str, str]] = [
      "Cre-lox"),
     (r"\bWPRE\b|woodchuck", "WPRE"),
     (r"poly[- ]?A|polyadenylation|\bbGH\b|\bSV40 ?pA\b", "polyA"),
+    # The SV40 "DTS" (DNA nuclear targeting sequence) is the 72-bp repeat
+    # enhancer, put into a plasmid for what it does to the DNA rather than
+    # to transcription: the factors it binds carry nuclear localisation
+    # signals, so the plasmid rides into the nucleus with them.  It is a
+    # cis-acting DNA element and is never translated, which is why it files
+    # with the enhancers and not with the tags - a tag here means a peptide,
+    # and the frame checks would try to read this one as protein.
+    (r"\bDTS\b|SV40[- _]?DTS|DNA nuclear targeting", "enhancer"),
     (r"\bIRES\b", "IRES"),
     (r"\b[PTEF]2A\b|\b2A (peptide|self)|self[- ]?cleav", "p2A"),
     (r"promot|\bCMV\b|\bEF1|\bhSyn\b|\bCaMKII|\bCAG\b|\bU6\b|\bTRE\b|\bPGK\b|\bSV40 ?prom", "promoter"),

@@ -3056,6 +3056,137 @@ class TestInferredORFs(unittest.TestCase):
         self.assertIsNone(payload_span(
             [{"feature_type": "promoter", "name": "hSyn", "start": 0, "end": 400}]))
 
+    def test_a_token_the_vocabulary_knows_is_not_an_insert_name(self):
+        # "pcag-egfp-wpre-spacer-sv40dts" named its EGFP "sv40dts": the
+        # longest token nobody had put on the hand-kept noise list.  The
+        # vocabulary had a rule for it, so the name list does not have to
+        # grow by a word for every element the share invents.
+        from genesis.orfs import name_from_plasmid as n, _names_an_element
+        self.assertEqual(n("pcag-egfp-wpre-spacer-sv40dts"), "egfp")
+        for token in ("sv40dts", "CAAX", "CaMKIIa", "PuroR", "T7",
+                      "SV40polyA", "minBGpromoter"):
+            self.assertTrue(_names_an_element(token), token)
+        # ...and the rule must not eat the protein names, which are
+        # precisely the tokens the vocabulary has no rule for.
+        for token in ("ASAP7y", "Voltron2", "iGluSnFR4f", "mCherry",
+                      "CheRiff", "egfp", "QuasAr2"):
+            self.assertFalse(_names_an_element(token), token)
+
+    def test_sv40_dts_is_a_dna_element_and_not_a_tag(self):
+        # It is the SV40 72-bp repeat, put in for what it does to the
+        # plasmid rather than to transcription.  It is never translated,
+        # so it must not land among the peptide tags, which the frame
+        # checks read as protein.
+        from genesis.vocab import classify_label
+        for label in ("SV40 DTS", "sv40dts", "DTS",
+                      "DNA nuclear targeting sequence"):
+            self.assertEqual(classify_label(label), "enhancer", label)
+        # the neighbouring SV40 elements keep their own verdicts
+        self.assertEqual(classify_label("SV40 polyA"), "polyA")
+        self.assertEqual(classify_label("SV40 promoter"), "promoter")
+        self.assertEqual(classify_label("SV40 ori"), "origin")
+
+    def test_an_orf_buried_in_a_promoter_is_not_a_gene(self):
+        # A GC-rich promoter read in a frame nobody transcribes gives a
+        # long Ala/Arg/Pro ORF.  Only an ORF that *swallowed* a structural
+        # element used to be rejected, so 108 plasmids carried a 202 aa
+        # "CDS" that was their CAG promoter - and one of them reached the
+        # catalogue as "Voltron" and renamed the same stretch elsewhere.
+        from genesis.orfs import candidate_orfs
+        orf = "ATG" + "GCC" * 300 + "TAA"
+        seq = "TTTT" * 50 + orf + "TTTT" * 50
+        start = 200
+        promoter = [{"feature_type": "promoter", "name": "CAG",
+                     "start": 0, "end": len(seq)}]
+        self.assertEqual(candidate_orfs(seq, False, promoter), [])
+        self.assertTrue(candidate_orfs(seq, False, []))
+        # an ORF merely abutting one is still a candidate
+        touching = [{"feature_type": "promoter", "name": "CAG",
+                     "start": 0, "end": start + 20}]
+        self.assertTrue(candidate_orfs(seq, False, touching))
+
+    def test_refresh_retires_the_parts_the_last_guess_minted(self):
+        # An occurrence is keyed on coordinates, not on the annotation
+        # that argued for it, so a wrong guess used to outlive the
+        # --refresh meant to undo it: part #2849 was the CAG promoter
+        # read in a dead frame, called "Voltron", and it stayed in the
+        # protein index lending that name to thirty-four other plasmids.
+        from genesis.orfs import infer_all
+        from genesis.seqtools import translate
+        conn = connect(":memory:")
+        aa = "M" + "".join(random.Random(9).choice("ACDEFGHIKLMNPQRSTVWY")
+                           for _ in range(250))
+        codon = {translate(a + b + c): a + b + c
+                 for a in "ACGT" for b in "ACGT" for c in "ACGT"}
+        cds = "".join(codon[r] for r in aa) + "TAA"
+        seq = "TTTT" * 100 + cds + "TTTT" * 100
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pTest-Fakease','t',?,?,'orfrefresh',0,
+                       'sequence_verified')""",
+            (seq, len(seq))).lastrowid
+        conn.commit()
+        infer_all(conn)
+        orf = conn.execute(
+            "SELECT start, end, strand FROM annotation "
+            "WHERE plasmid_id=? AND evidence='orf'", (pid,)).fetchone()
+        self.assertIsNotNone(orf, "the ORF should have been annotated")
+
+        # the state a confident run leaves behind: a part of its own,
+        # vouched for by nothing but that ORF.
+        part_id = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length, translated, confidence)
+               VALUES ('CDS','Fakease',?,'fakease',?,1,0.8)""",
+            (cds, len(cds))).lastrowid
+        conn.execute(
+            "INSERT INTO part_occurrence(part_id, plasmid_id, start, end, "
+            "strand) VALUES (?,?,?,?,?)",
+            (part_id, pid, orf["start"], orf["end"], orf["strand"]))
+        conn.commit()
+
+        infer_all(conn, refresh=True)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM part_occurrence "
+                         "WHERE part_id=?", (part_id,)).fetchone()[0], 0,
+            "refresh left an occurrence nothing but the old guess vouched for")
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM part WHERE id=?",
+                         (part_id,)).fetchone()[0], 0,
+            "refresh left a part with no occurrence pointing at it")
+        conn.close()
+
+    def test_refresh_keeps_a_part_the_file_also_vouches_for(self):
+        # The other half: an ORF that merely agreed with an annotation
+        # somebody made must not take that part down with it.
+        from genesis.orfs import infer_all
+        conn = connect(":memory:")
+        seq = "TTTT" * 100 + orf(150, 77) + "TTTT" * 100
+        pid = conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES ('pKeep','t',?,?,'orfkeep',0,'sequence_verified')""",
+            (seq, len(seq))).lastrowid
+        part_id = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length, translated, confidence)
+               VALUES ('CDS','RealThing','ATGTAA','keepme',6,1,1.0)"""
+        ).lastrowid
+        conn.execute("INSERT INTO part_occurrence(part_id, plasmid_id, start, "
+                     "end, strand) VALUES (?,?,10,20,1)", (part_id, pid))
+        conn.execute(
+            """INSERT INTO annotation(plasmid_id, feature_type, name, start,
+                    end, strand, evidence, confidence)
+               VALUES (?, 'CDS','RealThing',10,20,1,'file',1.0)""", (pid,))
+        conn.commit()
+        infer_all(conn, refresh=True)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM part WHERE id=?",
+                         (part_id,)).fetchone()[0], 1,
+            "refresh removed a part the file vouches for")
+        conn.close()
+
 
 class TestCloningSimulation(unittest.TestCase):
     """Replaying the protocol, rather than trusting its bookkeeping."""
