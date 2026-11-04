@@ -22,7 +22,7 @@ from pathlib import Path
 from .config import Config
 from .seqio import (READABLE_EXT, ParseError, Record, classify_role,
                     is_hidden_or_sidecar, read_record, sniff_format)
-from .seqtools import revcomp
+from .seqtools import revcomp, translate
 from .vocab import (classify_label, find_embedded_elements,
                     find_motifs, min_part_length, split_at_elements)
 
@@ -684,3 +684,194 @@ def reclassify(conn: sqlite3.Connection, progress=None) -> dict:
         "annotations_named": named,
         "parts_named": renamed_parts,
     }
+
+
+# --------------------------------------------------------------------------
+# Joining the fusion that several adjacent parts spell out
+# --------------------------------------------------------------------------
+
+#: How many bases may sit between two parts and still be one protein.
+#: Files leave a codon or two of cloning scar between a protein and its
+#: tag; more than that is a gap in the record, not a linker.
+MAX_FUSION_GAP = 6
+
+#: A run has to contain a real protein, not just a tag and a linker.
+MIN_FUSION_CORE = 150
+
+
+def _outermost_parts(items: list[dict]) -> list[dict]:
+    """Drop a part wholly covered by a longer one in the same place.
+
+    Files routinely draw the same stretch twice - a CDS key over the whole
+    thing and a labelled feature over its tag - and a nested copy would
+    break a run that is really contiguous.
+    """
+    keep = [i for i in items
+            if not any(j is not i and j["start"] <= i["start"]
+                       and j["end"] >= i["end"]
+                       and (j["end"] - j["start"]) > (i["end"] - i["start"])
+                       for j in items)]
+    seen: set = set()
+    out = []
+    for i in sorted(keep, key=lambda d: (d["start"], -(d["end"] - d["start"]))):
+        if (i["start"], i["end"]) in seen:
+            continue
+        seen.add((i["start"], i["end"]))
+        out.append(i)
+    return out
+
+
+def fusion_runs(seq: str, parts: list[dict]) -> list[dict]:
+    """Runs of adjacent parts that read as one protein.
+
+    Adjacency is not enough on its own: two coding features can abut and
+    still be two genes read in different frames.  The run has to come to a
+    whole number of codons and translate without an internal stop, which is
+    the same thing as saying the lab built it as one fusion.
+    """
+    runs: list[dict] = []
+    for strand in (1, -1):
+        same = _outermost_parts([p for p in parts if p["strand"] == strand])
+        group: list[dict] = []
+        for p in same:
+            if group and 0 <= p["start"] - group[-1]["end"] <= MAX_FUSION_GAP:
+                group.append(p)
+            else:
+                if group:
+                    runs.append(group)
+                group = [p]
+        if group:
+            runs.append(group)
+
+    out = []
+    for group in runs:
+        if len(group) < 2:
+            continue
+        lo, hi = group[0]["start"], group[-1]["end"]
+        sub = seq[lo:hi]
+        if group[0]["strand"] == -1:
+            sub = revcomp(sub)
+        if len(sub) % 3:
+            continue
+        protein = translate(sub)
+        if "*" in protein[:-1]:
+            continue
+        if not any(p["feature_type"] == "CDS"
+                   and p["end"] - p["start"] >= MIN_FUSION_CORE
+                   for p in group):
+            continue
+        out.append({"start": lo, "end": hi, "strand": group[0]["strand"],
+                    "seq": sub, "protein": protein, "members": group})
+    return out
+
+
+def fusion_name(conn: sqlite3.Connection, run: dict) -> str:
+    """What to call the whole of a fusion its pieces were catalogued apart.
+
+    Stringing the member names together gives "CDS + ASAP6c", because the
+    piece carrying the Kv2.1 was keyed CDS with the name on a neighbouring
+    feature.  So the longest member that has a usable name leads, and what
+    is fused to it is named from the peptide rather than from the record -
+    the same way the part picker describes a variant.
+    """
+    from .orfs import _useful
+
+    core = ""
+    for p in sorted(run["members"], key=lambda d: -(d["end"] - d["start"])):
+        if p["feature_type"] == "CDS" and _useful(p["name"]):
+            core = _clean_part_name(p["name"])
+            break
+    if not core:
+        named = [_clean_part_name(p["name"]) for p in run["members"]
+                 if _useful(p["name"])]
+        if named:
+            return " + ".join(dict.fromkeys(named))
+        return f"fusion ({len(run['protein'])} aa)"
+
+    decorations = []
+    for e in find_embedded_elements(run["seq"], "CDS"):
+        name = e.get("name") or ""
+        if name and name.lower() not in core.lower():
+            decorations.append(name)
+    if decorations:
+        return f"{core} + " + " + ".join(dict.fromkeys(decorations))
+    others = [_clean_part_name(p["name"]) for p in run["members"]
+              if _useful(p["name"]) and _clean_part_name(p["name"]) != core]
+    if others:
+        return f"{core} + " + " + ".join(dict.fromkeys(others))
+    return f"{core} fusion ({len(run['protein'])} aa)"
+
+
+def _clean_part_name(name: str) -> str:
+    return re.sub(r"\s*[\[(](?:piece )?\d+ of \d+.*?[\])]\s*$", "",
+                  (name or "").strip())
+
+
+def join_fusions(conn: sqlite3.Connection, progress=None) -> dict:
+    """Catalogue the fusion that adjacent parts spell out between them.
+
+    `extract_parts` already does the opposite.  A CDS the depositor
+    annotated as one "CheRiff_eGFP" is catalogued whole *and* split into
+    the proteins inside it, because both are real answers to "what part is
+    this".  But when the depositor drew that same fusion as separate
+    features - an ASAP6c, a GSS linker and a Kv2.1 side by side - only the
+    pieces were catalogued, so searching for ASAP6c offered the bare
+    protein and never the soma-targeted version the lab actually uses.
+
+    This reads nothing from the share: the sequences are already stored,
+    and so are the parts.  What is missing is the sentence they make.
+    """
+    rows = conn.execute(
+        """SELECT o.plasmid_id, o.part_id, o.start, o.end, o.strand,
+                  p.name, p.feature_type, p.confidence
+             FROM part_occurrence o JOIN part p ON p.id = o.part_id
+            WHERE p.feature_type IN ('CDS','trafficking_motif','linker',
+                                     'p2A','tag')""").fetchall()
+    by_plasmid: dict[int, list] = {}
+    for r in rows:
+        by_plasmid.setdefault(r["plasmid_id"], []).append(dict(r))
+
+    created = linked = examined = 0
+    names: dict[str, int] = {}
+    ids = sorted(by_plasmid)
+    for n, pid in enumerate(ids):
+        if progress and n and n % 200 == 0:
+            progress(n, len(ids), created)
+        p = conn.execute("SELECT seq FROM plasmid WHERE id = ?",
+                         (pid,)).fetchone()
+        if not p or not p["seq"]:
+            continue
+        for run in fusion_runs(p["seq"], by_plasmid[pid]):
+            examined += 1
+            chk = hashlib.sha256(run["seq"].upper().encode()).hexdigest()
+            existing = conn.execute(
+                "SELECT id FROM part WHERE seq_checksum = ?", (chk,)).fetchone()
+            if existing:
+                part_id = existing["id"]
+            else:
+                name = fusion_name(conn, run)
+                embedded = find_embedded_elements(run["seq"], "CDS")
+                cur = conn.execute(
+                    """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                            seq_length, translated, exact_required,
+                            confidence, contains)
+                       VALUES ('CDS',?,?,?,?,1,0,?,?)""",
+                    (name, run["seq"], chk, len(run["seq"]),
+                     min(float(m["confidence"] or 0.8)
+                         for m in run["members"]),
+                     _json_dumps(embedded) if embedded else None))
+                part_id = cur.lastrowid
+                created += 1
+                names[name] = names.get(name, 0) + 1
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO part_occurrence
+                   (part_id, plasmid_id, start, end, strand)
+                   VALUES (?,?,?,?,?)""",
+                (part_id, pid, run["start"], run["end"], run["strand"]))
+            linked += cur.rowcount
+        if examined and examined % 200 == 0:
+            conn.commit()
+    conn.commit()
+    return {"plasmids_examined": len(ids), "fusions_found": examined,
+            "parts_created": created, "occurrences_linked": linked,
+            "named": dict(sorted(names.items(), key=lambda kv: -kv[1])[:12])}

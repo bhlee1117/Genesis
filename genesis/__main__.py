@@ -28,7 +28,7 @@ from .design import design as run_design, save_design
 from .export import (primer_order_csv, primer_table_csv,
                      protocol_markdown, protocol_pdf,
                      to_genbank)
-from .importer import import_tree, reclassify
+from .importer import import_tree, join_fusions, reclassify
 from .orfs import infer_all
 
 CONFIG_PATH = Path("~/.genesis/config.json").expanduser()
@@ -82,6 +82,18 @@ def cmd_reclassify(args, cfg: Config):
     print("re-deriving feature types from stored labels (the share is not read)",
           file=sys.stderr)
     print(json.dumps(reclassify(conn, progress=progress), indent=2))
+
+
+def cmd_join_fusions(args, cfg: Config):
+    conn = _conn(cfg, args.db)
+
+    def progress(done, total, made):
+        print(f"  {done}/{total} plasmids | {made} fusions catalogued",
+              file=sys.stderr)
+
+    print("looking for the fusion that adjacent parts spell out "
+          "(the share is not read)", file=sys.stderr)
+    print(json.dumps(join_fusions(conn, progress=progress), indent=2))
 
 
 def cmd_infer_orfs(args, cfg: Config):
@@ -539,6 +551,12 @@ def main(argv=None):
         "reclassify",
         help="re-apply the labelling rules to the inventory already indexed")
     s.set_defaults(fn=cmd_reclassify)
+
+    s = sub.add_parser(
+        "join-fusions",
+        help="catalogue the fusion that adjacent parts spell out, so a "
+             "search for a protein also offers the tagged versions of it")
+    s.set_defaults(fn=cmd_join_fusions)
 
     s = sub.add_parser(
         "infer-orfs",

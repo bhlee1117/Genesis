@@ -3188,6 +3188,122 @@ class TestInferredORFs(unittest.TestCase):
         conn.close()
 
 
+class TestJoinedFusions(unittest.TestCase):
+    """The fusion that several adjacent parts spell out between them."""
+
+    @staticmethod
+    def _cds(aa, seed):
+        from genesis.seqtools import translate
+        codon = {translate(a + b + c): a + b + c
+                 for a in "ACGT" for b in "ACGT" for c in "ACGT"}
+        prot = "M" + "".join(random.Random(seed).choice("ACDEFGHIKLMNPQRSTVWY")
+                             for _ in range(aa - 1))
+        return "".join(codon[r] for r in prot)
+
+    def _plasmid(self, conn, name, seq):
+        return conn.execute(
+            """INSERT INTO plasmid(name, owner, seq, seq_length, seq_checksum,
+                    circular, verified)
+               VALUES (?,'t',?,?,?,0,'sequence_verified')""",
+            (name, seq, len(seq), name)).lastrowid
+
+    def _part(self, conn, pid, ftype, name, seq, start, strand=1):
+        import hashlib
+        part = conn.execute(
+            """INSERT INTO part(feature_type, name, seq, seq_checksum,
+                    seq_length, translated, confidence)
+               VALUES (?,?,?,?,?,1,1.0)""",
+            (ftype, name, seq, hashlib.sha256(seq.encode()).hexdigest(),
+             len(seq))).lastrowid
+        conn.execute("INSERT INTO part_occurrence(part_id, plasmid_id, start, "
+                     "end, strand) VALUES (?,?,?,?,?)",
+                     (part, pid, start, start + len(seq), strand))
+        return part
+
+    def test_adjacent_parts_in_one_frame_become_one_part(self):
+        # ASAP6c, a GSS linker and a Kv2.1 drawn as three features by the
+        # depositor: the fusion the lab actually uses existed nowhere, so
+        # a search for ASAP6c only ever offered the bare protein.
+        from genesis.importer import join_fusions
+        conn = connect(":memory:")
+        core, tail = self._cds(300, 1), self._cds(60, 2)[3:]   # no inner ATG/stop
+        seq = "TTTT" * 50 + core + tail + "TAA" + "TTTT" * 50
+        pid = self._plasmid(conn, "pFuse-Sensorase", seq)
+        self._part(conn, pid, "CDS", "Sensorase", core, 200)
+        self._part(conn, pid, "CDS", "Tailase", tail, 200 + len(core))
+        conn.commit()
+        out = join_fusions(conn)
+        self.assertEqual(out["parts_created"], 1, out)
+        fused = conn.execute(
+            "SELECT name, seq_length FROM part WHERE seq_length = ?",
+            (len(core) + len(tail),)).fetchone()
+        self.assertIsNotNone(fused, "the run was not catalogued")
+        self.assertIn("Sensorase", fused["name"])
+        # the pieces keep their own place in the catalogue
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM part WHERE name IN ('Sensorase','Tailase')"
+        ).fetchone()[0], 2)
+        conn.close()
+
+    def test_two_genes_that_merely_abut_are_not_a_fusion(self):
+        # Adjacency is not enough: a frame shift between them means the
+        # cell reads two proteins, whatever the coordinates look like.
+        from genesis.importer import join_fusions
+        conn = connect(":memory:")
+        a, b = self._cds(300, 3), self._cds(200, 4)
+        seq = "TTTT" * 50 + a + "T" + b + "TAA" + "TTTT" * 50
+        pid = self._plasmid(conn, "pTwo-Genes", seq)
+        self._part(conn, pid, "CDS", "Alpha", a, 200)
+        self._part(conn, pid, "CDS", "Beta", b, 200 + len(a) + 1)
+        conn.commit()
+        self.assertEqual(join_fusions(conn)["parts_created"], 0)
+        conn.close()
+
+    def test_a_tag_and_a_linker_alone_are_not_a_fusion(self):
+        from genesis.importer import join_fusions
+        conn = connect(":memory:")
+        tag, link = self._cds(12, 5), self._cds(9, 6)[3:]
+        seq = "TTTT" * 50 + tag + link + "TAA" + "TTTT" * 50
+        pid = self._plasmid(conn, "pBits", seq)
+        self._part(conn, pid, "tag", "HA tag", tag, 200)
+        self._part(conn, pid, "linker", "GSG", link, 200 + len(tag))
+        conn.commit()
+        self.assertEqual(join_fusions(conn)["parts_created"], 0,
+                         "a run with no real CDS is not a protein")
+        conn.close()
+
+    def test_running_it_twice_catalogues_nothing_new(self):
+        from genesis.importer import join_fusions
+        conn = connect(":memory:")
+        core, tail = self._cds(300, 7), self._cds(60, 8)[3:]
+        seq = "TTTT" * 50 + core + tail + "TAA" + "TTTT" * 50
+        pid = self._plasmid(conn, "pTwice", seq)
+        self._part(conn, pid, "CDS", "Corease", core, 200)
+        self._part(conn, pid, "CDS", "Tailase", tail, 200 + len(core))
+        conn.commit()
+        self.assertEqual(join_fusions(conn)["parts_created"], 1)
+        again = join_fusions(conn)
+        self.assertEqual(again["parts_created"], 0)
+        self.assertEqual(again["occurrences_linked"], 0)
+        conn.close()
+
+    def test_a_nested_copy_does_not_break_the_run(self):
+        # Files draw the same stretch twice - a CDS key over the whole
+        # piece and a labelled feature over its linker.  The nested copy
+        # must not split a run that is really contiguous.
+        from genesis.importer import join_fusions
+        conn = connect(":memory:")
+        core, tail = self._cds(300, 9), self._cds(60, 10)[3:]
+        seq = "TTTT" * 50 + core + tail + "TAA" + "TTTT" * 50
+        pid = self._plasmid(conn, "pNested-Sensorase", seq)
+        self._part(conn, pid, "CDS", "Sensorase", core, 200)
+        self._part(conn, pid, "CDS", "CDS", tail, 200 + len(core))
+        self._part(conn, pid, "linker", "GSS", tail[:27], 200 + len(core))
+        conn.commit()
+        self.assertEqual(join_fusions(conn)["parts_created"], 1)
+        conn.close()
+
+
 class TestCloningSimulation(unittest.TestCase):
     """Replaying the protocol, rather than trusting its bookkeeping."""
 
