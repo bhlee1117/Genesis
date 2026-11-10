@@ -5408,6 +5408,97 @@ class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
         conn.close()
 
 
+class TestAMismatchedPairIsRedesigned(unittest.TestCase):
+    """A pair that cannot share an annealing step is a design fault, and
+    the design is what should change - not a warning on the way out.
+
+    The forward primer is pinned: the bases it would skip have nowhere to
+    go, because reverse primers here carry no tail. The reverse one is
+    free, because whatever it stops short of is written onto the next
+    fragment's forward tail instead, which leaves the product identical
+    and costs that one oligo a few bases.
+    """
+
+    @staticmethod
+    def _lopsided_fragment():
+        """An AT-rich forward end and a GC-rich polylinker at the reverse
+        end, with ordinary sequence behind it. This is the real shape:
+        the backbone junction that failed sits in exactly such a
+        polylinker (XhoI/SmaI/ApaI/SacII stacked together)."""
+        import random as _r
+        rng = _r.Random(31)
+        return ("".join(rng.choice("AATT") for _ in range(50))
+                + "".join(rng.choice("ACGT") for _ in range(1400))
+                + "TCGAGATCCCGGGCCCGCGGCCGCGGGCCCGGG")
+
+    def test_the_reverse_anchor_moves_to_meet_the_forward_one(self):
+        from genesis.primers import pair_anneal_sites
+        cfg = Config()
+        cfg.primer_max_len = 36
+        t = self._lopsided_fragment()
+        pinned = pair_anneal_sites(t, 0, len(t), cfg, False, max_retreat=0)
+        self.assertGreater(
+            pinned[2], cfg.primer_pair_max_diff,
+            f"the fixture does not actually fail: {pinned[2]:.1f} C apart")
+        moved = pair_anneal_sites(t, 0, len(t), cfg, False, max_retreat=25)
+        self.assertLess(moved[2], pinned[2],
+                        f"retreat did not help: pinned {pinned[2]:.1f} C, "
+                        f"moved {moved[2]:.1f} C")
+        self.assertGreater(moved[3], 0, "it reported no retreat")
+
+    def test_it_takes_the_nearest_junction_that_works(self):
+        # Every base of retreat lengthens the neighbour's oligo, so the
+        # first position that clears the limit wins, not the best one.
+        from genesis.primers import pair_anneal_sites
+        cfg = Config()
+        cfg.primer_max_len = 36
+        t = self._lopsided_fragment()
+        _f, _r, gap, back = pair_anneal_sites(t, 0, len(t), cfg, False,
+                                              max_retreat=25)
+        if gap <= cfg.primer_pair_max_diff:
+            for nearer in range(1, back):
+                closer = pair_anneal_sites(t, 0, len(t), cfg, False,
+                                           max_retreat=nearer)
+                self.assertGreater(
+                    closer[2], cfg.primer_pair_max_diff,
+                    f"{nearer} bp would have done, but it took {back}")
+
+    def test_it_does_not_wander_when_the_pair_already_matches(self):
+        from genesis.primers import pair_anneal_sites
+        import random as _r
+        rng = _r.Random(32)
+        cfg = Config()
+        t = "".join(rng.choice("ACGT") for _ in range(1200))
+        _f, _r2, gap, back = pair_anneal_sites(t, 0, len(t), cfg, False,
+                                               max_retreat=25)
+        if gap <= cfg.primer_pair_max_diff:
+            self.assertLessEqual(
+                back, 4, f"moved the junction {back} bp for a {gap:.1f} C gap")
+
+    def test_the_bases_it_stops_short_of_are_carried_by_the_neighbour(self):
+        # The whole trade: the product must not change. This is the unit
+        # version; the route-level check is that the simulation still
+        # reads back identical, which it does on every reference design.
+        from genesis.primers import design_gibson_pair
+        import random as _r
+        rng = _r.Random(33)
+        cfg = Config()
+        cfg.primer_max_len = 36
+        upstream = "".join(rng.choice("ACGT") for _ in range(400))
+        frag = "".join(rng.choice("ACGT") for _ in range(900))
+        f0, _r0 = design_gibson_pair(0, "f", frag, 0, len(frag), upstream,
+                                     "", cfg, carry_downstream=False)
+        f8, _r8 = design_gibson_pair(0, "f", frag, 0, len(frag), upstream,
+                                     "", cfg, carry_downstream=False,
+                                     extra_arm=8)
+        self.assertEqual(len(f8.tail), len(f0.tail) + 8)
+        self.assertTrue(f8.tail.endswith(f0.tail),
+                        "the extra bases went on the wrong end of the tail")
+        self.assertTrue(upstream.endswith(f8.tail),
+                        "the tail is not the upstream fragment's own end")
+        self.assertEqual(f8.sequence, f8.tail + f8.anneal)
+
+
 class TestTmAgreesWithNEB(unittest.TestCase):
     """NEB's calculator is what a primer is checked against before it is
     ordered, so disagreeing with it is a bug however defensible the
@@ -5699,7 +5790,7 @@ class TestAPairHasToShareOneTemperature(unittest.TestCase):
         r_alone = pick_anneal(t, len(t), "R", cfg, False)
         apart_alone = abs(hot(f_alone) - hot(r_alone))
 
-        f_pair, r_pair, gap = pair_anneal_sites(t, 0, len(t), cfg, False)
+        f_pair, r_pair, gap, _back = pair_anneal_sites(t, 0, len(t), cfg, False)
         apart_pair = abs(hot(f_pair) - hot(r_pair))
 
         self.assertAlmostEqual(apart_pair, gap, places=1)
@@ -5740,8 +5831,8 @@ class TestAPairHasToShareOneTemperature(unittest.TestCase):
         template = ("".join(rng.choice("AT") for _ in range(60))
                     + "".join(rng.choice("ACGT") for _ in range(900))
                     + "".join(rng.choice("GC") for _ in range(60)))
-        _f, _r2, gap = pair_anneal_sites(template, 0, len(template), cfg,
-                                         False)
+        _f, _r2, gap, _b = pair_anneal_sites(template, 0, len(template), cfg,
+                                             False)
         self.assertGreater(gap, cfg.primer_pair_max_diff)
 
     def test_the_pool_is_not_truncated_before_the_pair_is_chosen(self):

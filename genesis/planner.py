@@ -395,6 +395,15 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
 
     n = len(pieces)
     pair_by_piece: dict[int, tuple] = {}
+    # A junction whose tails are about to be rewritten to carry a folded
+    # element cannot also move: _split_into_tails replaces the arm
+    # outright, and the retreat would be written over and lost.
+    pinned = set(split_after) | {(k + 1) % max(len(pieces), 1)
+                                 for k in split_after}
+
+    def retreat_budget(index: int) -> int:
+        return 0 if index in pinned else cfg.primer_max_retreat
+
     templates_needing_dpni: list[str] = []
     dpni_template_ids: list = []
 
@@ -409,7 +418,8 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
             0, piece["name"], backbone["seq"],
             piece["source_start"], piece["source_end"], up, down, cfg,
             circular_template=bool(backbone.get("circular")),
-            carry_downstream=False, unique_in=construct.seq)
+            carry_downstream=False, unique_in=construct.seq,
+            max_retreat=retreat_budget(k))
         _carry(fwd, carried.get(k, ""), route, cfg)
         _check_unique(fwd, construct.seq, route)
         pair_by_piece[k] = (fwd, rev)
@@ -480,7 +490,7 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         fwd, rev = design_gibson_pair(
             i, frag.name, tpl, start, end, up, down, cfg,
             circular_template=circ, carry_downstream=False,
-            unique_in=construct.seq)
+            unique_in=construct.seq, max_retreat=retreat_budget(piece_index))
         _carry(fwd, carried.get(piece_index, ""), route, cfg)
         pair_by_piece[piece_index] = (fwd, rev)
         # Report where the part is in the donor, not where it is in the
@@ -516,6 +526,25 @@ def plan_hifi_route(conn: sqlite3.Connection, construct: AssembledConstruct,
         templates_needing_dpni.append(frag.source_name)
         if frag.source_plasmid_id:
             dpni_template_ids.append(frag.source_plasmid_id)
+
+    # A fragment whose reverse primer pulled back from its junction stops
+    # short by that many bases, and they exist in no amplicon until the
+    # NEXT fragment's forward tail writes them. The arm is taken from the
+    # end of the upstream sequence, so reaching that much further back
+    # picks them up and leaves the annealing homology the same length.
+    for k, (fwd, rev) in sorted(pair_by_piece.items()):
+        prev = pair_by_piece.get((k - 1) % n)
+        back = prev[1].retreat if prev else 0
+        if not back:
+            continue
+        up_seq = pieces[(k - 1) % n][1]
+        want = len(fwd.tail) + back
+        fwd.tail = up_seq[-want:] if want <= len(up_seq) else up_seq
+        fwd.sequence = fwd.tail + fwd.anneal
+        route.warnings.append(
+            f"{prev[1].name} stops {back} bp short of its junction so the "
+            f"pair can share an annealing step; {fwd.name} carries those "
+            f"{back} bp, which is why it is {len(fwd.sequence)} nt")
 
     # Every pair exists now, so the folded elements can be written into
     # the two tails that meet where each one belongs.

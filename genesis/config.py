@@ -92,6 +92,13 @@ class Config:
     #: the unit that has to be right, not each primer on its own. NEB's
     #: own calculator refuses a pair past 5 C.
     primer_pair_max_diff: float = 5.0
+    #: How far a junction may move back into its fragment so that the two
+    #: primers of one reaction can share an annealing step. The bases it
+    #: stops short of are written onto the next fragment's forward tail,
+    #: so the product is unchanged and the cost is that one oligo is this
+    #: much longer. Set to 0 to pin every junction where the construct
+    #: puts it and take the Tm mismatch instead.
+    primer_max_retreat: int = 25
     #: Addgene's PCR cloning protocol: the region that hybridises to the
     #: template is 18-21 bp, which is "usually sufficient to give specificity
     #: and to also be compatible with a standard PCR reaction".

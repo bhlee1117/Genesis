@@ -26,6 +26,11 @@ class Primer:
     target_start: int = 0
     target_end: int = 0
     warnings: list = field(default_factory=list)
+    #: For a reverse primer, how many bases its anchor was pulled back
+    #: from the junction so the pair could share an annealing step. The
+    #: next fragment's forward tail has to be this much longer, or those
+    #: bases appear in no amplicon and the product comes out short.
+    retreat: int = 0
 
     @property
     def length(self) -> int:
@@ -124,6 +129,12 @@ def anneal_penalty(region: str, cfg: Config,
 #: temperature is not a pair.
 PAIR_PENALTY = 8.0
 
+#: What one base of retreat costs. Small, because a dozen extra bases on
+#: one oligo is a far better trade than a pair that cannot share an
+#: annealing step - but not zero, or the search wanders off the junction
+#: for a tenth of a degree.
+RETREAT_PENALTY = 0.15
+
 
 def rank_anneal_sites(template: str, start: int, direction: str, cfg: Config,
                       circular: bool = False, unique_in: str = "",
@@ -163,7 +174,8 @@ def rank_anneal_sites(template: str, start: int, direction: str, cfg: Config,
 
 
 def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
-                      circular: bool = False, unique_in: str = "") -> tuple:
+                      circular: bool = False, unique_in: str = "",
+                      max_retreat: int = 0) -> tuple:
     """Choose both sites of one reaction together.
 
     A forward and a reverse primer go into the same tube and anneal at
@@ -174,26 +186,68 @@ def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
     picked from different stretches of sequence with no reference to
     each other.
 
-    Returns (f_region, r_region, gap).
-    """
-    fwd = rank_anneal_sites(template, start, "F", cfg, circular, unique_in)
-    rev = rank_anneal_sites(template, end, "R", cfg, circular, unique_in)
-    if not fwd or not rev:
-        return (pick_anneal(template, start, "F", cfg, circular),
-                pick_anneal(template, end, "R", cfg, circular),
-                float("nan"))
+    `max_retreat` lets the reverse anchor move back into the fragment.
+    The forward primer cannot move - the bases it would skip have nowhere
+    to go, because reverse primers here carry no tail - but the reverse
+    one can, because whatever it stops short of is written onto the NEXT
+    fragment's forward tail instead. That is the only free variable at a
+    junction, and it is usually enough: the backbone junction that sat
+    6.7 C apart sits 0.5 C apart twelve bases earlier.
 
+    The junction only moves to fix a mismatch, never to shave a tenth of
+    a degree off a pair that already matches - a retreat costs the
+    neighbouring oligo a base for every base of it, and the first version
+    of this spent eight of them on a 0.1 C gap. So the pinned junction is
+    tried first and kept if it works, and otherwise the nearest position
+    that brings the pair inside the limit wins.
+
+    Returns (f_region, r_region, gap, retreat).
+    """
     limit = getattr(cfg, "primer_pair_max_diff", 5.0)
-    best, best_cost = None, float("inf")
-    for a in fwd:
-        for b in rev:
-            gap = abs(a["tm"] - b["tm"])
-            cost = (a["penalty"] + b["penalty"]
-                    + PAIR_PENALTY * max(0.0, gap - limit))
-            if cost < best_cost:
-                best_cost, best = cost, (a, b, gap)
+    fwd = rank_anneal_sites(template, start, "F", cfg, circular, unique_in)
+    fallback = (pick_anneal(template, start, "F", cfg, circular),
+                pick_anneal(template, end, "R", cfg, circular),
+                float("nan"), 0)
+    if not fwd:
+        return fallback
+
+    def best_against(rev: list):
+        """The best pairing of this reverse shortlist with the forward one."""
+        chosen, cost = None, float("inf")
+        for a in fwd:
+            for b in rev:
+                gap = abs(a["tm"] - b["tm"])
+                c = (a["penalty"] + b["penalty"]
+                     + PAIR_PENALTY * max(0.0, gap - limit))
+                if c < cost:
+                    cost, chosen = c, (a, b, gap)
+        return chosen
+
+    here = best_against(
+        rank_anneal_sites(template, end, "R", cfg, circular, unique_in))
+    if here is None:
+        return fallback
+    if here[2] <= limit or max_retreat <= 0:
+        return here[0]["region"], here[1]["region"], here[2], 0
+
+    # The junction has to move. Take the first position that works, and
+    # failing that the position that comes closest.
+    nearest = (here[2], here, 0)
+    for back in range(1, max_retreat + 1):
+        rev = rank_anneal_sites(template, end - back, "R", cfg, circular,
+                                unique_in)
+        if not rev:
+            continue
+        cand = best_against(rev)
+        if cand is None:
+            continue
+        if cand[2] <= limit:
+            return cand[0]["region"], cand[1]["region"], cand[2], back
+        if cand[2] < nearest[0]:
+            nearest = (cand[2], cand, back)
+    _gap, best, back = nearest
     a, b, gap = best
-    return a["region"], b["region"], gap
+    return a["region"], b["region"], gap, back
 
 
 def pick_anneal(template: str, start: int, direction: str, cfg: Config,
@@ -313,7 +367,8 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
                        upstream_seq: str, downstream_seq: str,
                        cfg: Config, circular_template: bool = False,
                        carry_downstream: bool = True,
-                       unique_in: str = "") -> tuple[Primer, Primer]:
+                       unique_in: str = "",
+                       max_retreat: int = 0, extra_arm: int = 0) -> tuple[Primer, Primer]:
     """Design the primer pair that amplifies one fragment with HiFi overlaps.
 
     The forward primer carries the 3' end of the *upstream* fragment as a
@@ -332,11 +387,21 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     # tube at the same temperature, so the pair is the unit that has to be
     # right; picking each one's best site alone optimises a quantity
     # nobody runs.
-    f_anneal, r_anneal, tm_gap = pair_anneal_sites(
-        template, start, end, cfg, circular_template, unique_in=template)
+    f_anneal, r_anneal, tm_gap, retreat = pair_anneal_sites(
+        template, start, end, cfg, circular_template, unique_in=template,
+        max_retreat=max_retreat)
 
     f_tail = pick_overlap(upstream_seq, cfg, from_end=True,
                           unique_in=unique_in)
+    # `extra_arm` is the previous fragment's retreat: the bases it stopped
+    # short of, which exist in no amplicon unless this tail writes them.
+    # They sit at the END of the upstream sequence, which is where the arm
+    # is taken from, so reaching further back picks them up and leaves the
+    # homology that actually anneals the same length as before.
+    if extra_arm and upstream_seq:
+        want = len(f_tail) + extra_arm
+        f_tail = upstream_seq[-want:] if want <= len(upstream_seq) \
+            else upstream_seq
     r_tail = (revcomp(pick_overlap(downstream_seq, cfg, from_end=False,
                                    unique_in=unique_in))
               if carry_downstream else "")
@@ -348,7 +413,7 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     rev = Primer(
         name=f"{fragment_name}-R", sequence=r_tail + r_anneal, anneal=r_anneal,
         tail=r_tail, direction="R", template=fragment_name,
-        target_start=start, target_end=end)
+        target_start=start, target_end=end - retreat, retreat=retreat)
 
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)
     rev.warnings = validate_primer(rev, template, cfg, circular_template)
@@ -359,8 +424,10 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
             pr.warnings.append(
                 f"this pair's Tms differ by {tm_gap:.1f} C, more than the "
                 f"{limit:.0f} C two primers sharing one annealing step "
-                f"should; no combination of lengths here does better, so "
-                f"run a gradient over the lower Tm")
+                f"should; no combination of lengths"
+                + (f" or of junction positions up to {max_retreat} bp"
+                   if max_retreat else "")
+                + " does better, so run a gradient over the lower Tm")
 
     # The tail is homology and nothing else now, so all of it is the arm.
     for p, tail in ((fwd, f_tail), (rev, r_tail)):
@@ -425,7 +492,7 @@ def design_re_pair(fragment_name: str, template: str, start: int, end: int,
     """
     from .enzymes import CATALOG
     # Same reasoning as the assembly pair: both go in one tube.
-    f_anneal, r_anneal, tm_gap = pair_anneal_sites(
+    f_anneal, r_anneal, tm_gap, _retreat = pair_anneal_sites(
         template, start, end, cfg, circular_template)
     f_tail = r_tail = ""
     if left_enzyme:
