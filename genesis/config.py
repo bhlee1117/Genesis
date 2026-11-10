@@ -90,8 +90,11 @@ class Config:
     #: How far the two primers of one reaction may differ in Tm. They
     #: anneal in the same tube at the same temperature, so the pair is
     #: the unit that has to be right, not each primer on its own. NEB's
-    #: own calculator refuses a pair past 5 C.
-    primer_pair_max_diff: float = 5.0
+    #: own calculator refuses a pair past 5 C; this lab runs tighter,
+    #: because 5 C is enough for the cooler primer to misprime at a Ta
+    #: the hotter one still needs. The junction can usually move far
+    #: enough to pay for it.
+    primer_pair_max_diff: float = 3.0
     #: How far a junction may move back into its fragment so that the two
     #: primers of one reaction can share an annealing step. The bases it
     #: stops short of are written onto the next fragment's forward tail,
@@ -116,12 +119,6 @@ class Config:
     #: to put the primer.
     primer_ideal_min_gc: float = 0.40
     primer_ideal_max_gc: float = 0.60
-    #: How far the annealing site may move *into* the fragment to find
-    #: better bases. The skipped bases are added to the primer's tail, so
-    #: the product is unchanged and only the oligo gets longer. Without
-    #: this the site is wherever the junction happens to fall, and an
-    #: AT-rich boundary gives a primer that is reported as poor and used
-    #: anyway.
     #: Homology arm. Used as a ceiling: the shortest arm that still reaches
     #: `overlap_tm_min` is taken, because every base of overlap is a base of
     #: oligo somebody pays for and synthesises with some error rate.
@@ -129,7 +126,13 @@ class Config:
     #: A floor under whatever the kit itself asks for, not a replacement
     #: for it: homology_range() already holds NEBuilder HiFi at 15-25 and
     #: Gibson at 20-40, which is what each supplier specifies.
-    overlap_min_length: int = 15
+    #:
+    #: Raised to 20 for this lab. NEB's own range starts at 15, but 15 is
+    #: the point at which it still works rather than the point at which
+    #: it works well, and NEB themselves ask for more as soon as there
+    #: are several fragments in the tube. Five more bases on one oligo is
+    #: a cheaper way to buy an assembly than a repeat of the assembly.
+    overlap_min_length: int = 20
     overlap_tm_min: float = 48.0
     primer_conc_nm: float = 500.0
     #: Free-ion concentrations of the reaction the Tm is quoted for.

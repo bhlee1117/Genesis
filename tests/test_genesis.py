@@ -2588,12 +2588,29 @@ class TestAssemblyHomology(unittest.TestCase):
     """Homology arms follow the kit, and are no longer than they need to be."""
 
     def test_the_two_kits_want_different_homology(self):
-        from genesis.primers import homology_range
+        from genesis.primers import homology_range, ASSEMBLY_HOMOLOGY
         hifi, gibson = Config(), Config()
         gibson.preferred_assembly_kit = "Gibson"
-        self.assertEqual(homology_range(hifi)[0], 15)
-        self.assertEqual(homology_range(gibson)[0], 20)
+        # What each supplier asks for, which has not changed.
+        self.assertEqual(ASSEMBLY_HOMOLOGY["hifi"], (15, 25))
+        self.assertEqual(ASSEMBLY_HOMOLOGY["gibson"], (20, 40))
         self.assertGreater(homology_range(gibson)[1], homology_range(hifi)[1])
+
+    def test_the_configured_floor_raises_the_kit_but_never_lowers_it(self):
+        # overlap_min_length is a floor-raiser, so asking for less than
+        # the kit specifies gets the kit's figure anyway.
+        from genesis.primers import homology_range
+        cfg = Config()
+        cfg.overlap_min_length = 8
+        self.assertEqual(homology_range(cfg)[0], 15, "went below the kit")
+        cfg.overlap_min_length = 20
+        self.assertEqual(homology_range(cfg)[0], 20)
+
+    def test_this_lab_asks_for_more_homology_than_the_kit_requires(self):
+        # The one place the policy is pinned: 15 bp is where NEBuilder
+        # homology still works rather than where it works well.
+        self.assertEqual(Config().overlap_min_length, 20)
+        self.assertEqual(Config().primer_pair_max_diff, 3.0)
 
     def test_hifi_gives_shorter_arms_so_shorter_primers(self):
         from genesis.primers import pick_overlap
@@ -2604,11 +2621,13 @@ class TestAssemblyHomology(unittest.TestCase):
                              len(pick_overlap(neighbour, gibson)))
 
     def test_a_gc_rich_arm_is_cut_short(self):
-        """No reason to pay for 25 bases when 15 already anneal."""
-        from genesis.primers import pick_overlap
+        """No reason to pay for 25 bases when the floor already anneals."""
+        from genesis.primers import pick_overlap, homology_range
         cfg = Config()
         arm = pick_overlap("GC" * 40, cfg)
-        self.assertEqual(len(arm), 15)
+        self.assertEqual(len(arm), homology_range(cfg)[0],
+                         "a GC-rich arm grew past the shortest that works")
+        self.assertLess(len(arm), homology_range(cfg)[1])
         self.assertGreaterEqual(st.tm(arm), cfg.overlap_tm_min)
 
     def test_an_at_rich_arm_grows_to_the_ceiling(self):
