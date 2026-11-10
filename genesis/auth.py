@@ -118,7 +118,13 @@ def check_password(password: str, salt: bytes, expected: bytes,
 
 #: Deliberately mild. A long passphrase beats a short one full of symbols,
 #: and rules that force symbols mostly produce "Password1!".
-MIN_PASSWORD_LENGTH = 12
+#:
+#: Lowered from 12 to 8 at the lab's request. The weak-stem list below
+#: still applies and is the part that catches the guesses that actually
+#: get tried, but eight characters is short enough to brute-force
+#: offline if this database is ever copied, and this server listens on
+#: a routable address.
+MIN_PASSWORD_LENGTH = 8
 
 
 def password_problem(password: str, username: str = "") -> str | None:
