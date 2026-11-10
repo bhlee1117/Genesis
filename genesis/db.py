@@ -159,6 +159,29 @@ CREATE TABLE IF NOT EXISTS design (
 );
 CREATE INDEX IF NOT EXISTS idx_design_construct ON design(construct_id);
 
+-- Autosaved working plans -----------------------------------------------
+-- Deliberately NOT the `design` table. A design is something somebody
+-- chose to keep, and it is versioned, named and owned; these are the
+-- plans the designer never got round to saving, kept so that closing a
+-- tab - or a server that stops with the machine it runs on - does not
+-- cost an afternoon's work. They expire by themselves, which is only
+-- safe because nothing here was ever deliberately saved.
+CREATE TABLE IF NOT EXISTS plan_draft (
+    id          INTEGER PRIMARY KEY,
+    owner       TEXT NOT NULL DEFAULT '',
+    name        TEXT NOT NULL DEFAULT '',
+    spec_key    TEXT NOT NULL,     -- checksum of the spec, so one spec
+    spec        TEXT NOT NULL,     -- keeps one row however often it is run
+    plan        TEXT NOT NULL,
+    route_id    TEXT,
+    created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+    saved_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at  TEXT NOT NULL,
+    UNIQUE(owner, spec_key)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_owner ON plan_draft(owner, saved_at DESC);
+CREATE INDEX IF NOT EXISTS idx_draft_expiry ON plan_draft(expires_at);
+
 CREATE TABLE IF NOT EXISTS outcome (
     id          INTEGER PRIMARY KEY,
     design_id   INTEGER REFERENCES design(id) ON DELETE CASCADE,
@@ -219,7 +242,7 @@ _ADDED_COLUMNS = (
 #: Tables added after the first release. `_ADDED_COLUMNS` only ever widens
 #: an existing table, so a genuinely new one needs saying here or an
 #: already-populated database never gets it.
-_ADDED_TABLES = ("part_alias",)
+_ADDED_TABLES = ("part_alias", "plan_draft")
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

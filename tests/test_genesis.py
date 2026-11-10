@@ -5408,6 +5408,117 @@ class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
         conn.close()
 
 
+class TestAutosavedDrafts(unittest.TestCase):
+    """Plans kept without being asked, and deleted without being asked."""
+
+    SPEC = {"name": "pTest", "vector": "AAV", "circular": True,
+            "modules": [{"type": "promoter", "name": "CAG"}]}
+    PLAN = {"construct": {"name": "pTest", "length": 1}, "routes": [
+        {"id": "hifi", "feasible": True}]}
+
+    def test_a_plan_is_kept_and_can_be_read_back(self):
+        from genesis import drafts
+        conn = connect(":memory:")
+        out = drafts.autosave(conn, self.SPEC, self.PLAN, owner="bhl")
+        self.assertIsNotNone(out["draft_id"])
+        got = drafts.load(conn, out["draft_id"], owner="bhl")
+        self.assertEqual(got["spec"]["name"], "pTest")
+        self.assertEqual(got["plan"]["routes"][0]["id"], "hifi")
+        self.assertEqual(got["route_id"], "hifi")
+        conn.close()
+
+    def test_rerunning_one_spec_keeps_one_draft_and_pushes_the_week_out(self):
+        from genesis import drafts
+        conn = connect(":memory:")
+        first = drafts.autosave(conn, self.SPEC, self.PLAN, owner="bhl")
+        conn.execute("UPDATE plan_draft SET expires_at = datetime('now','+1 day')")
+        conn.commit()
+        again = drafts.autosave(conn, self.SPEC, {**self.PLAN, "n": 2},
+                                owner="bhl")
+        self.assertEqual(first["draft_id"], again["draft_id"])
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM plan_draft").fetchone()[0], 1)
+        left = conn.execute(
+            "SELECT CAST(julianday(expires_at) - julianday('now') AS INT) "
+            "FROM plan_draft").fetchone()[0]
+        self.assertGreaterEqual(left, drafts.TTL_DAYS - 1,
+                                "the week runs from the last touch")
+        conn.close()
+
+    def test_a_draft_past_its_week_is_deleted(self):
+        from genesis import drafts
+        conn = connect(":memory:")
+        d = drafts.autosave(conn, self.SPEC, self.PLAN, owner="bhl")
+        conn.execute("UPDATE plan_draft SET expires_at = datetime('now','-1 hour')")
+        conn.commit()
+        self.assertEqual(drafts.purge(conn), 1)
+        self.assertIsNone(drafts.load(conn, d["draft_id"], owner="bhl"))
+        self.assertEqual(drafts.recent(conn, owner="bhl"), [])
+        conn.close()
+
+    def test_expiry_cannot_reach_anything_deliberately_saved(self):
+        # The whole safety argument for deleting on a timer is that this
+        # table holds only what nobody asked to keep.
+        from genesis import drafts
+        conn = connect(":memory:")
+        conn.execute("INSERT INTO construct(name, owner, spec) "
+                     "VALUES ('pKeep','bhl','{}')")
+        cid = conn.execute("SELECT id FROM construct").fetchone()[0]
+        conn.execute("INSERT INTO design(construct_id, version, owner, plan, "
+                     "created_at) VALUES (?,1,'bhl','{}', datetime('now','-400 days'))",
+                     (cid,))
+        drafts.autosave(conn, self.SPEC, self.PLAN, owner="bhl")
+        conn.execute("UPDATE plan_draft SET expires_at = datetime('now','-1 day')")
+        conn.commit()
+        drafts.purge(conn)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM design").fetchone()[0], 1,
+            "the purge reached a saved design")
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM construct").fetchone()[0], 1,
+            "the purge reached a saved construct")
+        conn.close()
+
+    def test_one_persons_drafts_are_not_anothers(self):
+        from genesis import drafts
+        conn = connect(":memory:")
+        mine = drafts.autosave(conn, self.SPEC, self.PLAN, owner="bhl")
+        drafts.autosave(conn, self.SPEC, self.PLAN, owner="someone-else")
+        self.assertEqual(len(drafts.recent(conn, owner="bhl")), 1)
+        self.assertIsNone(drafts.load(conn, mine["draft_id"],
+                                      owner="someone-else"))
+        self.assertEqual(
+            drafts.discard(conn, mine["draft_id"], owner="someone-else"),
+            {"deleted": 0}, "deleted somebody else's draft")
+        conn.close()
+
+    def test_a_runaway_caller_cannot_fill_the_table(self):
+        from genesis import drafts
+        conn = connect(":memory:")
+        for i in range(drafts.MAX_PER_OWNER + 10):
+            drafts.autosave(
+                conn, {**self.SPEC, "name": f"p{i}"},
+                {**self.PLAN, "construct": {"name": f"p{i}", "length": 1}},
+                owner="bhl")
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM plan_draft").fetchone()[0],
+            drafts.MAX_PER_OWNER)
+        # the newest survive, not the oldest
+        names = {r["name"] for r in drafts.recent(conn, owner="bhl", limit=99)}
+        self.assertNotIn("p0", names, "dropped the newest instead of the oldest")
+        self.assertIn(f"p{drafts.MAX_PER_OWNER + 9}", names)
+        conn.close()
+
+    def test_discarding_early_works(self):
+        from genesis import drafts
+        conn = connect(":memory:")
+        d = drafts.autosave(conn, self.SPEC, self.PLAN, owner="bhl")
+        self.assertEqual(drafts.discard(conn, d["draft_id"], owner="bhl"),
+                         {"deleted": 1})
+        self.assertEqual(drafts.recent(conn, owner="bhl"), [])
+        conn.close()
+
+
 class TestQuotedTmIsWhatBinds(unittest.TestCase):
     """The Tm on the order sheet has to be the Tm of what pairs."""
 

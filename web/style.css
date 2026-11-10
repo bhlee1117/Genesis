@@ -1849,3 +1849,9 @@ nav.steps .step-sep {
 .method-enzyme { color: #e0574f; }
 .method-assembly { color: #46b48c; }
 .method-order { color: #d8a33c; }
+
+/* Autosaved plans: listed with the saved designs, but visibly not one. */
+.drafts { margin-bottom: 22px; }
+.drafts h3 { margin: 0 0 4px; font-size: 14px; }
+.drafts > p.muted { margin: 0 0 10px; max-width: 62ch; }
+.drafts .expiring { color: var(--warn-text); font-weight: 600; }

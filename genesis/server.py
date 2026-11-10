@@ -7,7 +7,7 @@ behind the lab network or a VPN rather than on a public host.
 
 API
 ---
-GET  /api/auth-status                   whether a login is needed\nGET  /api/me                            the signed-in user\nPOST /api/login     {username,password} open a session\nPOST /api/logout                        end it\nPOST /api/password  {current,new}       change your own password\nGET  /api/users                         list accounts (admin)\nPOST /api/users     {action,...}        manage accounts (admin)\nGET  /api/stats                         inventory counts
+GET  /api/auth-status                   whether a login is needed\nGET  /api/me                            the signed-in user\nPOST /api/login     {username,password} open a session\nPOST /api/logout                        end it\nPOST /api/password  {current,new}       change your own password\nGET  /api/users                         list accounts (admin)\nPOST /api/users     {action,...}        manage accounts (admin)\nGET  /api/drafts                        autosaved plans still in date\nGET  /api/draft/<id>                    one autosaved plan, spec and all\nPOST /api/discard-draft {draft_id}      throw one away now\nGET  /api/stats                         inventory counts
 GET  /api/owners                        people with plasmids
 GET  /api/plasmids?q=&owner=&limit=     search the inventory
 GET  /api/plasmid/<id>                  sequence + annotations
@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import threading
 import traceback
 import ssl
@@ -41,6 +42,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import auth
 from .config import Config
+from . import drafts
 from .construct import ConstructSpec
 from .db import connect
 from .design import (delete_construct, delete_design, design, save_design,
@@ -235,6 +237,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         emit("progress", {"stage": "done", "label": "Done", "done": 1})
         emit("plan", plan)
+        # Written down before the tab can be closed on it. A failure to
+        # autosave must not break a design that already worked, so it is
+        # reported on the stream and otherwise let go.
+        try:
+            emit("autosaved", self.autosave(conn, spec, plan))
+        except Exception as exc:
+            emit("autosave_failed", {"error": str(exc)})
+
+    def autosave(self, conn, spec, plan) -> dict:
+        """Keep this plan for a week unless somebody saves it properly."""
+        user = self.current_user()
+        return drafts.autosave(conn, spec.to_dict(), plan,
+                               owner=(user.username if user else ""))
 
     def body_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -530,6 +545,19 @@ class Handler(BaseHTTPRequestHandler):
                 } for o in OPERATIONS.values()],
             })
 
+        if path == "/api/drafts":
+            user = self.current_user()
+            return self.json(drafts.recent(
+                c, owner=(user.username if user else "")))
+
+        if path.startswith("/api/draft/"):
+            user = self.current_user()
+            d = drafts.load(c, int(path.rsplit("/", 1)[1]),
+                            owner=(user.username if user else ""))
+            if d is None:
+                return self.json({"error": "not found or expired"}, 404)
+            return self.json(d)
+
         if path == "/api/designs":
             return self.json(rows(
                 """SELECT d.id, d.version, d.owner, d.created_at, c.name,
@@ -641,7 +669,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 spec = ConstructSpec.from_dict(spec_in or {})
             if path == "/api/design":
-                return self.json(design(c, spec, self.cfg))
+                plan = design(c, spec, self.cfg)
+                try:
+                    plan["autosaved"] = self.autosave(c, spec, plan)
+                except Exception as exc:
+                    plan["autosaved"] = {"error": str(exc)}
+                return self.json(plan)
             return self.design_stream(c, spec)
 
         if path == "/api/save":
@@ -657,6 +690,12 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self.json({"error": str(exc)}, 409)
             return self.json(result)
+
+        if path == "/api/discard-draft":
+            user = self.current_user()
+            return self.json(drafts.discard(
+                c, int(body["draft_id"]),
+                owner=(user.username if user else "")))
 
         if path == "/api/delete-design":
             try:
@@ -736,6 +775,12 @@ def serve(cfg: Config, db_path: str | None = None) -> None:
     auth.ensure_schema(conn)
     n_users = auth.count_users(conn)
     auth.purge_expired(conn)
+    # Drafts expire on a wall clock, so a server that was down over the
+    # weekend has a backlog waiting the moment it comes back.
+    stale = drafts.purge(conn)
+    if stale:
+        print(f"discarded {stale} autosaved plan(s) older than "
+              f"{drafts.TTL_DAYS} days", file=sys.stderr)
     conn.close()
 
     reachable = cfg.host not in LOOPBACK

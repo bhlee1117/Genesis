@@ -5526,6 +5526,114 @@ function groupByConstruct(rows) {
   return by;
 }
 
+/**
+ * Plans nobody asked to keep.
+ *
+ * Every design that finishes is written down, so a closed tab - or a
+ * server that stops with the machine it runs on - does not cost the
+ * afternoon. They are listed apart from the saved designs because they
+ * behave differently: these go by themselves after a week of not being
+ * touched, and a saved design never does.
+ */
+async function renderDrafts(out) {
+  var rows;
+  try {
+    rows = await api('/api/drafts');
+  } catch (err) {
+    return;                       // never let this break the saved list
+  }
+  if (!rows || !rows.length) return;
+  var box = h('section', { class: 'drafts' },
+    h('h3', {}, 'Autosaved plans'),
+    h('p', { class: 'muted' },
+      'Kept automatically for 7 days from the last time you ran them, '
+      + 'so closing a tab or restarting the server does not lose the work. '
+      + 'Save a design to keep it for good; these delete themselves.'));
+  box.appendChild(table([
+    { label: 'Construct', key: 'name' },
+    { label: 'Route', key: 'route_id' },
+    { label: 'Last run', key: 'saved_at' },
+    {
+      label: 'Goes in',
+      cell: function (r) {
+        var d = Number(r.days_left);
+        var soon = d <= 1;
+        return h('span', { class: soon ? 'expiring' : '' },
+          d <= 0 ? 'today' : plural(d, 'day'));
+      }
+    },
+    {
+      label: 'Discard',
+      cell: function (r) {
+        return h('span', {
+          class: 'row-delete',
+          onclick: function (e) { e.stopPropagation(); }
+        }, h('button', {
+          type: 'button', class: 'danger',
+          title: 'Discard the autosaved plan for "' + (r.name || 'this construct') + '"',
+          onclick: function () { discardDraft(r); }
+        }, 'discard'));
+      }
+    }
+  ], rows, { onRow: function (r) { openDraft(r.id); } }));
+  out.appendChild(box);
+}
+
+/** Reopen an autosaved plan. It was never saved, so it has no version. */
+async function openDraft(id) {
+  var status = $('designs-status');
+  setStatus(status, 'loading autosaved plan...', 'busy');
+  try {
+    var d = await api('/api/draft/' + id);
+    state.plan = d.plan;
+    state.appliedSuggestion = null;
+    state.spec = d.spec || null;
+    // Deliberately not state.saved: this was never saved, and showing it
+    // as a version would invite an overwrite of something that does not
+    // exist. Saving it goes through the normal Save path and makes one.
+    state.saved = null;
+    state.routeId = d.route_id
+      || (d.plan && d.plan.routes && d.plan.routes.length
+        ? d.plan.routes[0].id : null);
+    var filled = applySpecToBuilder(d.spec);
+    refreshSaveButtons();
+    selectTab('design');
+    renderPlan();
+    setStatus($('design-status'),
+      'reopened the plan autosaved on ' + d.saved_at
+      + (filled ? ' - save it to keep it past ' + d.expires_at
+        : ' - no stored specification, so it cannot be re-saved'),
+      filled ? 'ok' : 'error');
+  } catch (err) {
+    setStatus(status, err.message, 'error');
+  }
+}
+
+function discardDraft(r) {
+  var status = $('designs-status');
+  modal({
+    title: 'Discard an autosaved plan',
+    danger: true,
+    confirmLabel: 'Discard',
+    body: [
+      h('p', null,
+        'This throws away the plan autosaved for ',
+        h('b', null, r.name || 'this construct'),
+        ', which would have gone by itself anyway.'),
+      h('p', { class: 'muted' },
+        'Saved designs are not touched - only the autosave.')
+    ],
+    onConfirm: async function () {
+      try {
+        await api('/api/discard-draft', { draft_id: r.id });
+        renderDesigns();
+      } catch (err) {
+        setStatus(status, err.message, 'error');
+      }
+    }
+  });
+}
+
 async function renderDesigns() {
   var out = $('designs-table');
   var status = $('designs-status');
@@ -5537,6 +5645,7 @@ async function renderDesigns() {
     var by = groupByConstruct(rows);
     var capped = rows.length >= DESIGNS_LIMIT;
     clear(out);
+    await renderDrafts(out);
     out.appendChild(table([
       { label: 'Design', numeric: true, key: 'id' },
       { label: 'Construct', key: 'name' },
