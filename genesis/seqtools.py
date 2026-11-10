@@ -197,8 +197,19 @@ _NN = {
 _R = 1.987  # cal/(mol*K)
 
 
-def tm(seq: str, primer_nm: float = 500.0, na_mm: float = 200.0,
-       mg_mm: float = 2.0, dntp_mm: float = 0.0) -> float:
+#: The reaction the Tm model was calibrated against: 2 mM Mg2+, which is
+#: what Q5 buffer contains, and a monovalent figure fitted to 84 values
+#: from NEB's own API. They are not preferences. Changing either moves
+#: Genesis away from the calculator the bench checks against - at 50 mM,
+#: which is where a config written before the calibration leaves it, the
+#: agreement goes from 0.69 C RMSE to 2.38 C and GC-rich primers read
+#: 2.6 C low again.
+CALIBRATED_NA_MM = 200.0
+CALIBRATED_MG_MM = 2.0
+
+
+def tm(seq: str, primer_nm: float = 500.0, na_mm: float = CALIBRATED_NA_MM,
+       mg_mm: float = CALIBRATED_MG_MM, dntp_mm: float = 0.0) -> float:
     """Nearest-neighbour melting temperature in degrees C.
 
     SantaLucia (1998) unified parameters with the Owczarzy (2008) salt

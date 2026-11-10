@@ -779,6 +779,22 @@ def serve(cfg: Config, db_path: str | None = None) -> None:
     auth.purge_expired(conn)
     # Drafts expire on a wall clock, so a server that was down over the
     # weekend has a backlog waiting the moment it comes back.
+    # A configuration written before the Tm model was calibrated carries
+    # the old ion concentrations, and they override the calibration
+    # silently: every primer is designed and quoted against a model that
+    # no longer agrees with NEB. Say so at startup rather than letting it
+    # be discovered a Tm at a time.
+    from .seqtools import CALIBRATED_MG_MM, CALIBRATED_NA_MM
+    for field, want in (("na_mm", CALIBRATED_NA_MM),
+                        ("mg_mm", CALIBRATED_MG_MM)):
+        have = getattr(cfg, field, want)
+        if abs(have - want) > 0.01:
+            print(f"warning: {field} is {have:g} in the configuration, not "
+                  f"the calibrated {want:g}. Tm values will not agree with "
+                  f"NEB's calculator; remove the line from "
+                  f"~/.genesis/config.json to use the calibrated figure.",
+                  file=sys.stderr)
+
     stale = drafts.purge(conn)
     if stale:
         print(f"discarded {stale} autosaved plan(s) older than "

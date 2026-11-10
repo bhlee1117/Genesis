@@ -5518,6 +5518,53 @@ class TestAMismatchedPairIsRedesigned(unittest.TestCase):
         self.assertEqual(f8.sequence, f8.tail + f8.anneal)
 
 
+class TestTheCalibrationCannotBeSilentlyUndone(unittest.TestCase):
+    """The ion concentrations are part of the Tm model, not preferences.
+
+    A config written before the model was calibrated carried na_mm 50,
+    which overrode the default and put every designed primer back on the
+    old numbers while the validation here, which calls tm() with its own
+    defaults, went on passing. Nothing connected the two.
+    """
+
+    def test_the_config_default_is_the_calibrated_figure(self):
+        from genesis.seqtools import CALIBRATED_MG_MM, CALIBRATED_NA_MM
+        self.assertEqual(Config().na_mm, CALIBRATED_NA_MM)
+        self.assertEqual(Config().mg_mm, CALIBRATED_MG_MM)
+
+    def test_the_reference_set_is_checked_at_the_configured_salt_too(self):
+        # The validation used to call tm() bare, so it measured the
+        # defaults while designs used the config. Measure what designs
+        # actually use.
+        import json, math
+        from genesis.seqtools import tm
+        cfg = Config()
+        ref = json.loads(
+            (Path(__file__).resolve().parent / "neb_tm_reference.json")
+            .read_text())["values"]
+        errs = [tm(s, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm) - t
+                for s, t in ref]
+        rmse = math.sqrt(sum(e * e for e in errs) / len(errs))
+        self.assertLess(rmse, 1.2,
+                        f"at the configured salt the model is {rmse:.2f} C "
+                        f"from NEB")
+
+    def test_the_old_salt_really_was_the_problem(self):
+        # Guards the diagnosis: if 50 mM ever stops being worse, the
+        # explanation above is wrong and should be revisited.
+        import json, math
+        from genesis.seqtools import tm
+        ref = json.loads(
+            (Path(__file__).resolve().parent / "neb_tm_reference.json")
+            .read_text())["values"]
+
+        def rmse(na):
+            e = [tm(s, 500, na, 2.0) - t for s, t in ref]
+            return math.sqrt(sum(x * x for x in e) / len(e))
+
+        self.assertGreater(rmse(50.0), rmse(200.0) + 1.0)
+
+
 class TestTmAgreesWithNEB(unittest.TestCase):
     """NEB's calculator is what a primer is checked against before it is
     ordered, so disagreeing with it is a bug however defensible the

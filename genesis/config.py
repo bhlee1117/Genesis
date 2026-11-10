@@ -8,6 +8,7 @@ defaults are derived from what the lab share actually contains.
 from __future__ import annotations
 
 import json
+from .seqtools import CALIBRATED_MG_MM, CALIBRATED_NA_MM
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -141,8 +142,8 @@ class Config:
     #: 20-80% GC, because NEB's calculator is what a primer gets checked
     #: against before it is ordered and disagreeing with it by 5 C is a
     #: bug however defensible the thermodynamics.
-    na_mm: float = 200.0
-    mg_mm: float = 2.0
+    na_mm: float = CALIBRATED_NA_MM
+    mg_mm: float = CALIBRATED_MG_MM
 
     # --- Stage 10: route ranking weights (higher = more discouraged) -----
     cost_weights: dict = field(default_factory=lambda: {
