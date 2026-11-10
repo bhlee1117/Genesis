@@ -5626,21 +5626,132 @@ class TestPrimerSiteMovesToBetterBases(unittest.TestCase):
                             + revcomp(r.sequence))
         self.assertEqual(products[0], products[1])
 
-    def test_it_reaches_better_bases_than_the_boundary_offers(self):
-        from genesis.seqtools import gc_fraction
+    def test_the_shift_buys_nothing_once_the_tail_is_counted(self):
+        # This used to assert that allowing the site to move reached
+        # better bases. It only looked that way because the stepped-over
+        # bases were left out of the Tm: they sit between the junction
+        # and the annealing region, they are template, and they are in
+        # the duplex from the first cycle. So shifting by N and keeping
+        # length L gives the same molecule, and the same Tm, as not
+        # shifting and using length N+L - the choice collapses, and the
+        # chooser now takes the plain longer primer.
         (f0, _), _ = self._pair(0)
         (f1, _), _ = self._pair(15)
-        self.assertGreater(gc_fraction(f1.anneal), gc_fraction(f0.anneal))
+        self.assertEqual(f1.shift_tail, "",
+                         "a shift was taken although it changes nothing")
+        self.assertEqual(f0.anneal, f1.anneal)
+        self.assertEqual(f1.hybridising, f1.anneal)
+        self.assertEqual(f1.arm, f1.tail)
 
-    def test_the_bases_stepped_over_are_on_the_tail(self):
-        (f, _), _ = self._pair(15)
-        self.assertEqual(f.sequence, f.tail + f.anneal)
-        at = self.template.find(f.anneal)
-        self.assertTrue(f.tail.endswith(self.template[:at]), f.tail)
+    def test_the_whole_duplex_is_what_is_measured(self):
+        from genesis.primers import Primer
+        from genesis.seqtools import tm
+        cfg = Config()
+        # built by hand, because the designer no longer produces one
+        p = Primer(name="x-F", sequence="acgtacgtAAGGCCTTAAGGCCTTAA",
+                   anneal="GCCTTAAGGCCTTAA", tail="acgtacgtAAG",
+                   shift_tail="AAG", direction="F")
+        self.assertEqual(p.hybridising, "AAGGCCTTAAGGCCTTAA")
+        self.assertEqual(p.arm, "acgtacgt")
+        self.assertAlmostEqual(
+            p.to_dict(cfg)["anneal_tm"],
+            tm("AAGGCCTTAAGGCCTTAA", cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm),
+            places=1)
 
-    def test_moving_the_site_is_said_out_loud(self):
-        (f, _), _ = self._pair(15)
-        self.assertTrue(any("moved" in w for w in f.warnings), f.warnings)
+
+class TestAPairHasToShareOneTemperature(unittest.TestCase):
+    """Both primers go in one tube, so the pair is what has to be right."""
+
+    @staticmethod
+    def _lopsided():
+        """A fragment with a cool end and a hot one, which is the shape
+        that pulls a pair apart - and the shape of a real backbone arc,
+        where one junction lands in an AT-rich stretch and the other in
+        a GC-rich one."""
+        import random as _r
+        rng = _r.Random(11)
+        return ("".join(rng.choice("AATG") for _ in range(70))
+                + "".join(rng.choice("ACGT") for _ in range(1200))
+                + "".join(rng.choice("GGCT") for _ in range(70)))
+
+    def test_choosing_the_pair_together_beats_choosing_each_alone(self):
+        # Picking each primer's best site independently optimised a
+        # quantity nobody runs: on this inventory it put 12 of 13 pairs
+        # outside the 5 C NEB's calculator allows, one of them by 19 C.
+        from genesis.primers import pick_anneal_site, pair_anneal_sites
+        from genesis.seqtools import tm
+        cfg = Config()
+        cfg.primer_max_len = 36          # the window this lab designs in
+        t = self._lopsided()
+
+        def hot(region):
+            return tm(region, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+
+        f_alone, _ = pick_anneal_site(t, 0, "F", cfg, False, 0)
+        r_alone, _ = pick_anneal_site(t, len(t), "R", cfg, False, 0)
+        apart_alone = abs(hot(f_alone) - hot(r_alone))
+
+        (f_pair, _), (r_pair, _), gap = pair_anneal_sites(
+            t, 0, len(t), cfg, False, 0)
+        apart_pair = abs(hot(f_pair) - hot(r_pair))
+
+        self.assertAlmostEqual(apart_pair, gap, places=1)
+        self.assertLess(apart_pair, apart_alone,
+                        f"choosing together ({apart_pair:.1f} C apart) did "
+                        f"not beat choosing alone ({apart_alone:.1f} C)")
+
+    def test_a_pair_it_cannot_match_is_warned_about_not_hidden(self):
+        # Some junctions cannot be bridged: both primers are anchored at
+        # their own end of the fragment, and if one end is AT-rich and
+        # the other GC-rich no choice of lengths brings them together.
+        # The guarantee is that this is said on the primer, before the
+        # oligos are ordered, rather than discovered in NEB's calculator.
+        from genesis.primers import design_gibson_pair
+        import random as _r
+        rng = _r.Random(14)
+        cfg = Config()
+        cfg.primer_max_len = 36
+        t = self._lopsided()
+        up = "".join(rng.choice("ACGT") for _ in range(300))
+        dn = "".join(rng.choice("ACGT") for _ in range(300))
+        f, r = design_gibson_pair(0, "frag", t, 0, len(t), up, dn, cfg,
+                                  carry_downstream=False)
+        gap = abs(f.to_dict(cfg)["anneal_tm"] - r.to_dict(cfg)["anneal_tm"])
+        if gap > cfg.primer_pair_max_diff:
+            for p in (f, r):
+                self.assertTrue(
+                    any("differ by" in w for w in p.warnings),
+                    f"{p.name} is {gap:.1f} C from its partner and says "
+                    f"nothing: {p.warnings}")
+
+    def test_an_unbridgeable_pair_says_so_rather_than_hiding_it(self):
+        from genesis.primers import pair_anneal_sites
+        cfg = Config()
+        cfg.primer_pair_max_diff = 0.01        # nothing can satisfy this
+        import random as _r
+        rng = _r.Random(12)
+        template = ("".join(rng.choice("AT") for _ in range(60))
+                    + "".join(rng.choice("ACGT") for _ in range(900))
+                    + "".join(rng.choice("GC") for _ in range(60)))
+        _f, _r2, gap = pair_anneal_sites(template, 0, len(template), cfg,
+                                         False, 0)
+        self.assertGreater(gap, cfg.primer_pair_max_diff)
+
+    def test_the_pool_is_not_truncated_before_the_pair_is_chosen(self):
+        # The cool candidates the other primer needs are not the ones a
+        # single-primer ranking puts first, so truncating the shortlist
+        # hid them and left a 15.8 C gap that a full pool closes.
+        from genesis.primers import rank_anneal_sites
+        import random as _r
+        rng = _r.Random(13)
+        template = "".join(rng.choice("ACGT") for _ in range(900))
+        cfg = Config()
+        full = rank_anneal_sites(template, 0, "F", cfg, False, 0)
+        self.assertEqual(len(full),
+                         cfg.primer_max_len - cfg.primer_min_len + 1,
+                         "the pool was truncated by default")
+        self.assertEqual(len(rank_anneal_sites(template, 0, "F", cfg, False,
+                                               0, keep=2)), 2)
 
 
 class TestEveryPieceInTheTubeIsDrawable(unittest.TestCase):

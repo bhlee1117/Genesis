@@ -5741,13 +5741,26 @@ function discardDraft(r) {
       h('p', { class: 'muted' },
         'Saved designs are not touched - only the autosave.')
     ],
-    onConfirm: async function () {
-      try {
-        await api('/api/discard-draft', { draft_id: r.id });
-        renderDesigns();
-      } catch (err) {
-        setStatus(status, err.message, 'error');
-      }
+    // postJSON, not api(): api()'s second argument is fetch options, so
+    // passing a payload there sends a GET with no body and the server
+    // never sees the draft_id. And the dialog does not close itself -
+    // onConfirm is handed the handle and has to - so a handler that
+    // only awaited left the button looking dead and put its error on a
+    // status line the dialog was covering.
+    onConfirm: function (api_) {
+      setStatus(status, 'discarding the autosave...', 'busy');
+      return postJSON('/api/discard-draft', { draft_id: r.id })
+        .then(function () {
+          api_.close();
+          return renderDesigns();
+        })
+        .then(function () {
+          setStatus(status, 'discarded the autosaved plan for "'
+            + (r.name || 'this construct') + '"', 'ok');
+        }, function (err) {
+          api_.setError(err.message);
+          setStatus(status, 'discard failed', 'error');
+        });
     }
   });
 }

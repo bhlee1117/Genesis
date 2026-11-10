@@ -87,6 +87,11 @@ class Config:
     # --- Stage 9: primer design -----------------------------------------
     primer_tm_target: float = 60.0
     primer_tm_tolerance: float = 3.0
+    #: How far the two primers of one reaction may differ in Tm. They
+    #: anneal in the same tube at the same temperature, so the pair is
+    #: the unit that has to be right, not each primer on its own. NEB's
+    #: own calculator refuses a pair past 5 C.
+    primer_pair_max_diff: float = 5.0
     #: Addgene's PCR cloning protocol: the region that hybridises to the
     #: template is 18-21 bp, which is "usually sufficient to give specificity
     #: and to also be compatible with a standard PCR reaction".

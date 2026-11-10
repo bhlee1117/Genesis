@@ -163,6 +163,97 @@ def anneal_penalty(region: str, cfg: Config, shift: int = 0,
     return score
 
 
+#: What a degree of mismatch between a pair costs, per degree past the
+#: limit. Large enough that no combination of the single-primer criteria
+#: outweighs it, because a pair that cannot share an annealing
+#: temperature is not a pair.
+PAIR_PENALTY = 8.0
+
+
+def rank_anneal_sites(template: str, start: int, direction: str, cfg: Config,
+                      circular: bool = False, max_shift: int = 0,
+                      unique_in: str = "", keep: int = 0) -> list[dict]:
+    """Every site worth considering, best first, with the Tm it would have.
+
+    `pick_anneal_site` answers "which is the best site for this primer",
+    which is the wrong question when the answer has to agree with the
+    other primer's.  This returns the shortlist so the two can be chosen
+    together.
+    """
+    out: list[dict] = []
+    for shift in range(0, max(0, max_shift) + 1):
+        for length in range(cfg.primer_min_len, cfg.primer_max_len + 1):
+            if shift + length > cfg.primer_max_len:
+                break
+            if direction == "F":
+                lo = start + shift
+                region = slice_region(template, lo, lo + length, circular)
+                binding = slice_region(template, start, lo + length, circular)
+            else:
+                hi = start - shift
+                lo = hi - length
+                if lo < 0 and not circular:
+                    break
+                region = revcomp(slice_region(template, lo, hi, circular))
+                binding = revcomp(slice_region(template, lo, start, circular))
+            if len(region) < length:
+                break
+            t = tm(binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+            if t != t:
+                continue
+            out.append({
+                "region": region, "shift": shift, "tm": t,
+                "penalty": anneal_penalty(binding, cfg, shift, unique_in,
+                                          circular)})
+    # Sorted for the single-primer caller; NOT truncated by default,
+    # because the pair search needs the cool candidates a ranking by
+    # single-primer penalty would cut off. The pool is a few hundred at
+    # most - one length window times one shift window - so keeping it
+    # whole costs nothing and a truncated one silently hid the only
+    # sites that could have matched the other primer.
+    out.sort(key=lambda c: c["penalty"])
+    return out[:keep] if keep else out
+
+
+def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
+                      circular: bool = False, max_shift: int = 0,
+                      unique_in: str = "") -> tuple:
+    """Choose both sites of one reaction together.
+
+    A forward and a reverse primer go into the same tube and anneal at
+    the same temperature, so the pair is what has to be right. Choosing
+    each one's best site on its own optimises a quantity nobody runs:
+    it put 12 of 13 pairs on this inventory outside the 5 C that NEB's
+    calculator allows, one of them by 19 C, because the two sites were
+    picked from different stretches of sequence with no reference to
+    each other.
+
+    Returns ((f_region, f_shift), (r_region, r_shift), gap).
+    """
+    fwd = rank_anneal_sites(template, start, "F", cfg, circular, max_shift,
+                            unique_in)
+    rev = rank_anneal_sites(template, end, "R", cfg, circular, max_shift,
+                            unique_in)
+    if not fwd or not rev:
+        f = pick_anneal_site(template, start, "F", cfg, circular, max_shift,
+                             unique_in)
+        r = pick_anneal_site(template, end, "R", cfg, circular, max_shift,
+                             unique_in)
+        return f, r, float("nan")
+
+    limit = getattr(cfg, "primer_pair_max_diff", 5.0)
+    best, best_cost = None, float("inf")
+    for a in fwd:
+        for b in rev:
+            gap = abs(a["tm"] - b["tm"])
+            cost = (a["penalty"] + b["penalty"]
+                    + PAIR_PENALTY * max(0.0, gap - limit))
+            if cost < best_cost:
+                best_cost, best = cost, (a, b, gap)
+    a, b, gap = best
+    return (a["region"], a["shift"]), (b["region"], b["shift"]), gap
+
+
 def pick_anneal_site(template: str, start: int, direction: str, cfg: Config,
                      circular: bool = False, max_shift: int = 0,
                      unique_in: str = "") -> tuple[str, int]:
@@ -183,18 +274,30 @@ def pick_anneal_site(template: str, start: int, direction: str, cfg: Config,
     best, best_score = ("", 0), float("inf")
     for shift in range(0, max(0, max_shift) + 1):
         for length in range(cfg.primer_min_len, cfg.primer_max_len + 1):
+            if shift + length > cfg.primer_max_len:
+                break
             if direction == "F":
                 lo = start + shift
                 region = slice_region(template, lo, lo + length, circular)
+                binding = slice_region(template, start, lo + length, circular)
             else:
                 hi = start - shift
                 lo = hi - length
                 if lo < 0 and not circular:
                     break
                 region = revcomp(slice_region(template, lo, hi, circular))
+                binding = revcomp(slice_region(template, lo, start, circular))
             if len(region) < length:
                 break
-            score = anneal_penalty(region, cfg, shift, unique_in, circular)
+            # Scored on everything that will pair with the template, not
+            # on the part we happen to call the annealing region. The
+            # stepped-over bases sit between the junction and the region
+            # and are template themselves, so they are in the duplex from
+            # the first cycle. Scoring the region alone was aiming at a
+            # 60 C target while building a 77 C oligo, and put 12 of 13
+            # pairs outside the 5 C the forward and reverse primers of
+            # one reaction are allowed to differ by.
+            score = anneal_penalty(binding, cfg, shift, unique_in, circular)
             if score < best_score:
                 best_score, best = score, (region, shift)
     if best[0]:
@@ -339,12 +442,13 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     has to carry both of its junctions.
     """
     shift = max(0, getattr(cfg, "primer_max_shift", 0))
-    f_anneal, f_shift = pick_anneal_site(template, start, "F", cfg,
-                                         circular_template, shift,
-                                         unique_in=template)
-    r_anneal, r_shift = pick_anneal_site(template, end, "R", cfg,
-                                         circular_template, shift,
-                                         unique_in=template)
+    # Chosen together. The two primers of one reaction anneal in the same
+    # tube at the same temperature, so the pair is the unit that has to be
+    # right; picking each one's best site alone optimises a quantity
+    # nobody runs.
+    (f_anneal, f_shift), (r_anneal, r_shift), tm_gap = pair_anneal_sites(
+        template, start, end, cfg, circular_template, shift,
+        unique_in=template)
 
     f_tail = pick_overlap(upstream_seq, cfg, from_end=True,
                           unique_in=unique_in)
@@ -378,6 +482,15 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
 
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)
     rev.warnings = validate_primer(rev, template, cfg, circular_template)
+
+    limit = getattr(cfg, "primer_pair_max_diff", 5.0)
+    if tm_gap == tm_gap and tm_gap > limit:
+        for pr in (fwd, rev):
+            pr.warnings.append(
+                f"this pair's Tms differ by {tm_gap:.1f} C, more than the "
+                f"{limit:.0f} C two primers sharing one annealing step "
+                f"should; no combination of lengths here does better, so "
+                f"run a gradient over the lower Tm")
 
     # Say when the site was moved. A primer that sits 9 bases inside the
     # fragment rather than at its edge is a deliberate choice, and the
@@ -457,8 +570,9 @@ def design_re_pair(fragment_name: str, template: str, start: int, end: int,
     the 6-8 bp recognition site, then the 18-21 bp hybridising region.
     """
     from .enzymes import CATALOG
-    f_anneal = pick_anneal(template, start, "F", cfg, circular_template)
-    r_anneal = pick_anneal(template, end, "R", cfg, circular_template)
+    # Same reasoning as the assembly pair: both go in one tube.
+    (f_anneal, _fs), (r_anneal, _rs), tm_gap = pair_anneal_sites(
+        template, start, end, cfg, circular_template, 0)
     f_tail = r_tail = ""
     if left_enzyme:
         site = CATALOG[left_enzyme].site
@@ -473,6 +587,14 @@ def design_re_pair(fragment_name: str, template: str, start: int, end: int,
                  fragment_name, start, end)
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)
     rev.warnings = validate_primer(rev, template, cfg, circular_template)
+    limit = getattr(cfg, "primer_pair_max_diff", 5.0)
+    if tm_gap == tm_gap and tm_gap > limit:
+        for pr in (fwd, rev):
+            pr.warnings.append(
+                f"this pair's Tms differ by {tm_gap:.1f} C, more than the "
+                f"{limit:.0f} C two primers sharing one annealing step "
+                f"should; no combination of lengths here does better, so "
+                f"run a gradient over the lower Tm")
     return fwd, rev
 
 
