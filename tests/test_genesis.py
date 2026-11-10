@@ -7282,6 +7282,13 @@ class TestTheTwoFiguresAgree(unittest.TestCase):
          "at_start": 5792, "at_end": 16, "features": []},
     ]}
 
+    #: Three fragments round a circle, one of them wrapping the origin -
+    #: which is the normal shape of a pAAV assembly, and the case a naive
+    #: pairwise overlap check gets wrong.
+    PLACED = [{"name": "backbone2", "at_start": 0, "at_end": 5806},
+              {"name": "Kozak+ASAP7y", "at_start": 5791, "at_end": 7138},
+              {"name": "iGluSnFR4f", "at_start": 7114, "at_end": 15}]
+
     @staticmethod
     def _shape(lanes):
         """The fields both ports are responsible for, in order."""
@@ -7336,7 +7343,10 @@ class TestTheTwoFiguresAgree(unittest.TestCase):
           const nested = outermost(input.nested).map(a => a.name);
           const feats = input.sim.sources.map(s => figFeatures(s).map(a => a.name));
           const prod = productFeatures(input.layout, input.span).map(a => a.name);
-          process.stdout.write(JSON.stringify({out, joins, nested, feats, prod}));
+          const overlaps = assemblyOverlaps(input.placed, input.total)
+            .map(o => [o.names[0], o.names[1], o.bp, o.start, o.end]);
+          process.stdout.write(
+            JSON.stringify({out, joins, nested, feats, prod, overlaps}));
         """
         with tempfile.TemporaryDirectory() as tmp:
             drv = Path(tmp) / "drive.js"
@@ -7346,7 +7356,9 @@ class TestTheTwoFiguresAgree(unittest.TestCase):
                                        "plan": self.PLAN,
                                        "nested": self.NESTED,
                                        "layout": self.LAYOUT,
-                                       "span": 7081}))
+                                       "span": 7081,
+                                       "placed": self.PLACED,
+                                       "total": 8935}))
             proc = subprocess.run(
                 [node, str(drv), str(app), str(inp)],
                 capture_output=True, text=True, cwd=str(app.parent.parent))
@@ -7381,6 +7393,19 @@ class TestTheTwoFiguresAgree(unittest.TestCase):
              for src in self.SIM["sources"]])
         self.assertNotIn("Voltron2", payload["feats"][0],
                          "a CDS buried in the CAG promoter is not a part")
+
+        # ...and where the two ports think the fragments overlap, which
+        # has to agree or the figure and the bench disagree about how
+        # much homology the assembly actually has.
+        from genesis.figure import assembly_overlaps
+        self.assertEqual(
+            payload["overlaps"],
+            [[o["names"][0], o["names"][1], o["bp"], o["start"], o["end"]]
+             for o in assembly_overlaps(self.PLACED, 8935)],
+            "the two ports find different overlaps")
+        self.assertEqual(
+            [o[2] for o in payload["overlaps"]], [15, 15, 24],
+            "the join that wraps the origin was missed or mismeasured")
 
         # ...and on the product circle
         from genesis.figure import product_features

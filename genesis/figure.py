@@ -351,3 +351,42 @@ def junction_colours(lanes: list) -> dict:
                         JUNCTION_COLOURS[order.index(name)
                                          % len(JUNCTION_COLOURS)])
             for i, side, name in ids}
+
+
+def assembly_overlaps(placed: list, total: int) -> list:
+    """Where two fragments share sequence on the assembled product.
+
+    A HiFi or Gibson join is not a butt joint. The two fragments are
+    built to end in the same 15-25 bases; the exonuclease chews one
+    strand of each back, and the shared stretch is what anneals. On the
+    product that stretch belongs to both fragments at once, so a figure
+    that paints each fragment one flat colour cannot show it and a
+    person reading the figure cannot tell a 15 bp join from a 40 bp one.
+
+    A fragment that wraps the origin is treated as its two spans, so the
+    join crossing position 1 - which is most of them on a pAAV, where
+    the backbone starts at the ITR - is found like any other.
+    """
+    spans = []
+    for i, s in enumerate(placed):
+        a, b = s.get("at_start"), s.get("at_end")
+        if not isinstance(a, int) or not isinstance(b, int):
+            continue
+        segs = [(a, total), (0, b)] if b < a else [(a, b)]
+        spans.append({"i": i, "name": s.get("name", ""),
+                      "flipped": bool(s.get("flipped")), "segs": segs})
+
+    out = []
+    for ai, A in enumerate(spans):
+        for B in spans[ai + 1:]:
+            for lo_a, hi_a in A["segs"]:
+                for lo_b, hi_b in B["segs"]:
+                    lo, hi = max(lo_a, lo_b), min(hi_a, hi_b)
+                    if hi > lo:
+                        out.append({
+                            "start": lo, "end": hi, "bp": hi - lo,
+                            "names": [A["name"], B["name"]],
+                            "indexes": [A["i"], B["i"]],
+                            "flipped": A["flipped"] or B["flipped"],
+                        })
+    return sorted(out, key=lambda o: o["start"])

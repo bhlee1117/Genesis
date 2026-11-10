@@ -855,7 +855,8 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                       "annealing temperature.", 8.6, gray=0.4)
         rows = []
         for pr in p["primers"]:
-            seq = (pr["tail"].lower() + pr["anneal"].upper()) if pr["tail"] \
+            seq = (pr.get("arm", pr["tail"]).lower()
+                   + pr.get("hybridising", pr["anneal"]).upper()) if pr["tail"] \
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             rows.append([pr["name"], pr["direction"], f"{pr['length']}",
@@ -1040,6 +1041,19 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                 plasmid_track(doc, "assembled product",
                               f"{sim['product_bp']:,} bp",
                               sim["product_bp"], blocks)
+                from .figure import assembly_overlaps
+                overlaps = assembly_overlaps(placed, sim["product_bp"])
+                if overlaps:
+                    doc.paragraph(
+                        "Where two fragments share sequence, that shared "
+                        "stretch is the homology the assembly anneals "
+                        "through - it belongs to both of them, and it is "
+                        "what the exonuclease chews back to.", 8.6)
+                    doc.table(
+                        ["Join", "Overlap", "On the product"],
+                        [[f"{o['names'][0]} / {o['names'][1]}",
+                          f"{o['bp']:,} bp",
+                          f"{o['start']:,}-{o['end']:,}"] for o in overlaps])
                 doc.table(["Fragment", "Cut from", "Length", "Lands at"],
                           [[x["name"],
                             f"{x['template']}  {x.get('from_start')}-"
@@ -1231,7 +1245,8 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
                 "Sequence (5'->3') |",
                 "|---|---|---|---|---|---|---|"]
         for pr in p["primers"]:
-            seq = (pr["tail"].lower() + pr["anneal"].upper()) if pr["tail"] \
+            seq = (pr.get("arm", pr["tail"]).lower()
+                   + pr.get("hybridising", pr["anneal"]).upper()) if pr["tail"] \
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             out.append(f"| {pr['name']} | {pr['direction']} | {pr['length']} | "

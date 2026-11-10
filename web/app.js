@@ -647,6 +647,39 @@ function buildMapSvg(width, span, list, opts) {
     }
   });
 
+  /* Overlaps on top of the blocks they join: the shared bases belong to
+     both fragments, so they are hatched in both colours and labelled with
+     how many there are. A join narrower than a few pixels still gets its
+     band - 15 bp on a 9 kb product is under a pixel - so the label is what
+     carries the number, and the band is only there to point at it. */
+  var overlaps = opts.overlaps || [];
+  if (overlaps.length) {
+    var defs = svg('defs', null);
+    root.appendChild(defs);
+    overlaps.forEach(function (ov) {
+      var ox = x(ov.start);
+      var ow = Math.max(x(ov.end) - ox, 3);
+      // A join to a flipped fragment spans both tracks, because the two
+      // blocks it belongs to sit on opposite sides of the axis.
+      var oy = axis - FEAT_RISE;
+      var oh = ov.reverse ? (axis + FEAT_DROP + FEAT_H) - oy : FEAT_H;
+      var band = svg('rect', {
+        x: ox, y: oy, width: ow, height: oh, rx: 2,
+        fill: 'url(#' + stripePattern(defs, ov.colours) + ')',
+        class: 'feat-overlap'
+      });
+      band.appendChild(svg('title', null,
+        ov.bp + ' bp shared by ' + ov.names[0] + ' and ' + ov.names[1] +
+        '\n' + ov.start + '–' + ov.end +
+        '\nthis is the homology the assembly anneals through'));
+      root.appendChild(band);
+      root.appendChild(svg('text', {
+        x: ox + ow / 2, y: oy - 5,
+        class: 'overlap-label', 'text-anchor': 'middle'
+      }, ov.bp + ' bp'));
+    });
+  }
+
   // Markers last, so their ticks read on top of the feature blocks.
   var fwdTop = axis - FEAT_RISE;
   fwd.forEach(function (m) {
@@ -903,6 +936,64 @@ function circularMap(length, items, opts) {
   return h('div', null, host, captionHost, note);
 }
 
+/**
+ * Where two fragments share sequence on the assembled product.
+ *
+ * A HiFi or Gibson join is not a butt joint: the two fragments are made
+ * to end in the same 15-25 bases, the exonuclease chews one strand back
+ * and the shared stretch is what anneals. On the product that stretch
+ * belongs to both fragments at once, which is exactly what a flat block
+ * of one colour cannot show.
+ *
+ * A fragment that wraps the origin is two spans, so the join that
+ * crosses position 1 is found like any other.
+ */
+function assemblyOverlaps(placed, total) {
+  var spans = placed.map(function (s, i) {
+    var a = s.at_start, b = s.at_end;
+    return {
+      i: i, name: s.name, reverse: !!s.flipped,
+      segs: (b < a) ? [[a, total], [0, b]] : [[a, b]]
+    };
+  });
+  var out = [];
+  spans.forEach(function (A, ai) {
+    spans.slice(ai + 1).forEach(function (B) {
+      A.segs.forEach(function (sa) {
+        B.segs.forEach(function (sb) {
+          var lo = Math.max(sa[0], sb[0]);
+          var hi = Math.min(sa[1], sb[1]);
+          if (hi > lo) {
+            out.push({
+              start: lo, end: hi, bp: hi - lo,
+              names: [A.name, B.name],
+              reverse: A.reverse || B.reverse,
+              colours: [fragmentHue(A.i), fragmentHue(B.i)]
+            });
+          }
+        });
+      });
+    });
+  });
+  return out.sort(function (a, b) { return a.start - b.start; });
+}
+
+var STRIPE_SEQ = 0;
+
+/** A two-colour 45-degree hatch, so an overlap reads as both fragments. */
+function stripePattern(defs, colours) {
+  var id = 'ov-stripe-' + (++STRIPE_SEQ);
+  var pat = svg('pattern', {
+    id: id, width: 8, height: 8,
+    patternUnits: 'userSpaceOnUse',
+    patternTransform: 'rotate(45)'
+  });
+  pat.appendChild(svg('rect', { width: 4, height: 8, fill: colours[0] }));
+  pat.appendChild(svg('rect', { x: 4, width: 4, height: 8, fill: colours[1] }));
+  defs.appendChild(pat);
+  return id;
+}
+
 function featureMap(length, items, opts) {
   opts = opts || {};
   var span = Math.max(Number(length) || 0, 1);
@@ -917,7 +1008,8 @@ function featureMap(length, items, opts) {
   // dropped is only known after a draw; the footnote is refreshed from here.
   var info = { hidden: 0 };
   var mapOpts = {
-    label: opts.label, circular: opts.circular, markers: marks, info: info
+    label: opts.label, circular: opts.circular, markers: marks, info: info,
+    overlaps: opts.overlaps || []
   };
 
   var host = h('div', { class: 'map-svg' });
@@ -4073,15 +4165,36 @@ function renderSimulation(route, plan) {
   });
   if (placed.length && sim.product_bp) {
     card.appendChild(h('h4', null, 'How they go together'));
+    var overlaps = assemblyOverlaps(placed, sim.product_bp);
     card.appendChild(h('p', { class: 'muted small' },
       'The simulated product, coloured by which reaction each stretch ' +
-      'came out of. An arc that wraps past the top crosses position 1.'));
+      'came out of. An arc that wraps past the top crosses position 1. ' +
+      (overlaps.length
+        ? 'Hatched in two colours is sequence both fragments carry: that ' +
+          'is the homology the assembly anneals through, labelled with ' +
+          'how long it is.'
+        : '')));
     card.appendChild(featureMap(sim.product_bp, placed.map(function (s, i) {
       return { type: 'fragment', name: s.name, start: s.at_start,
                end: s.at_end < s.at_start ? sim.product_bp : s.at_end,
                strand: s.flipped ? -1 : 1,
                colour: fragmentHue(sources.indexOf(s)) };
-    }), { label: 'assembled product', circular: true }));
+    }), { label: 'assembled product', circular: true, overlaps: overlaps }));
+
+    if (overlaps.length) {
+      card.appendChild(table([
+        { label: 'Join', cell: function (o) {
+            return h('span', null,
+              h('span', { class: 'sim-swatch',
+                          style: 'background:' + o.colours[0] }),
+              h('span', { class: 'sim-swatch',
+                          style: 'background:' + o.colours[1] }),
+              ' ' + o.names[0] + ' / ' + o.names[1]); } },
+        { label: 'Overlap', numeric: true, cell: function (o) { return bp(o.bp); } },
+        { label: 'On the product', cell: function (o) {
+            return bp(o.start) + '-' + bp(o.end); } }
+      ], overlaps));
+    }
 
     card.appendChild(table([
       { label: 'Fragment', cell: function (s) {
@@ -5397,9 +5510,14 @@ function renderRouteDetail(route) {
     { label: 'Anneal Tm', numeric: true, cell: function (p) { return num(p.anneal_tm, 1); } },
     { label: 'GC', numeric: true, cell: function (p) { return pct(p.gc); } },
     { label: 'Sequence (tail / anneal)', cell: function (p) {
+        // Lower case means "does not pair with the template", so the
+        // stepped-over bases belong with the annealing region however
+        // they are stored.
+        var arm = p.arm === undefined ? p.tail : p.arm;
+        var binds = p.hybridising || p.anneal || '';
         return h('span', { class: 'mono seq' },
-          p.tail ? h('span', { class: 'tail' }, String(p.tail).toLowerCase()) : null,
-          h('span', { class: 'anneal' }, String(p.anneal || '').toUpperCase())); } },
+          arm ? h('span', { class: 'tail' }, String(arm).toLowerCase()) : null,
+          h('span', { class: 'anneal' }, String(binds).toUpperCase())); } },
     { label: 'Warnings', cell: function (p) { return warnCell(p.warnings); } }
   ], primers));
 

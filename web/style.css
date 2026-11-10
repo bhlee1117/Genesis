@@ -1855,3 +1855,10 @@ nav.steps .step-sep {
 .drafts h3 { margin: 0 0 4px; font-size: 14px; }
 .drafts > p.muted { margin: 0 0 10px; max-width: 62ch; }
 .drafts .expiring { color: var(--warn-text); font-weight: 600; }
+
+/* Assembly overlaps: sequence that belongs to two fragments at once. */
+.feat-overlap { stroke: var(--panel); stroke-width: 0.75; }
+.overlap-label {
+  font-size: 9px; font-weight: 600; fill: var(--text-muted);
+  paint-order: stroke; stroke: var(--panel); stroke-width: 2.5px;
+}

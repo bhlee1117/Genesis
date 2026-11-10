@@ -39,6 +39,20 @@ class Primer:
         return len(self.sequence)
 
     @property
+    def arm(self) -> str:
+        """The 5' part that does NOT pair with the template.
+
+        The overlap or adapter proper, with the stepped-over template
+        taken back off the end of it. This is the only part that should
+        be drawn as a tail: `shift_tail` sits in `tail` structurally,
+        because that is where it has to be spliced, but it is template
+        and it anneals, and printing it in lower case under a legend
+        that says lower case does not bind states the opposite.
+        """
+        return self.tail[:len(self.tail) - len(self.shift_tail)] \
+            if self.shift_tail else self.tail
+
+    @property
     def hybridising(self) -> str:
         """Everything in this oligo that base-pairs with the template.
 
@@ -61,6 +75,7 @@ class Primer:
         cfg = cfg or Config()
         d = asdict(self)
         d["length"] = self.length
+        d["arm"] = self.arm
         d["hybridising"] = self.hybridising
         d["anneal_tm"] = tm(self.hybridising, cfg.primer_conc_nm,
                             cfg.na_mm, cfg.mg_mm)
@@ -372,8 +387,10 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
         if moved:
             p.warnings.append(
                 f"annealing site moved {moved} bp into the fragment to reach "
-                f"better bases; those {moved} bp are carried on the tail, so "
-                f"the product is unchanged")
+                f"better bases; the primer re-supplies those {moved} bp, so "
+                f"the product is unchanged. They are template and they "
+                f"anneal, so they are shown in upper case and the Tm above "
+                f"includes them")
 
     # Only the homology arm is an overlap. The bases added to reach a
     # better annealing site are template, not homology, and measuring
