@@ -7,7 +7,7 @@ behind the lab network or a VPN rather than on a public host.
 
 API
 ---
-GET  /api/auth-status                   whether a login is needed\nGET  /api/me                            the signed-in user\nPOST /api/login     {username,password} open a session\nPOST /api/logout                        end it\nPOST /api/password  {current,new}       change your own password\nGET  /api/users                         list accounts (admin)\nPOST /api/users     {action,...}        manage accounts (admin)\nGET  /api/drafts                        autosaved plans still in date\nGET  /api/draft/<id>                    one autosaved plan, spec and all\nPOST /api/discard-draft {draft_id}      throw one away now\nGET  /api/stats                         inventory counts
+GET  /api/auth-status                   whether a login is needed\nGET  /api/me                            the signed-in user\nPOST /api/login     {username,password} open a session\nPOST /api/logout                        end it\nPOST /api/password  {current,new}       change your own password\nGET  /api/users                         list accounts (admin)\nPOST /api/users     {action,...}        manage accounts (admin)\nGET  /api/drafts                        autosaved plans still in date\nGET  /api/draft/<id>                    one autosaved plan, spec and all\nPOST /api/discard-draft {draft_id}      throw one away now\nGET  /api/stats                         inventory counts, and when the code last changed
 GET  /api/owners                        people with plasmids
 GET  /api/plasmids?q=&owner=&limit=     search the inventory
 GET  /api/plasmid/<id>                  sequence + annotations
@@ -361,7 +361,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(auth.list_users(c))
 
         if path == "/api/stats":
+            from .version import last_updated
             return self.json({
+                "updated": last_updated(),
                 "plasmids": one("SELECT COUNT(*) n FROM plasmid")["n"],
                 "parts": one("SELECT COUNT(*) n FROM part")["n"],
                 "annotations": one("SELECT COUNT(*) n FROM annotation")["n"],

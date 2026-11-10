@@ -5408,6 +5408,59 @@ class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
         conn.close()
 
 
+class TestWhichGenesisIsRunning(unittest.TestCase):
+    """The header has to say which build answered the request."""
+
+    def test_it_reports_a_date_and_where_the_date_came_from(self):
+        from genesis.version import last_updated
+        u = last_updated(refresh=True)
+        self.assertIn(u["source"], ("git", "files"))
+        self.assertRegex(u["date"] or "", r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_a_copy_without_a_checkout_still_answers(self):
+        # Taken to another machine as a plain directory, git says
+        # nothing and the files have to.
+        import genesis.version as V
+        real = V._from_git
+        try:
+            V._from_git = lambda root: None
+            u = V.last_updated(refresh=True)
+            self.assertEqual(u["source"], "files")
+            self.assertRegex(u["date"] or "", r"^\d{4}-\d{2}-\d{2}$")
+            self.assertEqual(u["commit"], "")
+        finally:
+            V._from_git = real
+            V.last_updated(refresh=True)
+
+    def test_uncommitted_edits_are_not_reported_as_the_commit_date(self):
+        # A dev server running edited files is a different Genesis from
+        # the commit it sits on, and dating it to the commit would say
+        # the opposite.
+        import genesis.version as V
+        real_git, real_dirty, real_files = V._from_git, V._dirty, V._from_files
+        try:
+            V._from_git = lambda root: ("2020-01-01", "abc1234")
+            V._dirty = lambda root: True
+            V._from_files = lambda root: "2026-11-10"
+            u = V.last_updated(refresh=True)
+            self.assertEqual(u["date"], "2026-11-10")
+            self.assertTrue(u["modified"])
+            self.assertEqual(u["commit"], "abc1234")
+        finally:
+            V._from_git, V._dirty, V._from_files = real_git, real_dirty, real_files
+            V.last_updated(refresh=True)
+
+    def test_it_carries_the_fields_the_header_reads(self):
+        # showLastUpdated() reads date, source, commit and modified;
+        # a rename here would blank the corner of the header silently.
+        from genesis.version import last_updated
+        u = last_updated(refresh=True)
+        for key in ("date", "source", "commit", "modified"):
+            self.assertIn(key, u)
+        self.assertIsInstance(u["modified"], bool)
+        self.assertIsInstance(u["commit"], str)
+
+
 class TestAutosavedDrafts(unittest.TestCase):
     """Plans kept without being asked, and deleted without being asked."""
 

@@ -1138,11 +1138,35 @@ async function loadStats() {
       node.appendChild(h('span', { class: 'stat' },
         h('b', null, String(n)), ' ', pair[0] + (n === 1 ? '' : 's')));
     });
+    showLastUpdated(s.updated);
     populatePartTypes(s.by_type || []);
   } catch (err) {
     clear(node);
     node.appendChild(h('span', { class: 'stat-error' }, err.message));
   }
+}
+
+/**
+ * When the running code was last changed, in the corner of the header.
+ *
+ * Everyone reaches this over the network from one Mac, so there is
+ * otherwise no way to tell from the browser whether the server has been
+ * restarted on newer code - which matters when a fix changes what a
+ * protocol says. The date is the commit's; the tooltip carries the sha,
+ * and says so when the checkout has uncommitted edits on top of it.
+ */
+function showLastUpdated(u) {
+  if (!u || !u.date) return;
+  var node = $('version');
+  if (!node) return;
+  clear(node);
+  var detail = u.source === 'git'
+    ? ('commit ' + u.commit + (u.modified ? ', plus uncommitted edits' : ''))
+    : 'dated from the files on disk; this copy is not a git checkout';
+  node.appendChild(h('span', {
+    class: 'version-stamp' + (u.modified ? ' version-dirty' : ''),
+    title: 'Genesis last changed on ' + u.date + ' (' + detail + ')'
+  }, 'updated ', h('b', null, u.date)));
 }
 
 /* ------------------------------------------------------------------ */
