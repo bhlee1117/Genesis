@@ -5408,6 +5408,72 @@ class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
         conn.close()
 
 
+class TestQuotedTmIsWhatBinds(unittest.TestCase):
+    """The Tm on the order sheet has to be the Tm of what pairs."""
+
+    def test_bases_the_site_stepped_over_count_toward_the_tm(self):
+        # A primer is [overlap arm][shift_tail][anneal].  shift_tail is a
+        # slice of the template, copied from it and put back on the tail
+        # so the amplicon is not short - which means it base-pairs like
+        # any other template sequence.  Quoting `anneal` alone understated
+        # the ASAP7y forward primer by 6.6 C, and the NEB calculator, fed
+        # the real 21-mer, disagreed with us by exactly that much.
+        from genesis.primers import Primer
+        from genesis.seqtools import tm
+        from genesis.config import Config
+        cfg = Config()
+        p = Primer(name="x-F", sequence="gtcagatccggtagtGCCACCATGGAGACGACTGTG",
+                   anneal="ACCATGGAGACGACTGTG", tail="gtcagatccggtagtGCC",
+                   shift_tail="GCC", direction="F")
+        self.assertEqual(p.hybridising, "GCCACCATGGAGACGACTGTG")
+        d = p.to_dict(cfg)
+        self.assertAlmostEqual(
+            d["anneal_tm"], tm("GCCACCATGGAGACGACTGTG", cfg.primer_conc_nm,
+                               cfg.na_mm, cfg.mg_mm), places=1)
+        self.assertGreater(d["anneal_tm"],
+                           tm("ACCATGGAGACGACTGTG", cfg.primer_conc_nm,
+                              cfg.na_mm, cfg.mg_mm) + 5,
+                           "three GC bases are worth more than 5 C here")
+        # GC is quoted for the same stretch the Tm is
+        self.assertAlmostEqual(d["gc"], 13 / 21, places=2)
+
+    def test_a_primer_that_stepped_over_nothing_is_unchanged(self):
+        from genesis.primers import Primer
+        from genesis.seqtools import tm
+        from genesis.config import Config
+        cfg = Config()
+        p = Primer(name="x-R", sequence="acgtacgtGGTTACCACTTCAAGTTGTTTC",
+                   anneal="GGTTACCACTTCAAGTTGTTTC", tail="acgtacgt",
+                   shift_tail="", direction="R")
+        self.assertEqual(p.hybridising, "GGTTACCACTTCAAGTTGTTTC")
+        self.assertAlmostEqual(
+            p.to_dict(cfg)["anneal_tm"],
+            tm("GGTTACCACTTCAAGTTGTTTC", cfg.primer_conc_nm, cfg.na_mm,
+               cfg.mg_mm), places=1)
+
+    def test_the_overlap_tail_is_still_left_out(self):
+        # The point of quoting the annealing region at all: the Gibson
+        # arm does not pair with the template and must not inflate the
+        # number the thermocycler is set from.
+        from genesis.primers import Primer
+        from genesis.config import Config
+        cfg = Config()
+        arm = "ttgggcccctgttaaaat"
+        p = Primer(name="x-F", sequence=arm + "GCC" + "ACCATGGAGACGACTGTG",
+                   anneal="ACCATGGAGACGACTGTG", tail=arm + "GCC",
+                   shift_tail="GCC", direction="F")
+        d = p.to_dict(cfg)
+        self.assertLess(d["anneal_tm"], d["full_tm"] - 5,
+                        "the overlap arm leaked into the annealing Tm")
+
+    def test_the_site_drawn_on_the_map_is_the_site_that_binds(self):
+        from genesis.protocol import _anneal_site
+        pr = {"target_start": 2221, "target_end": 3508, "direction": "F",
+              "anneal": "ACCATGGAGACGACTGTG",
+              "hybridising": "GCCACCATGGAGACGACTGTG"}
+        self.assertEqual(_anneal_site(pr), "2,221-2,242 ->")
+
+
 class TestPrimerSiteMovesToBetterBases(unittest.TestCase):
     """A junction is where the DNA joins, not where a primer must bind.
 

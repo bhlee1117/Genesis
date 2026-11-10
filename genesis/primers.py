@@ -38,13 +38,34 @@ class Primer:
     def length(self) -> int:
         return len(self.sequence)
 
+    @property
+    def hybridising(self) -> str:
+        """Everything in this oligo that base-pairs with the template.
+
+        `anneal` is the stretch the designer picked, but it is not always
+        all of it.  When the annealing site has to step inward to find a
+        unique or well-behaved sequence, the bases it stepped over are put
+        back on the 3' end of the tail - they are a slice of the template,
+        copied from it, and they anneal to it like any other.
+
+        Quoting `anneal` alone therefore understates the temperature at
+        which the primer finds its site, and understates it most where it
+        matters: the step is usually a few bases of a Kozak or a
+        restriction site, which are GC-rich.  Three such bases were worth
+        6.6 C on the ASAP7y forward primer, and the NEB calculator, fed
+        the real 21-mer, disagreed with us by exactly that.
+        """
+        return self.shift_tail + self.anneal
+
     def to_dict(self, cfg: Config | None = None) -> dict:
         cfg = cfg or Config()
         d = asdict(self)
         d["length"] = self.length
-        d["anneal_tm"] = tm(self.anneal, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+        d["hybridising"] = self.hybridising
+        d["anneal_tm"] = tm(self.hybridising, cfg.primer_conc_nm,
+                            cfg.na_mm, cfg.mg_mm)
         d["full_tm"] = tm(self.sequence, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
-        d["gc"] = round(gc_fraction(self.anneal), 3)
+        d["gc"] = round(gc_fraction(self.hybridising), 3)
         return d
 
 
@@ -211,11 +232,15 @@ def validate_primer(primer: Primer, template: str, cfg: Config,
     """Run the Stage 9 primer checks and return human-readable warnings."""
     w: list[str] = []
     anneal = primer.anneal
+    # The Tm check asks what the oligo does on the template, so it is run
+    # on everything that pairs with it; the length checks below ask what
+    # the designer chose, so they stay on the region that was designed.
+    binding = primer.hybridising
     full = primer.sequence
 
-    t = tm(anneal, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+    t = tm(binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
     if t != t:
-        n_ambig = sum(1 for ch in anneal if ch not in "ACGT")
+        n_ambig = sum(1 for ch in binding if ch not in "ACGT")
         w.append(f"the source sequence has {n_ambig} ambiguous base(s) at this "
                  f"primer site, so no reliable primer can be designed here; "
                  f"re-sequence this region or choose another source plasmid")

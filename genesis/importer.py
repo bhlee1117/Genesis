@@ -583,6 +583,20 @@ def reclassify(conn: sqlite3.Connection, progress=None) -> dict:
                   name, start, end, strand, confidence, evidence
            FROM annotation""").fetchall()
 
+    # The motif library is a rule too.  A label that was never written
+    # down cannot be re-derived from the database, but a motif can be
+    # found again in the sequence, and until this ran a motif added after
+    # a plasmid was imported stayed invisible on it for good: YD030's
+    # Lucy-Rho leader sat there as "unknown", and a planner that cannot
+    # see a trafficking motif leaves it in the backbone and fuses it to
+    # whatever payload goes in next.
+    motifs_added = _rescan_motifs(conn)
+
+    rows = conn.execute(
+        """SELECT id, plasmid_id, feature_type, original_label, original_key,
+                  name, start, end, strand, confidence, evidence
+           FROM annotation""").fetchall()
+
     changes = []
     for r in rows:
         if r["evidence"] == "file":
@@ -676,6 +690,7 @@ def reclassify(conn: sqlite3.Connection, progress=None) -> dict:
     conn.commit()
     return {
         "annotations": len(rows),
+        "motifs_added": motifs_added,
         "relabelled": len(changes),
         "moved": dict(sorted(moved.items(), key=lambda kv: -kv[1])),
         "occurrences_dropped": dropped,
@@ -875,3 +890,46 @@ def join_fusions(conn: sqlite3.Connection, progress=None) -> dict:
     return {"plasmids_examined": len(ids), "fusions_found": examined,
             "parts_created": created, "occurrences_linked": linked,
             "named": dict(sorted(names.items(), key=lambda kv: -kv[1])[:12])}
+
+
+def _rescan_motifs(conn: sqlite3.Connection) -> int:
+    """Look for motifs the library has learned since each plasmid was read.
+
+    A scan is keyed on file timestamps, so a motif added to the library
+    afterwards is never looked for again - the files have not changed.
+    The sequences are in the database, though, so this costs nothing from
+    the share.  Only hits nothing already accounts for are added, on the
+    same rule `annotations_for` uses when the file is first read.
+    """
+    from .vocab import find_motifs
+
+    added = 0
+    for p in conn.execute(
+            """SELECT id, seq, circular FROM plasmid
+                WHERE seq IS NOT NULL AND seq <> ''""").fetchall():
+        existing = [dict(r) for r in conn.execute(
+            """SELECT feature_type, start, end, strand FROM annotation
+                WHERE plasmid_id = ?""", (p["id"],))]
+        spans = {(a["start"], a["end"], a["strand"]) for a in existing}
+        for m in find_motifs(p["seq"], circular=bool(p["circular"])):
+            if (m["start"], m["end"], m["strand"]) in spans:
+                continue
+            if any(a["feature_type"] == m["feature_type"]
+                   and not (a["end"] <= m["start"] or a["start"] >= m["end"])
+                   for a in existing):
+                continue
+            conn.execute(
+                """INSERT INTO annotation(plasmid_id, feature_type, name,
+                        original_label, original_key, start, end, strand,
+                        evidence, confidence, qualifiers)
+                   VALUES (?,?,?,'',?,?,?,?,'motif',?,?)""",
+                (p["id"], m["feature_type"], m["name"],
+                 f"motif:{m['level']}", m["start"], m["end"], m["strand"],
+                 0.9 if m["level"] == "protein" else 0.85,
+                 _json_dumps({"note": m.get("note", "")})))
+            existing.append({"feature_type": m["feature_type"],
+                             "start": m["start"], "end": m["end"],
+                             "strand": m["strand"]})
+            added += 1
+    conn.commit()
+    return added

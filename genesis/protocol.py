@@ -457,7 +457,9 @@ def _anneal_site(pr: dict) -> str:
     inside the region being cut out.
     """
     start, end = pr.get("target_start"), pr.get("target_end")
-    anneal = len(pr.get("anneal") or "")
+    # target_start/end bracket everything that pairs with the template,
+    # which includes the bases the annealing site stepped over.
+    anneal = len(pr.get("hybridising") or pr.get("anneal") or "")
     if start is None or end is None or start == end or not anneal:
         return "-"
     if pr.get("direction") == "F":
@@ -496,7 +498,7 @@ def _primer_marks(route: dict, template_name: str) -> list[dict]:
         start, end = pr.get("target_start"), pr.get("target_end")
         if start is None or end is None or start == end:
             continue
-        anneal = len(pr.get("anneal") or "")
+        anneal = len(pr.get("hybridising") or pr.get("anneal") or "")
         if not anneal:
             continue
         if pr.get("direction") == "F":
