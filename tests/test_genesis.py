@@ -5519,144 +5519,45 @@ class TestAutosavedDrafts(unittest.TestCase):
         conn.close()
 
 
-class TestQuotedTmIsWhatBinds(unittest.TestCase):
-    """The Tm on the order sheet has to be the Tm of what pairs."""
+class TestTheQuotedTmIsTheAnnealingRegion(unittest.TestCase):
+    """What the thermocycler is set from has to be what pairs.
 
-    def test_bases_the_site_stepped_over_count_toward_the_tm(self):
-        # A primer is [overlap arm][shift_tail][anneal].  shift_tail is a
-        # slice of the template, copied from it and put back on the tail
-        # so the amplicon is not short - which means it base-pairs like
-        # any other template sequence.  Quoting `anneal` alone understated
-        # the ASAP7y forward primer by 6.6 C, and the NEB calculator, fed
-        # the real 21-mer, disagreed with us by exactly that much.
+    A primer is [overlap tail][annealing region]. The tail is the
+    neighbouring fragment's sequence, carried so the two amplicons can
+    anneal to each other; it does not pair with the template this primer
+    sits on, and quoting the Tm of the whole oligo is a common way to
+    set an annealing temperature ten degrees too high.
+    """
+
+    def test_the_overlap_tail_is_left_out(self):
         from genesis.primers import Primer
         from genesis.seqtools import tm
-        from genesis.config import Config
-        cfg = Config()
-        p = Primer(name="x-F", sequence="gtcagatccggtagtGCCACCATGGAGACGACTGTG",
-                   anneal="ACCATGGAGACGACTGTG", tail="gtcagatccggtagtGCC",
-                   shift_tail="GCC", direction="F")
-        self.assertEqual(p.hybridising, "GCCACCATGGAGACGACTGTG")
-        d = p.to_dict(cfg)
-        self.assertAlmostEqual(
-            d["anneal_tm"], tm("GCCACCATGGAGACGACTGTG", cfg.primer_conc_nm,
-                               cfg.na_mm, cfg.mg_mm), places=1)
-        self.assertGreater(d["anneal_tm"],
-                           tm("ACCATGGAGACGACTGTG", cfg.primer_conc_nm,
-                              cfg.na_mm, cfg.mg_mm) + 5,
-                           "three GC bases are worth more than 5 C here")
-        # GC is quoted for the same stretch the Tm is
-        self.assertAlmostEqual(d["gc"], 13 / 21, places=2)
-
-    def test_a_primer_that_stepped_over_nothing_is_unchanged(self):
-        from genesis.primers import Primer
-        from genesis.seqtools import tm
-        from genesis.config import Config
-        cfg = Config()
-        p = Primer(name="x-R", sequence="acgtacgtGGTTACCACTTCAAGTTGTTTC",
-                   anneal="GGTTACCACTTCAAGTTGTTTC", tail="acgtacgt",
-                   shift_tail="", direction="R")
-        self.assertEqual(p.hybridising, "GGTTACCACTTCAAGTTGTTTC")
-        self.assertAlmostEqual(
-            p.to_dict(cfg)["anneal_tm"],
-            tm("GGTTACCACTTCAAGTTGTTTC", cfg.primer_conc_nm, cfg.na_mm,
-               cfg.mg_mm), places=1)
-
-    def test_the_overlap_tail_is_still_left_out(self):
-        # The point of quoting the annealing region at all: the Gibson
-        # arm does not pair with the template and must not inflate the
-        # number the thermocycler is set from.
-        from genesis.primers import Primer
-        from genesis.config import Config
         cfg = Config()
         arm = "ttgggcccctgttaaaat"
-        p = Primer(name="x-F", sequence=arm + "GCC" + "ACCATGGAGACGACTGTG",
-                   anneal="ACCATGGAGACGACTGTG", tail=arm + "GCC",
-                   shift_tail="GCC", direction="F")
+        anneal = "CAACCTCTGGATTACAAAATTTGTG"
+        p = Primer(name="x-F", sequence=arm + anneal, anneal=anneal,
+                   tail=arm, direction="F")
         d = p.to_dict(cfg)
+        self.assertAlmostEqual(
+            d["anneal_tm"],
+            tm(anneal, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm), places=1)
         self.assertLess(d["anneal_tm"], d["full_tm"] - 5,
                         "the overlap arm leaked into the annealing Tm")
 
-    def test_the_site_drawn_on_the_map_is_the_site_that_binds(self):
+    def test_gc_is_quoted_for_the_same_stretch_as_the_tm(self):
+        from genesis.primers import Primer
+        cfg = Config()
+        p = Primer(name="x-F", sequence="acgtacgt" + "GGGGCCCCAAAATTTTGG",
+                   anneal="GGGGCCCCAAAATTTTGG", tail="acgtacgt",
+                   direction="F")
+        self.assertAlmostEqual(p.to_dict(cfg)["gc"], 10 / 18, places=2)
+
+    def test_the_site_drawn_on_the_map_is_the_annealing_region(self):
         from genesis.protocol import _anneal_site
         pr = {"target_start": 2221, "target_end": 3508, "direction": "F",
-              "anneal": "ACCATGGAGACGACTGTG",
-              "hybridising": "GCCACCATGGAGACGACTGTG"}
-        self.assertEqual(_anneal_site(pr), "2,221-2,242 ->")
+              "anneal": "ACCATGGAGACGACTGTG"}
+        self.assertEqual(_anneal_site(pr), "2,221-2,239 ->")
 
-
-class TestPrimerSiteMovesToBetterBases(unittest.TestCase):
-    """A junction is where the DNA joins, not where a primer must bind.
-
-    The annealing site used to be fixed at the fragment boundary and only
-    its length could change, so a junction in an AT-rich stretch gave a
-    primer that was reported as too cold and used anyway. The site may now
-    move into the fragment, with the bases it steps over carried on the
-    tail - which leaves the product identical and only lengthens the oligo.
-    """
-
-    def setUp(self):
-        import random
-        rng = random.Random(909)
-        # An AT-rich mouth followed by balanced sequence, so moving in is
-        # the only way to reach NEB's 40-60% band.
-        poor = "".join(rng.choice("ATATATATGC") for _ in range(40))
-        good = "".join(rng.choice("ACGT") for _ in range(3000))
-        self.template = poor + good
-        self.up = "".join(rng.choice("ACGT") for _ in range(300))
-        self.dn = "".join(rng.choice("ACGT") for _ in range(300))
-
-    def _pair(self, shift):
-        from genesis.primers import design_gibson_pair
-        cfg = Config()
-        cfg.primer_max_shift = shift
-        return design_gibson_pair(0, "frag", self.template, 0, 1500,
-                                  self.up, self.dn, cfg,
-                                  carry_downstream=False), cfg
-
-    def test_the_product_is_unchanged_by_the_shift(self):
-        from genesis.seqtools import revcomp
-        products = []
-        for shift in (0, 15):
-            (f, r), _ = self._pair(shift)
-            at = self.template.find(f.anneal)
-            rc_at = self.template.find(revcomp(r.anneal))
-            products.append(f.sequence
-                            + self.template[at + len(f.anneal):rc_at]
-                            + revcomp(r.sequence))
-        self.assertEqual(products[0], products[1])
-
-    def test_the_shift_buys_nothing_once_the_tail_is_counted(self):
-        # This used to assert that allowing the site to move reached
-        # better bases. It only looked that way because the stepped-over
-        # bases were left out of the Tm: they sit between the junction
-        # and the annealing region, they are template, and they are in
-        # the duplex from the first cycle. So shifting by N and keeping
-        # length L gives the same molecule, and the same Tm, as not
-        # shifting and using length N+L - the choice collapses, and the
-        # chooser now takes the plain longer primer.
-        (f0, _), _ = self._pair(0)
-        (f1, _), _ = self._pair(15)
-        self.assertEqual(f1.shift_tail, "",
-                         "a shift was taken although it changes nothing")
-        self.assertEqual(f0.anneal, f1.anneal)
-        self.assertEqual(f1.hybridising, f1.anneal)
-        self.assertEqual(f1.arm, f1.tail)
-
-    def test_the_whole_duplex_is_what_is_measured(self):
-        from genesis.primers import Primer
-        from genesis.seqtools import tm
-        cfg = Config()
-        # built by hand, because the designer no longer produces one
-        p = Primer(name="x-F", sequence="acgtacgtAAGGCCTTAAGGCCTTAA",
-                   anneal="GCCTTAAGGCCTTAA", tail="acgtacgtAAG",
-                   shift_tail="AAG", direction="F")
-        self.assertEqual(p.hybridising, "AAGGCCTTAAGGCCTTAA")
-        self.assertEqual(p.arm, "acgtacgt")
-        self.assertAlmostEqual(
-            p.to_dict(cfg)["anneal_tm"],
-            tm("AAGGCCTTAAGGCCTTAA", cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm),
-            places=1)
 
 
 class TestAPairHasToShareOneTemperature(unittest.TestCase):
@@ -5678,7 +5579,7 @@ class TestAPairHasToShareOneTemperature(unittest.TestCase):
         # Picking each primer's best site independently optimised a
         # quantity nobody runs: on this inventory it put 12 of 13 pairs
         # outside the 5 C NEB's calculator allows, one of them by 19 C.
-        from genesis.primers import pick_anneal_site, pair_anneal_sites
+        from genesis.primers import pick_anneal, pair_anneal_sites
         from genesis.seqtools import tm
         cfg = Config()
         cfg.primer_max_len = 36          # the window this lab designs in
@@ -5687,12 +5588,11 @@ class TestAPairHasToShareOneTemperature(unittest.TestCase):
         def hot(region):
             return tm(region, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
 
-        f_alone, _ = pick_anneal_site(t, 0, "F", cfg, False, 0)
-        r_alone, _ = pick_anneal_site(t, len(t), "R", cfg, False, 0)
+        f_alone = pick_anneal(t, 0, "F", cfg, False)
+        r_alone = pick_anneal(t, len(t), "R", cfg, False)
         apart_alone = abs(hot(f_alone) - hot(r_alone))
 
-        (f_pair, _), (r_pair, _), gap = pair_anneal_sites(
-            t, 0, len(t), cfg, False, 0)
+        f_pair, r_pair, gap = pair_anneal_sites(t, 0, len(t), cfg, False)
         apart_pair = abs(hot(f_pair) - hot(r_pair))
 
         self.assertAlmostEqual(apart_pair, gap, places=1)
@@ -5734,7 +5634,7 @@ class TestAPairHasToShareOneTemperature(unittest.TestCase):
                     + "".join(rng.choice("ACGT") for _ in range(900))
                     + "".join(rng.choice("GC") for _ in range(60)))
         _f, _r2, gap = pair_anneal_sites(template, 0, len(template), cfg,
-                                         False, 0)
+                                         False)
         self.assertGreater(gap, cfg.primer_pair_max_diff)
 
     def test_the_pool_is_not_truncated_before_the_pair_is_chosen(self):
@@ -5746,12 +5646,12 @@ class TestAPairHasToShareOneTemperature(unittest.TestCase):
         rng = _r.Random(13)
         template = "".join(rng.choice("ACGT") for _ in range(900))
         cfg = Config()
-        full = rank_anneal_sites(template, 0, "F", cfg, False, 0)
+        full = rank_anneal_sites(template, 0, "F", cfg, False)
         self.assertEqual(len(full),
                          cfg.primer_max_len - cfg.primer_min_len + 1,
                          "the pool was truncated by default")
         self.assertEqual(len(rank_anneal_sites(template, 0, "F", cfg, False,
-                                               0, keep=2)), 2)
+                                               keep=2)), 2)
 
 
 class TestEveryPieceInTheTubeIsDrawable(unittest.TestCase):
@@ -6618,21 +6518,27 @@ class TestAShortElementRidesOnThePrimerTails(unittest.TestCase):
         joined = front + element[len(front):]
         self.assertEqual(joined, element)
 
-    def test_the_skipped_bases_survive_the_rewrite(self):
-        """Whatever the annealing site stepped over sits at the end of
-        the tail and has to stay there. Overwriting the whole tail lost
-        it, and the product then had no second CDS in it at all."""
+    def test_the_rewrite_puts_the_whole_element_on_the_two_tails(self):
+        """The element is split across the pair and nothing of it is
+        dropped. This used to be delicate because a primer could also
+        be carrying bases of its own fragment at the end of its tail;
+        it no longer can, so the tail is the element and nothing else."""
         from genesis.planner import _split_into_tails, Route
         from genesis.primers import Primer
+        from genesis.seqtools import revcomp
+        element = "ACGT" * 16
         rev = Primer(name="a-R", sequence="", anneal="AAAA", tail="TTTGGG",
-                     shift_tail="GGG", direction="R", template="a")
+                     direction="R", template="a")
         fwd = Primer(name="b-F", sequence="", anneal="CCCC", tail="AAACCC",
-                     shift_tail="CCC", direction="F", template="b")
-        _split_into_tails(rev, fwd, "ACGT" * 16, 20,
+                     direction="F", template="b")
+        _split_into_tails(rev, fwd, element, 20,
                           Route(id="r", strategy="hifi", title="t"))
-        self.assertTrue(rev.tail.endswith("GGG"), rev.tail)
-        self.assertTrue(fwd.tail.endswith("CCC"), fwd.tail)
+        # every base of the element is on one tail or the other
+        joined = revcomp(rev.tail) + fwd.tail
+        self.assertIn(element, joined + element[:0] or joined,
+                      f"the element was not fully carried: {joined}")
         self.assertTrue(rev.sequence.endswith(rev.anneal))
+        self.assertTrue(fwd.sequence.endswith(fwd.anneal))
 
     def test_an_element_too_short_to_split_is_still_not_lost(self):
         """Returning early dropped the bases: a 15 bp linker vanished

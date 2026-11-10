@@ -457,9 +457,7 @@ def _anneal_site(pr: dict) -> str:
     inside the region being cut out.
     """
     start, end = pr.get("target_start"), pr.get("target_end")
-    # target_start/end bracket everything that pairs with the template,
-    # which includes the bases the annealing site stepped over.
-    anneal = len(pr.get("hybridising") or pr.get("anneal") or "")
+    anneal = len(pr.get("anneal") or "")
     if start is None or end is None or start == end or not anneal:
         return "-"
     if pr.get("direction") == "F":
@@ -498,7 +496,7 @@ def _primer_marks(route: dict, template_name: str) -> list[dict]:
         start, end = pr.get("target_start"), pr.get("target_end")
         if start is None or end is None or start == end:
             continue
-        anneal = len(pr.get("hybridising") or pr.get("anneal") or "")
+        anneal = len(pr.get("anneal") or "")
         if not anneal:
             continue
         if pr.get("direction") == "F":
@@ -855,8 +853,7 @@ def protocol_pdf(plan: dict, cfg: Config | None = None,
                       "annealing temperature.", 8.6, gray=0.4)
         rows = []
         for pr in p["primers"]:
-            seq = (pr.get("arm", pr["tail"]).lower()
-                   + pr.get("hybridising", pr["anneal"]).upper()) if pr["tail"] \
+            seq = (pr["tail"].lower() + pr["anneal"].upper()) if pr["tail"] \
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             rows.append([pr["name"], pr["direction"], f"{pr['length']}",
@@ -1245,8 +1242,7 @@ def protocol_markdown(plan: dict, cfg: Config | None = None,
                 "Sequence (5'->3') |",
                 "|---|---|---|---|---|---|---|"]
         for pr in p["primers"]:
-            seq = (pr.get("arm", pr["tail"]).lower()
-                   + pr.get("hybridising", pr["anneal"]).upper()) if pr["tail"] \
+            seq = (pr["tail"].lower() + pr["anneal"].upper()) if pr["tail"] \
                 else pr["sequence"].upper()
             tm_s = "n/a" if pr["anneal_tm"] != pr["anneal_tm"] else f"{pr['anneal_tm']:.1f}"
             out.append(f"| {pr['name']} | {pr['direction']} | {pr['length']} | "

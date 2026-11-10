@@ -26,61 +26,19 @@ class Primer:
     target_start: int = 0
     target_end: int = 0
     warnings: list = field(default_factory=list)
-    #: The part of `tail` that is template the annealing site stepped over,
-    #: sitting at its 3' end. Anything spliced into the tail later has to go
-    #: in FRONT of these, or the amplicon reads them out of order. Declared
-    #: last on purpose: other call sites build a Primer positionally, and
-    #: inserting a field mid-list silently shifted "F" into this one and
-    #: every argument after it.
-    shift_tail: str = ""
 
     @property
     def length(self) -> int:
         return len(self.sequence)
 
-    @property
-    def arm(self) -> str:
-        """The 5' part that does NOT pair with the template.
-
-        The overlap or adapter proper, with the stepped-over template
-        taken back off the end of it. This is the only part that should
-        be drawn as a tail: `shift_tail` sits in `tail` structurally,
-        because that is where it has to be spliced, but it is template
-        and it anneals, and printing it in lower case under a legend
-        that says lower case does not bind states the opposite.
-        """
-        return self.tail[:len(self.tail) - len(self.shift_tail)] \
-            if self.shift_tail else self.tail
-
-    @property
-    def hybridising(self) -> str:
-        """Everything in this oligo that base-pairs with the template.
-
-        `anneal` is the stretch the designer picked, but it is not always
-        all of it.  When the annealing site has to step inward to find a
-        unique or well-behaved sequence, the bases it stepped over are put
-        back on the 3' end of the tail - they are a slice of the template,
-        copied from it, and they anneal to it like any other.
-
-        Quoting `anneal` alone therefore understates the temperature at
-        which the primer finds its site, and understates it most where it
-        matters: the step is usually a few bases of a Kozak or a
-        restriction site, which are GC-rich.  Three such bases were worth
-        6.6 C on the ASAP7y forward primer, and the NEB calculator, fed
-        the real 21-mer, disagreed with us by exactly that.
-        """
-        return self.shift_tail + self.anneal
-
     def to_dict(self, cfg: Config | None = None) -> dict:
         cfg = cfg or Config()
         d = asdict(self)
         d["length"] = self.length
-        d["arm"] = self.arm
-        d["hybridising"] = self.hybridising
-        d["anneal_tm"] = tm(self.hybridising, cfg.primer_conc_nm,
+        d["anneal_tm"] = tm(self.anneal, cfg.primer_conc_nm,
                             cfg.na_mm, cfg.mg_mm)
         d["full_tm"] = tm(self.sequence, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
-        d["gc"] = round(gc_fraction(self.hybridising), 3)
+        d["gc"] = round(gc_fraction(self.anneal), 3)
         return d
 
 
@@ -110,7 +68,7 @@ class Junction:
 # Annealing-region selection
 # --------------------------------------------------------------------------
 
-def anneal_penalty(region: str, cfg: Config, shift: int = 0,
+def anneal_penalty(region: str, cfg: Config,
                    unique_in: str = "", circular: bool = False) -> float:
     """How poor a primer this stretch of template would make. Lower is better.
 
@@ -151,9 +109,6 @@ def anneal_penalty(region: str, cfg: Config, shift: int = 0,
     if hair and hair["stem"] >= 6:
         score += 4.0
 
-    # Every base of shift is a base of oligo somebody pays for.
-    score += 0.25 * shift
-
     if unique_in:
         from .seqtools import find_all
         n = len(find_all(unique_in, region, circular)) + \
@@ -171,53 +126,44 @@ PAIR_PENALTY = 8.0
 
 
 def rank_anneal_sites(template: str, start: int, direction: str, cfg: Config,
-                      circular: bool = False, max_shift: int = 0,
-                      unique_in: str = "", keep: int = 0) -> list[dict]:
+                      circular: bool = False, unique_in: str = "",
+                      keep: int = 0) -> list[dict]:
     """Every site worth considering, best first, with the Tm it would have.
 
-    `pick_anneal_site` answers "which is the best site for this primer",
-    which is the wrong question when the answer has to agree with the
-    other primer's.  This returns the shortlist so the two can be chosen
+    `pick_anneal` answers "which is the best site for this primer", which
+    is the wrong question when the answer has to agree with the other
+    primer's.  This returns the shortlist so the two can be chosen
     together.
     """
     out: list[dict] = []
-    for shift in range(0, max(0, max_shift) + 1):
-        for length in range(cfg.primer_min_len, cfg.primer_max_len + 1):
-            if shift + length > cfg.primer_max_len:
+    for length in range(cfg.primer_min_len, cfg.primer_max_len + 1):
+        if direction == "F":
+            region = slice_region(template, start, start + length, circular)
+        else:
+            lo = start - length
+            if lo < 0 and not circular:
                 break
-            if direction == "F":
-                lo = start + shift
-                region = slice_region(template, lo, lo + length, circular)
-                binding = slice_region(template, start, lo + length, circular)
-            else:
-                hi = start - shift
-                lo = hi - length
-                if lo < 0 and not circular:
-                    break
-                region = revcomp(slice_region(template, lo, hi, circular))
-                binding = revcomp(slice_region(template, lo, start, circular))
-            if len(region) < length:
-                break
-            t = tm(binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
-            if t != t:
-                continue
-            out.append({
-                "region": region, "shift": shift, "tm": t,
-                "penalty": anneal_penalty(binding, cfg, shift, unique_in,
-                                          circular)})
+            region = revcomp(slice_region(template, lo, start, circular))
+        if len(region) < length:
+            break
+        t = tm(region, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+        if t != t:
+            continue
+        out.append({"region": region, "tm": t,
+                    "penalty": anneal_penalty(region, cfg, unique_in,
+                                              circular)})
     # Sorted for the single-primer caller; NOT truncated by default,
     # because the pair search needs the cool candidates a ranking by
-    # single-primer penalty would cut off. The pool is a few hundred at
-    # most - one length window times one shift window - so keeping it
-    # whole costs nothing and a truncated one silently hid the only
-    # sites that could have matched the other primer.
+    # single-primer penalty would cut off.  The pool is one length
+    # window, so keeping it whole costs nothing and a truncated one
+    # silently hid the only sites that could have matched the other
+    # primer.
     out.sort(key=lambda c: c["penalty"])
     return out[:keep] if keep else out
 
 
 def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
-                      circular: bool = False, max_shift: int = 0,
-                      unique_in: str = "") -> tuple:
+                      circular: bool = False, unique_in: str = "") -> tuple:
     """Choose both sites of one reaction together.
 
     A forward and a reverse primer go into the same tube and anneal at
@@ -228,18 +174,14 @@ def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
     picked from different stretches of sequence with no reference to
     each other.
 
-    Returns ((f_region, f_shift), (r_region, r_shift), gap).
+    Returns (f_region, r_region, gap).
     """
-    fwd = rank_anneal_sites(template, start, "F", cfg, circular, max_shift,
-                            unique_in)
-    rev = rank_anneal_sites(template, end, "R", cfg, circular, max_shift,
-                            unique_in)
+    fwd = rank_anneal_sites(template, start, "F", cfg, circular, unique_in)
+    rev = rank_anneal_sites(template, end, "R", cfg, circular, unique_in)
     if not fwd or not rev:
-        f = pick_anneal_site(template, start, "F", cfg, circular, max_shift,
-                             unique_in)
-        r = pick_anneal_site(template, end, "R", cfg, circular, max_shift,
-                             unique_in)
-        return f, r, float("nan")
+        return (pick_anneal(template, start, "F", cfg, circular),
+                pick_anneal(template, end, "R", cfg, circular),
+                float("nan"))
 
     limit = getattr(cfg, "primer_pair_max_diff", 5.0)
     best, best_cost = None, float("inf")
@@ -251,58 +193,7 @@ def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
             if cost < best_cost:
                 best_cost, best = cost, (a, b, gap)
     a, b, gap = best
-    return (a["region"], a["shift"]), (b["region"], b["shift"]), gap
-
-
-def pick_anneal_site(template: str, start: int, direction: str, cfg: Config,
-                     circular: bool = False, max_shift: int = 0,
-                     unique_in: str = "") -> tuple[str, int]:
-    """Choose where the primer binds, and how far in from the junction.
-
-    `pick_anneal` can only change how long the primer is, not where it
-    sits, so a junction falling in an AT-rich stretch produced a primer
-    that was reported as too cold and used regardless. The site may now
-    move *into* the fragment; the bases it steps over are added to the
-    primer's tail, which leaves the product identical and makes the oligo
-    longer by exactly the shift.
-
-    It never moves outward, because that would amplify template bases the
-    construct does not call for.
-
-    Returns the annealing region and the shift it took.
-    """
-    best, best_score = ("", 0), float("inf")
-    for shift in range(0, max(0, max_shift) + 1):
-        for length in range(cfg.primer_min_len, cfg.primer_max_len + 1):
-            if shift + length > cfg.primer_max_len:
-                break
-            if direction == "F":
-                lo = start + shift
-                region = slice_region(template, lo, lo + length, circular)
-                binding = slice_region(template, start, lo + length, circular)
-            else:
-                hi = start - shift
-                lo = hi - length
-                if lo < 0 and not circular:
-                    break
-                region = revcomp(slice_region(template, lo, hi, circular))
-                binding = revcomp(slice_region(template, lo, start, circular))
-            if len(region) < length:
-                break
-            # Scored on everything that will pair with the template, not
-            # on the part we happen to call the annealing region. The
-            # stepped-over bases sit between the junction and the region
-            # and are template themselves, so they are in the duplex from
-            # the first cycle. Scoring the region alone was aiming at a
-            # 60 C target while building a 77 C oligo, and put 12 of 13
-            # pairs outside the 5 C the forward and reverse primers of
-            # one reaction are allowed to differ by.
-            score = anneal_penalty(binding, cfg, shift, unique_in, circular)
-            if score < best_score:
-                best_score, best = score, (region, shift)
-    if best[0]:
-        return best
-    return pick_anneal(template, start, direction, cfg, circular), 0
+    return a["region"], b["region"], gap
 
 
 def pick_anneal(template: str, start: int, direction: str, cfg: Config,
@@ -350,15 +241,11 @@ def validate_primer(primer: Primer, template: str, cfg: Config,
     """Run the Stage 9 primer checks and return human-readable warnings."""
     w: list[str] = []
     anneal = primer.anneal
-    # The Tm check asks what the oligo does on the template, so it is run
-    # on everything that pairs with it; the length checks below ask what
-    # the designer chose, so they stay on the region that was designed.
-    binding = primer.hybridising
     full = primer.sequence
 
-    t = tm(binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+    t = tm(anneal, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
     if t != t:
-        n_ambig = sum(1 for ch in binding if ch not in "ACGT")
+        n_ambig = sum(1 for ch in anneal if ch not in "ACGT")
         w.append(f"the source sequence has {n_ambig} ambiguous base(s) at this "
                  f"primer site, so no reliable primer can be designed here; "
                  f"re-sequence this region or choose another source plasmid")
@@ -441,14 +328,12 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     not amplified - a digested vector cannot be given a tail, so the insert
     has to carry both of its junctions.
     """
-    shift = max(0, getattr(cfg, "primer_max_shift", 0))
     # Chosen together. The two primers of one reaction anneal in the same
     # tube at the same temperature, so the pair is the unit that has to be
     # right; picking each one's best site alone optimises a quantity
     # nobody runs.
-    (f_anneal, f_shift), (r_anneal, r_shift), tm_gap = pair_anneal_sites(
-        template, start, end, cfg, circular_template, shift,
-        unique_in=template)
+    f_anneal, r_anneal, tm_gap = pair_anneal_sites(
+        template, start, end, cfg, circular_template, unique_in=template)
 
     f_tail = pick_overlap(upstream_seq, cfg, from_end=True,
                           unique_in=unique_in)
@@ -456,28 +341,13 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
                                    unique_in=unique_in))
               if carry_downstream else "")
 
-    # Whatever the annealing site stepped over has to be put back, or the
-    # amplicon is short by exactly that much and the junction it was
-    # designed for no longer exists. It goes on the tail, between the
-    # overlap and the binding region, which is where the polymerase will
-    # copy it from.
-    f_overlap, r_overlap = len(f_tail), len(r_tail)
-    if f_shift:
-        f_tail = f_tail + slice_region(template, start, start + f_shift,
-                                       circular_template)
-    if r_shift:
-        r_tail = r_tail + revcomp(slice_region(template, end - r_shift, end,
-                                               circular_template))
-
     fwd = Primer(
         name=f"{fragment_name}-F", sequence=f_tail + f_anneal, anneal=f_anneal,
-        tail=f_tail, shift_tail=f_tail[f_overlap:], direction="F",
-        template=fragment_name,
+        tail=f_tail, direction="F", template=fragment_name,
         target_start=start, target_end=end)
     rev = Primer(
         name=f"{fragment_name}-R", sequence=r_tail + r_anneal, anneal=r_anneal,
-        tail=r_tail, shift_tail=r_tail[r_overlap:], direction="R",
-        template=fragment_name,
+        tail=r_tail, direction="R", template=fragment_name,
         target_start=start, target_end=end)
 
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)
@@ -492,24 +362,8 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
                 f"should; no combination of lengths here does better, so "
                 f"run a gradient over the lower Tm")
 
-    # Say when the site was moved. A primer that sits 9 bases inside the
-    # fragment rather than at its edge is a deliberate choice, and the
-    # person checking it against their own map should not have to work
-    # out why the numbers do not line up with the junction.
-    for p, moved in ((fwd, f_shift), (rev, r_shift)):
-        if moved:
-            p.warnings.append(
-                f"annealing site moved {moved} bp into the fragment to reach "
-                f"better bases; the primer re-supplies those {moved} bp, so "
-                f"the product is unchanged. They are template and they "
-                f"anneal, so they are shown in upper case and the Tm above "
-                f"includes them")
-
-    # Only the homology arm is an overlap. The bases added to reach a
-    # better annealing site are template, not homology, and measuring
-    # their melting temperature as if they were a HiFi arm reported a
-    # 3 nt tail as -118 C.
-    for p, tail in ((fwd, f_tail[:f_overlap]), (rev, r_tail[:r_overlap])):
+    # The tail is homology and nothing else now, so all of it is the arm.
+    for p, tail in ((fwd, f_tail), (rev, r_tail)):
         if tail:
             t_ov = tm(tail, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
             if t_ov == t_ov and t_ov < cfg.overlap_tm_min:
@@ -571,8 +425,8 @@ def design_re_pair(fragment_name: str, template: str, start: int, end: int,
     """
     from .enzymes import CATALOG
     # Same reasoning as the assembly pair: both go in one tube.
-    (f_anneal, _fs), (r_anneal, _rs), tm_gap = pair_anneal_sites(
-        template, start, end, cfg, circular_template, 0)
+    f_anneal, r_anneal, tm_gap = pair_anneal_sites(
+        template, start, end, cfg, circular_template)
     f_tail = r_tail = ""
     if left_enzyme:
         site = CATALOG[left_enzyme].site

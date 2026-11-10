@@ -115,7 +115,6 @@ class Config:
     #: this the site is wherever the junction happens to fall, and an
     #: AT-rich boundary gives a primer that is reported as poor and used
     #: anyway.
-    primer_max_shift: int = 15
     #: Homology arm. Used as a ceiling: the shortest arm that still reaches
     #: `overlap_tm_min` is taken, because every base of overlap is a base of
     #: oligo somebody pays for and synthesises with some error rate.

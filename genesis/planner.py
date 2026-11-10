@@ -1316,19 +1316,18 @@ def _split_into_tails(up_rev: Primer, down_fwd: Primer, element: str,
     front = (total + overlap + 1) // 2
     back = total + overlap - front
 
-    # Whatever the annealing site stepped over sits at the end of the
-    # tail, immediately before the binding region, and has to stay
-    # there: it is the part of the fragment the primer skipped, and
-    # dropping it leaves the amplicon short by exactly that much.
-    # Overwriting the whole tail is what lost it the first time, and
-    # the product then had no mCherry in it at all.
-    up_rev.tail = revcomp(element[:front]) + (up_rev.shift_tail or "")
+    # The tail is homology and nothing else: a primer no longer skips
+    # bases of its own fragment, so there is nothing hiding at the end
+    # of the tail that overwriting it would drop. When there was, this
+    # is where it was lost, and the product came out with no mCherry
+    # in it at all.
+    up_rev.tail = revcomp(element[:front])
     up_rev.sequence = up_rev.tail + up_rev.anneal
     # The downstream primer's old tail was homology with the upstream
     # fragment's end. That end has moved - it is now inside the element
     # - so the old homology would anneal to bases that are no longer
     # at that junction.
-    down_fwd.tail = element[total - back:] + (down_fwd.shift_tail or "")
+    down_fwd.tail = element[total - back:]
     down_fwd.sequence = down_fwd.tail + down_fwd.anneal
 
     for pr in (up_rev, down_fwd):
@@ -1372,15 +1371,13 @@ def _carry(fwd: Primer, extra: str, route: "Route",
     """
     if not extra:
         return
-    # The arc is template that sits UPSTREAM of this fragment, so it must
-    # come before the bases the annealing site stepped over - which are the
-    # first bases of the fragment itself. Appending it to the whole tail put
-    # the two the wrong way round and built a different molecule: every one
-    # of the six routes in a 28-construct sweep that used a carried arc on a
-    # shifted primer produced a product that was not the designed sequence.
-    shifted = fwd.shift_tail or ""
-    head = fwd.tail[:len(fwd.tail) - len(shifted)] if shifted else fwd.tail
-    fwd.tail = head + extra + shifted
+    # The arc is template that sits UPSTREAM of this fragment, and the
+    # tail is now homology and nothing else, so it goes on the end of it.
+    # It used to have to go BEFORE the bases the annealing site stepped
+    # over, and appending it to the whole tail put the two the wrong way
+    # round: every one of the six routes in a 28-construct sweep that
+    # used a carried arc on a shifted primer built the wrong molecule.
+    fwd.tail = fwd.tail + extra
     fwd.sequence = fwd.tail + fwd.anneal
     if len(fwd.sequence) > 100:
         route.warnings.append(

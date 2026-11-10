@@ -5510,14 +5510,11 @@ function renderRouteDetail(route) {
     { label: 'Anneal Tm', numeric: true, cell: function (p) { return num(p.anneal_tm, 1); } },
     { label: 'GC', numeric: true, cell: function (p) { return pct(p.gc); } },
     { label: 'Sequence (tail / anneal)', cell: function (p) {
-        // Lower case means "does not pair with the template", so the
-        // stepped-over bases belong with the annealing region however
-        // they are stored.
-        var arm = p.arm === undefined ? p.tail : p.arm;
-        var binds = p.hybridising || p.anneal || '';
+        // Lower case is the overlap tail, which does not pair with the
+        // template; upper case is the region that does.
         return h('span', { class: 'mono seq' },
-          arm ? h('span', { class: 'tail' }, String(arm).toLowerCase()) : null,
-          h('span', { class: 'anneal' }, String(binds).toUpperCase())); } },
+          p.tail ? h('span', { class: 'tail' }, String(p.tail).toLowerCase()) : null,
+          h('span', { class: 'anneal' }, String(p.anneal || '').toUpperCase())); } },
     { label: 'Warnings', cell: function (p) { return warnCell(p.warnings); } }
   ], primers));
 
