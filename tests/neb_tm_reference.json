@@ -1,0 +1,78 @@
+{
+ "source": "https://tmapi.neb.com/tm/batch",
+ "prodcode": "q5-0",
+ "product": "Q5 High-Fidelity DNA Polymerase (M0491)",
+ "primer_conc_uM": 0.5,
+ "fetched": "2026-11-10",
+ "note": "Randomly generated sequences, not lab primers. NEB rounds to whole degrees, so a tolerance below ~0.5 C is not meaningful.",
+ "values": [
+  [
+   "GCAATATGTTCTTTAAAA",
+   48
+  ],
+  [
+   "CGCCGAGGGCCTTCAGTC",
+   72
+  ],
+  [
+   "TTGTCGACTCGAAACTCGGA",
+   66
+  ],
+  [
+   "CTTCATATACTAATATCGGAGT",
+   55
+  ],
+  [
+   "GCCGCAGCTCCGAGCGGGGCTC",
+   83
+  ],
+  [
+   "TGTCCTGGGCACACGCAGATAGCT",
+   75
+  ],
+  [
+   "AATTCCAGGTTCAGATTCTGAGAATC",
+   64
+  ],
+  [
+   "TTTTACAAATTAGGTAATAATACGACTT",
+   58
+  ],
+  [
+   "TGCTCGCTGGGCGACCAGGGCTCACACG",
+   84
+  ],
+  [
+   "TCTCGCCGACTTATTAACATGGCGTAGGAC",
+   73
+  ],
+  [
+   "AACAATAATACGTGCTTAAGTACGTACTTTTG",
+   65
+  ],
+  [
+   "CGCTCCGGCGGCGTCACAGGCATCGCCGGGCG",
+   91
+  ],
+  [
+   "GTACCGGTGAAGTCCACCGGGTCATACCTGACTG",
+   79
+  ],
+  [
+   "AGCAATAGCATATTTCTTGCAGTCTAGTACCGGAAT",
+   71
+  ],
+  [
+   "AAAGAAATCCAAGCTTTTTTAGATATAATCTTATTTGA",
+   63
+  ],
+  [
+   "GCTAACGGGCTCTGCGCTGCTGGCCCAAGGTACCGCCG",
+   88
+  ],
+  [
+   "GGAGTACACGAACTTAATCGTCGTAAGCTTTGGGCTCCAC",
+   77
+  ]
+ ]
+}

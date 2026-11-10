@@ -5408,6 +5408,60 @@ class TestDonorsAreRankedOnHavingThePart(unittest.TestCase):
         conn.close()
 
 
+class TestTmAgreesWithNEB(unittest.TestCase):
+    """NEB's calculator is what a primer is checked against before it is
+    ordered, so disagreeing with it is a bug however defensible the
+    thermodynamics.
+
+    The reference values in tests/neb_tm_reference.json came from NEB's
+    own API (prodcode q5-0, 0.5 uM) for randomly generated sequences -
+    no lab primer was sent anywhere. They are stored rather than fetched
+    so the suite does not need a network, and NEB rounds to whole
+    degrees, which is why the tolerances below are not tighter.
+    """
+
+    @staticmethod
+    def _reference():
+        import json
+        path = Path(__file__).resolve().parent / "neb_tm_reference.json"
+        return json.loads(path.read_text())["values"]
+
+    def test_every_reference_value_is_within_two_degrees(self):
+        from genesis.seqtools import tm, gc_fraction
+        worst = (0.0, "")
+        for seq, neb in self._reference():
+            err = abs(tm(seq) - neb)
+            if err > worst[0]:
+                worst = (err, f"{len(seq)} nt, {gc_fraction(seq):.0%} GC")
+            self.assertLessEqual(
+                err, 2.0,
+                f"{seq} ({len(seq)} nt, {gc_fraction(seq):.0%} GC): "
+                f"NEB {neb}, Genesis {tm(seq)}")
+        self.assertLess(worst[0], 2.0, f"worst was {worst}")
+
+    def test_the_spread_is_small_on_average_too(self):
+        # One outlier inside the tolerance would pass the test above
+        # while the model as a whole drifted.
+        from genesis.seqtools import tm
+        import math
+        errs = [tm(seq) - neb for seq, neb in self._reference()]
+        rmse = math.sqrt(sum(e * e for e in errs) / len(errs))
+        self.assertLess(rmse, 1.2, f"RMSE against NEB is {rmse:.2f} C")
+
+    def test_it_does_not_drift_with_gc_the_way_the_old_model_did(self):
+        # The model this replaced used a salt correction with no base
+        # composition term, and was 5.4 C low at 78% GC while exact at
+        # 31%. A GC-dependent residual is the signature of that fault.
+        from genesis.seqtools import tm, gc_fraction
+        low = [tm(s) - n for s, n in self._reference() if gc_fraction(s) < 0.4]
+        high = [tm(s) - n for s, n in self._reference() if gc_fraction(s) > 0.65]
+        self.assertTrue(low and high, "the reference set lost its spread")
+        drift = abs(sum(high) / len(high) - sum(low) / len(low))
+        self.assertLess(drift, 2.0,
+                        f"GC-rich and AT-rich oligos disagree with NEB by "
+                        f"{drift:.2f} C more than each other")
+
+
 class TestWhichGenesisIsRunning(unittest.TestCase):
     """The header has to say which build answered the request."""
 

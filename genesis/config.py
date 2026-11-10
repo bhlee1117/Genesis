@@ -125,7 +125,13 @@ class Config:
     overlap_min_length: int = 15
     overlap_tm_min: float = 48.0
     primer_conc_nm: float = 500.0
-    na_mm: float = 50.0
+    #: Free-ion concentrations of the reaction the Tm is quoted for.
+    #: 2 mM Mg2+ is what Q5 buffer contains; the monovalent figure was
+    #: fitted to 84 values from NEB's own Tm API across 18-40 nt and
+    #: 20-80% GC, because NEB's calculator is what a primer gets checked
+    #: against before it is ordered and disagreeing with it by 5 C is a
+    #: bug however defensible the thermodynamics.
+    na_mm: float = 200.0
     mg_mm: float = 2.0
 
     # --- Stage 10: route ranking weights (higher = more discouraged) -----
