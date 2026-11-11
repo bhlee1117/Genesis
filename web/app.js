@@ -3765,12 +3765,9 @@ function sequenceBrowser(seq, opts) {
 
   function clampView() {
     view.span = Math.max(BROWSER_MIN_SPAN, Math.min(view.span, total));
+    // A circle has no ends, so panning always wraps.
     if (view.span >= total) { view.start = 0; return; }
-    if (opts.circular) {
-      view.start = ((view.start % total) + total) % total;
-    } else {
-      view.start = Math.max(0, Math.min(view.start, total - view.span));
-    }
+    view.start = ((view.start % total) + total) % total;
   }
 
   /** Zoom about a fixed base, so the thing under the pointer stays put. */
@@ -3785,12 +3782,14 @@ function sequenceBrowser(seq, opts) {
   }
 
   function baseAt(px, width) {
-    var inner = Math.max(width - 2 * MAP_PAD, 1);
-    var frac = (px - MAP_PAD) / inner;
-    return view.start + frac * view.span;
+    var size = Math.max(Math.min(width, 900), 320);
+    var inner = Math.max(size - 90, 1);
+    var frac = (px - (width - inner) / 2) / inner;
+    return view.start + Math.max(0, Math.min(1, frac)) * view.span;
   }
 
   var lastW = 0;
+  var lastArcPx = 0;        // the arc the last draw actually used
   function draw() {
     var w = Math.round(host.clientWidth) || lastW || 760;
     lastW = w;
@@ -3804,11 +3803,13 @@ function sequenceBrowser(seq, opts) {
       bp(from) + '–' + bp(opts.circular ? ((to - 1) % total) + 1 : to) +
       '  (' + bp(Math.round(view.span)) + ' shown of ' + bp(total) + ')'));
     clear(hint);
-    var perBase = (w - 2 * MAP_PAD) / view.span;
+    var arcPx = Math.max(Math.min(w, 900), 320) - 90;
+    lastArcPx = arcPx;
+    var perBase = view.span >= seq.length ? 0 : arcPx / view.span;
     hint.appendChild(document.createTextNode(
       perBase >= BROWSER_LETTER_PX
-        ? 'bases are shown; both strands read 5′ to 3′ on their own side'
-        : 'zoom in to ' + Math.ceil((w - 2 * MAP_PAD) / BROWSER_LETTER_PX) +
+        ? 'bases are shown inside the ring; both strands read 5′ to 3′'
+        : 'zoom in to ' + Math.ceil(arcPx / BROWSER_LETTER_PX) +
           ' bases or fewer to read the sequence'));
   }
 
@@ -3825,8 +3826,9 @@ function sequenceBrowser(seq, opts) {
   });
   window.addEventListener('mousemove', function (ev) {
     if (!dragging) return;
-    var w = lastW || host.clientWidth || 760;
-    var perPx = view.span / Math.max(w - 2 * MAP_PAD, 1);
+    var arcPx = lastArcPx ||
+      (Math.max(Math.min(host.clientWidth || 760, 900), 320) - 90);
+    var perPx = view.span / Math.max(arcPx, 1);
     view.start = dragging.start - (ev.clientX - dragging.x) * perPx;
     clampView();
     draw();
@@ -3858,9 +3860,13 @@ function sequenceBrowser(seq, opts) {
     button('whole', 'Show the whole molecule', function () {
       view.start = 0; view.span = total; clampView(); draw();
     }),
+    // Asks the last draw how much arc it had rather than working it out
+    // again from a width measured somewhere else: the two disagreed, and
+    // the button landed on 144 bases while the letters needed 116.
     button('bases', 'Zoom until the sequence is readable', function () {
-      var w = lastW || host.clientWidth || 760;
-      view.span = Math.floor((w - 2 * MAP_PAD) / BROWSER_LETTER_PX);
+      var arcPx = lastArcPx ||
+        (Math.max(Math.min(host.clientWidth || 760, 900), 320) - 90);
+      view.span = Math.floor(arcPx / BROWSER_LETTER_PX);
       clampView(); draw();
     }),
     readout);
@@ -3888,127 +3894,197 @@ function sequenceBrowser(seq, opts) {
     host);
 }
 
+/**
+ * The circular map, zoomed.
+ *
+ * Zooming a circle is not the same as zooming a line. The trick is that
+ * the drawn arc keeps a constant length in pixels while the radius grows
+ * as the window narrows - so at full view it is the familiar ring, and
+ * at a hundred bases it is a gentle curve across the top of the panel
+ * with the bases sitting on it. Nothing jumps between two different
+ * pictures; it is one picture, seen closer.
+ *
+ * Labels ride the arc on a textPath, which is what keeps them legible
+ * when the curve is tight and is why they no longer vanish the moment a
+ * feature runs off both sides of the window.
+ */
+/* How much of the circle is kept on screen when zoomed. Tighter than
+   this and the per-base rotation makes the sequence hard to read along
+   the curve; looser and the band stops looking like part of a ring. */
+var ARC_SWEEP = 1.75;
+
 function buildBrowserSvg(width, seq, view, features, sites, junctions, opts) {
-  var total = seq.length;
-  var inner = Math.max(width - MAP_PAD * 2, 10);
-  var perBase = inner / view.span;
-  var letters = perBase >= BROWSER_LETTER_PX;
+  var total = seq.length || 1;
+  var frac = Math.min(view.span / total, 1);
+  var size = Math.max(Math.min(width, 900), 320);
+  var height = 330;
 
-  var axis = 92;
-  var height = letters ? 168 : 132;
+  // A constant arc length means the band always fills the panel: the
+  // radius is whatever makes the visible window subtend ARC_SWEEP.
+  var arcPixels = size - 90;
+  var sweep = frac >= 1 ? Math.PI * 2 : ARC_SWEEP;
+  var radius = arcPixels / sweep;
+  if (frac >= 1) radius = Math.min(height, size) / 2 - 58;
+
+  var cx = size / 2;
+  var cy = (frac >= 1) ? height / 2 : 58 + radius;
+  var centre = view.start + view.span / 2;
+
   var root = svg('svg', {
-    width: width, height: height, viewBox: '0 0 ' + width + ' ' + height,
-    class: 'seqbrowser', role: 'img'
+    width: '100%', viewBox: '0 0 ' + size + ' ' + height,
+    class: 'seqbrowser circ-zoom', role: 'img',
+    'aria-label': (opts.label || 'construct') + ', ' + total + ' bp, circular'
   });
+  var defs = svg('defs', null);
+  root.appendChild(defs);
+  var uid = 'arc' + (buildBrowserSvg._n = (buildBrowserSvg._n || 0) + 1);
 
-  function x(base) {
-    var off = (base - view.start + total) % total;
-    if (off > total - view.span && view.start + view.span <= total) {
-      off = base - view.start;          // linear window, no wrap needed
-    }
-    return MAP_PAD + off * perBase;
+  /* Angle of a base, 0 at the top, clockwise.
+     Scaled so the *visible window* subtends `sweep` - not the whole
+     plasmid. Dividing by `total` instead left the arc showing the entire
+     ring however far it was zoomed, with the bases crushed into a dot at
+     the top. At full view span === total and this is the familiar ring. */
+  function ang(base) {
+    var d = base - centre;
+    while (d > total / 2) d -= total;
+    while (d < -total / 2) d += total;
+    return (d / view.span) * sweep;
+  }
+  function pt(base, r) {
+    var a = ang(base);
+    return [cx + r * Math.sin(a), cy - r * Math.cos(a)];
+  }
+  function visible(base) { return Math.abs(ang(base)) <= sweep / 2 + 0.02; }
+
+  /** Arc path between two bases at one radius, the short way round. */
+  function arc(b1, b2, r) {
+    var a1 = Math.max(-sweep / 2, Math.min(sweep / 2, ang(b1)));
+    var a2 = Math.max(-sweep / 2, Math.min(sweep / 2, ang(b2)));
+    if (a2 <= a1) a2 = a1 + 0.0004;
+    var p1 = [cx + r * Math.sin(a1), cy - r * Math.cos(a1)];
+    var p2 = [cx + r * Math.sin(a2), cy - r * Math.cos(a2)];
+    var large = (a2 - a1) > Math.PI ? 1 : 0;
+    return 'M ' + p1[0].toFixed(2) + ' ' + p1[1].toFixed(2) +
+           ' A ' + r + ' ' + r + ' 0 ' + large + ' 1 ' +
+           p2[0].toFixed(2) + ' ' + p2[1].toFixed(2);
   }
 
-  /* --- features ------------------------------------------------------ */
-  features.forEach(function (f) {
-    var fx = x(f.start);
-    var fw = Math.max((f.end - f.start) * perBase, 1.5);
-    if (fx + fw < 0 || fx > width) return;
+  var bandR = radius;
+  var bandW = 15;
+
+  /* --- the backbone ring --------------------------------------------- */
+  root.appendChild(svg('path', {
+    d: arc(centre - view.span * 0.4999, centre + view.span * 0.4999, bandR),
+    fill: 'none', class: 'circ-backbone', 'stroke-width': 1.5
+  }));
+
+  /* --- features ------------------------------------------------------- */
+  features.forEach(function (f, i) {
+    var a1 = ang(f.start), a2 = ang(f.end);
+    var half = sweep / 2;
+    // Off-screen entirely, or straddling the window with both ends out.
+    if ((a1 < -half && a2 < -half) || (a1 > half && a2 > half)) return;
+    if (a2 < a1) return;                 // wrapped past the far side
     var rev = Number(f.strand) === -1;
-    var y = rev ? axis + 10 : axis - 10 - 13;
-    var rect = svg('rect', {
-      x: fx, y: y, width: fw, height: 13, rx: 2,
-      fill: f.colour || colorFor(typeOf(f)),
-      class: 'feat' + (rev ? ' feat-rev' : '')
+    var r = bandR + (rev ? -bandW : bandW) * 0.0;
+    var path = svg('path', {
+      d: arc(f.start, f.end, r),
+      fill: 'none', 'stroke-width': bandW,
+      stroke: f.colour || colorFor(typeOf(f)),
+      class: 'circ-feat' + (rev ? ' circ-rev' : '')
     });
-    rect.appendChild(svg('title', null,
+    path.appendChild(svg('title', null,
       (f.name || '(unnamed)') + '\n' + typeOf(f) + '\n' +
       (f.start + 1) + '–' + f.end + ' (' + (f.end - f.start) + ' bp)'));
-    root.appendChild(rect);
-    if (fw > 40 && f.name) {
-      root.appendChild(svg('text', {
-        x: Math.max(fx, 2) + Math.min(fw, width) / 2, y: y + 10,
-        class: 'feat-label', 'text-anchor': 'middle'
-      }, String(f.name).slice(0, Math.floor(fw / 6))));
-    }
+    root.appendChild(path);
+
+    /* The label rides an arc of its own, just outside the band, so it
+       stays on the curve and stays put when the feature runs off both
+       edges of the window. */
+    var lr = bandR + bandW / 2 + (rev ? 26 : 13);
+    var id = uid + '-f' + i;
+    defs.appendChild(svg('path', { id: id, d: arc(f.start, f.end, lr),
+                                   fill: 'none' }));
+    var txt = svg('text', { class: 'circ-label' + (rev ? ' circ-rev' : '') });
+    var tp = svg('textPath', {
+      href: '#' + id, startOffset: '50%', 'text-anchor': 'middle'
+    }, f.name || typeOf(f));
+    tp.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#' + id);
+    txt.appendChild(tp);
+    root.appendChild(txt);
   });
 
-  /* --- the axis and its ticks ---------------------------------------- */
-  root.appendChild(svg('line', {
-    x1: MAP_PAD, y1: axis, x2: width - MAP_PAD, y2: axis, class: 'axis-line'
-  }));
-  var ticks = width < 420 ? 4 : 8;
-  for (var t = 0; t <= ticks; t++) {
-    var base = Math.round(view.start + view.span * t / ticks);
-    var tx = MAP_PAD + (view.span * t / ticks) * perBase;
+  /* --- restriction sites ---------------------------------------------- */
+  var lastLabelAngle = -99;
+  sites.forEach(function (st) {
+    if (!visible(st.at)) return;
+    var unique = st.cuts === 1;
+    var a = pt(st.at, bandR - bandW / 2 - 2);
+    var b = pt(st.at, bandR - bandW / 2 - 16);
     root.appendChild(svg('line', {
-      x1: tx, y1: axis, x2: tx, y2: axis + 4, class: 'axis-tick'
-    }));
-    root.appendChild(svg('text', {
-      x: tx, y: axis + 15, class: 'axis-label', 'text-anchor': 'middle'
-    }, bp(opts.circular ? (((base % total) + total) % total) + 1 : base + 1)));
-  }
-
-  /* --- restriction sites --------------------------------------------- */
-  var placed = [];
-  sites.forEach(function (s) {
-    var sx = x(s.at);
-    if (sx < -20 || sx > width + 20) return;
-    var unique = s.cuts === 1;
-    root.appendChild(svg('line', {
-      x1: sx, y1: axis - 34, x2: sx, y2: axis - 10,
+      x1: a[0], y1: a[1], x2: b[0], y2: b[1],
       class: 'cut-tick' + (unique ? ' cut-unique' : '')
     }));
-    // Only label what there is room for, nearest-first.
-    var clash = placed.some(function (p) { return Math.abs(p - sx) < 34; });
-    if (!clash) {
-      placed.push(sx);
-      var label = svg('text', {
-        x: sx, y: axis - 38, 'text-anchor': 'middle',
-        class: 'cut-label' + (unique ? ' cut-unique' : '')
-      }, s.enzyme);
-      label.appendChild(svg('title', null,
-        s.enzyme + ' ' + s.site + '\n' + (s.at + 1) +
-        (unique ? '\ncuts here and nowhere else'
-                : '\none of ' + s.cuts + ' sites in this molecule')));
-      root.appendChild(label);
-    }
+    if (Math.abs(ang(st.at) - lastLabelAngle) < 0.055) return;
+    lastLabelAngle = ang(st.at);
+    var lp = pt(st.at, bandR - bandW / 2 - 21);
+    var deg = ang(st.at) * 180 / Math.PI;
+    var label = svg('text', {
+      x: lp[0], y: lp[1], 'text-anchor': 'middle',
+      transform: 'rotate(' + deg.toFixed(2) + ' ' + lp[0].toFixed(2) +
+                 ' ' + lp[1].toFixed(2) + ')',
+      class: 'cut-label' + (unique ? ' cut-unique' : '')
+    }, st.enzyme);
+    label.appendChild(svg('title', null,
+      st.enzyme + ' ' + st.site + '\n' + (st.at + 1) +
+      (unique ? '\ncuts here and nowhere else'
+              : '\none of ' + st.cuts + ' sites in this molecule')));
+    root.appendChild(label);
   });
 
-  /* --- fragment junctions -------------------------------------------- */
+  /* --- fragment junctions ---------------------------------------------- */
   junctions.forEach(function (j) {
-    var jx = x(j.at);
-    if (jx < 0 || jx > width) return;
-    root.appendChild(svg('line', {
-      x1: jx, y1: axis - 10, x2: jx, y2: axis + 23, class: 'junction-tick'
-    })).appendChild(svg('title', null, j.name || 'fragment junction'));
+    if (!visible(j.at)) return;
+    var a = pt(j.at, bandR + bandW / 2 + 3);
+    var b = pt(j.at, bandR - bandW / 2 - 3);
+    var line = svg('line', { x1: a[0], y1: a[1], x2: b[0], y2: b[1],
+                             class: 'junction-tick' });
+    line.appendChild(svg('title', null, j.name || 'fragment junction'));
+    root.appendChild(line);
   });
 
-  /* --- the bases ------------------------------------------------------ */
-  if (letters) {
-    var top = axis + 46;
-    var from = Math.floor(view.start);
-    var upto = Math.ceil(view.start + view.span);
-    for (var i = from; i < upto; i++) {
-      var at = opts.circular ? ((i % total) + total) % total : i;
-      if (at < 0 || at >= total) continue;
-      var bx = MAP_PAD + (i - view.start) * perBase + perBase / 2;
-      var base = seq[at].toUpperCase();
-      root.appendChild(svg('text', {
-        x: bx, y: top, 'text-anchor': 'middle',
-        class: 'base base-' + base
-      }, base));
-      root.appendChild(svg('text', {
-        x: bx, y: top + 15, 'text-anchor': 'middle',
-        class: 'base base-rev base-' + (revcompJS(base) || 'N')
-      }, revcompJS(base)));
+  /* --- position ticks --------------------------------------------------- */
+  var nticks = frac >= 1 ? 8 : 6;
+  for (var t = 0; t <= nticks; t++) {
+    var base = Math.round(view.start + view.span * t / nticks);
+    if (frac >= 1 && t === nticks) break;
+    if (!visible(base)) continue;
+    var o1 = pt(base, bandR + bandW / 2);
+    var o2 = pt(base, bandR + bandW / 2 + 5);
+    root.appendChild(svg('line', { x1: o1[0], y1: o1[1], x2: o2[0], y2: o2[1],
+                                   class: 'axis-tick' }));
+  }
+
+  /* --- the bases, on the arc -------------------------------------------- */
+  var perBase = (frac >= 1 ? 0 : (sweep * radius) / view.span);
+  if (perBase >= BROWSER_LETTER_PX) {
+    var fromB = Math.floor(view.start), toB = Math.ceil(view.start + view.span);
+    for (var i = fromB; i < toB; i++) {
+      var at = ((i % total) + total) % total;
+      if (!visible(i)) continue;
+      var deg2 = ang(i + 0.5) * 180 / Math.PI;
+      [[bandR - bandW / 2 - 30, seq[at].toUpperCase(), ''],
+       [bandR - bandW / 2 - 42, revcompJS(seq[at]), ' base-rev']
+      ].forEach(function (row) {
+        var q = pt(i + 0.5, row[0]);
+        root.appendChild(svg('text', {
+          x: q[0], y: q[1], 'text-anchor': 'middle',
+          transform: 'rotate(' + deg2.toFixed(2) + ' ' + q[0].toFixed(2) +
+                     ' ' + q[1].toFixed(2) + ')',
+          class: 'base base-' + row[1] + row[2]
+        }, row[1]));
+      });
     }
-    root.appendChild(svg('text', {
-      x: 4, y: top, class: 'strand-label'
-    }, '5′'));
-    root.appendChild(svg('text', {
-      x: 4, y: top + 15, class: 'strand-label'
-    }, '3′'));
   }
   return root;
 }
