@@ -103,6 +103,21 @@ class Config:
     #: much longer. Set to 0 to pin every junction where the construct
     #: puts it and take the Tm mismatch instead.
     primer_max_retreat: int = 25
+    #: Put a unique restriction site at each end of the cassette - in
+    #: front of the Kozak and past the stop codon - so the insert can be
+    #: swapped later without redesigning the whole plasmid. The sites are
+    #: chosen against the finished sequence, so they cut once or not at
+    #: all.
+    #:
+    #: Off until the planner stops tripping over the extra module. The
+    #: handles themselves are right - unique, popular enzymes, no start
+    #: codon introduced in front of the Kozak, product simulates
+    #: identical - but a twelve-base module is below the length worth
+    #: amplifying, so it is folded onto the primer tails that meet there,
+    #: and a folded junction cannot move. That costs the retreat that
+    #: keeps a primer pair inside its Tm limit, and three planner tests
+    #: fail outright.
+    junction_sites: bool = False
     #: Addgene's PCR cloning protocol: the region that hybridises to the
     #: template is 18-21 bp, which is "usually sufficient to give specificity
     #: and to also be compatible with a standard PCR reaction".

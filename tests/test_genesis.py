@@ -5629,6 +5629,75 @@ class TestAnArmThatGoesOnMatchingIsPartOfTheDuplex(unittest.TestCase):
         self.assertIn("tail_binds", d)
 
 
+class TestCloningHandles(unittest.TestCase):
+    """A unique restriction site at each end of the cassette.
+
+    Off by default: the handles themselves are correct, but a twelve-base
+    module is folded onto the primer tails at its junction, and a folded
+    junction cannot retreat, which is what keeps a pair inside its Tm
+    limit. These tests cover the part that works, so that turning it on
+    later starts from a known position.
+    """
+
+    def test_it_picks_a_popular_enzyme_that_cuts_nowhere(self):
+        from genesis.construct import choose_junction_enzymes, POPULAR_ENZYMES
+        from genesis.enzymes import CATALOG
+        cfg = Config()
+        cfg.stocked_enzymes = ["HindIII", "EcoRI", "BamHI", "XbaI", "NheI"]
+        # a sequence carrying HindIII and EcoRI already
+        seq = ("AAGCTT" + "A" * 200 + "GAATTC" + "T" * 200)
+        picks = choose_junction_enzymes(seq, cfg, how_many=2)
+        self.assertEqual(len(picks), 2)
+        for name in picks:
+            self.assertIn(name, POPULAR_ENZYMES)
+            self.assertNotIn(CATALOG[name].site.upper(), seq.upper())
+        self.assertNotIn("HindIII", picks, "picked an enzyme that already cuts")
+        self.assertNotIn("EcoRI", picks)
+
+    def test_it_prefers_the_first_popular_enzyme_that_is_free(self):
+        from genesis.construct import choose_junction_enzymes
+        cfg = Config()
+        cfg.stocked_enzymes = ["HindIII", "EcoRI", "BamHI"]
+        picks = choose_junction_enzymes("A" * 400, cfg, how_many=2)
+        self.assertEqual(picks[:2], ["HindIII", "EcoRI"])
+
+    def test_it_will_not_use_an_enzyme_the_lab_does_not_stock(self):
+        from genesis.construct import choose_junction_enzymes
+        cfg = Config()
+        cfg.stocked_enzymes = ["NheI"]
+        self.assertEqual(choose_junction_enzymes("A" * 400, cfg, 2), ["NheI"])
+
+    def test_the_upstream_spacer_never_adds_a_start_codon(self):
+        # An ATG in front of the real one is a second start codon, and
+        # the ribosome takes the first it meets. It has to be checked
+        # across the seams too, since the codon can straddle them.
+        from genesis.construct import junction_spacer, _makes_atg
+        self.assertTrue(_makes_atg("TGACGT", before="CCA", after="GGG"))
+        for before, after in (("CCA", "GCCACC"), ("AAA", "ATGGCC"),
+                              ("CAT", "GCCACC"), ("", "GCCACC")):
+            sp = junction_spacer("HindIII", True, before, after)
+            if sp:
+                self.assertNotIn("ATG", (before[-2:] + sp + after[:2]).upper(),
+                                 f"start codon across the seam: {before}|{sp}|{after}")
+
+    def test_the_site_is_flanked_so_the_enzyme_can_cut_it(self):
+        from genesis.construct import junction_spacer
+        from genesis.enzymes import CATALOG
+        sp = junction_spacer("HindIII", False, "AAAA", "TTTT")
+        site = CATALOG["HindIII"].site.upper()
+        self.assertIn(site, sp)
+        self.assertGreater(sp.index(site), 0, "site is flush against the join")
+        self.assertLess(sp.index(site) + len(site), len(sp))
+
+    def test_off_by_default_changes_nothing(self):
+        from genesis.construct import add_junction_sites
+        cfg = Config()
+        self.assertFalse(cfg.junction_sites)
+        out, notes = add_junction_sites(["anything"], "ACGT" * 50, cfg)
+        self.assertEqual(out, ["anything"])
+        self.assertEqual(notes, [])
+
+
 class TestTmAgreesWithNEB(unittest.TestCase):
     """NEB's calculator is what a primer is checked against before it is
     ordered, so disagreeing with it is a bug however defensible the

@@ -11,7 +11,7 @@ import sqlite3
 
 from .config import Config
 from .seqtools import find_all, revcomp, slice_region
-from .construct import (VECTOR_TYPES, ConstructSpec, assemble,
+from .construct import (add_junction_sites, VECTOR_TYPES, ConstructSpec, assemble,
                         assemble_into_backbone, codon_markers,
                         expand_dio, resolve)
 from .planner import (group_contiguous, plan_gblock_route,
@@ -1089,15 +1089,26 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
     # real plasmid carrying its ITRs, WPRE, polyA, origin and resistance -
     # not the payload bolted onto the end of one.
     backbone_annotations = backbone_rows
-    if backbone:
-        spec_types = {canonical_feature_type(
-            m["type"] if isinstance(m, dict) else m.type) for m in spec.modules}
-        construct = assemble_into_backbone(
-            resolved, backbone["seq"], backbone_annotations, spec_types,
-            circular=spec.circular)
-    else:
-        construct = assemble(resolved, "", circular=spec.circular)
+    spec_types = {canonical_feature_type(
+        m["type"] if isinstance(m, dict) else m.type) for m in spec.modules}
+
+    def build(mods):
+        if backbone:
+            return assemble_into_backbone(
+                mods, backbone["seq"], backbone_annotations, spec_types,
+                circular=spec.circular)
+        return assemble(mods, "", circular=spec.circular)
+
+    # Built once to find out what the molecule actually contains, because
+    # a handle has to be unique in the *product* - a site in the stretch
+    # of backbone being replaced is not in the way, and ruling its enzyme
+    # out cost HindIII, which is the one anyone would reach for first.
+    construct = build(resolved)
+    resolved, handle_notes = add_junction_sites(resolved, construct.seq, cfg)
+    if handle_notes:
+        construct = build(resolved)
     construct.warnings.extend(dio_notes)
+    construct.warnings.extend(handle_notes)
     # These were being computed and dropped, so a plan could silently take
     # a fusion whole, move a source onto the recipient or extend an
     # amplicon to a stop codon without ever saying it had.

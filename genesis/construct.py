@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import dataclass, field, asdict
+from dataclasses import replace, dataclass, field, asdict
 
 from .seqtools import clean_seq, revcomp, translate, STOP_CODONS
 from .vocab import (canonical_feature_type, find_embedded_elements,
@@ -1358,3 +1358,171 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
 
     return AssembledConstruct(seq, circular, layout, warnings,
                               missing_required, backbone_segments=kept)
+
+
+# --------------------------------------------------------------------------
+# Cloning handles at the cassette's two junctions
+# --------------------------------------------------------------------------
+
+#: Enzymes worth putting a site in for: common, cheap, single-site cutters
+#: that nearly every freezer has. Order is preference - the first one whose
+#: site is absent from the finished plasmid wins.
+POPULAR_ENZYMES = (
+    "HindIII", "EcoRI", "BamHI", "XbaI", "NheI", "SalI", "XhoI", "KpnI",
+    "SacI", "NotI", "AgeI", "BglII", "EcoRV", "SpeI", "PstI", "NcoI",
+    "MluI", "AscI", "BsrGI", "ClaI",
+)
+
+#: Bases put either side of a site. A restriction enzyme will not cut a
+#: recognition sequence flush against the end of a fragment, and these
+#: also give a primer somewhere other than the junction itself to anchor
+#: on. Chosen to be GC-balanced and to contain no ATG.
+_PAD_5 = "TCA"
+_PAD_3 = "CTA"
+
+
+def _makes_atg(spacer: str, before: str, after: str) -> bool:
+    """Whether inserting this spacer puts an ATG in the 5' untranslated run.
+
+    An ATG upstream of the real start codon is a second start codon: the
+    ribosome scans from the cap and takes the first one it meets in good
+    context, so an accidental one here costs expression. It has to be
+    checked across the seams as well as inside the spacer, because the
+    codon can straddle them.
+    """
+    window = (before[-2:] if before else "") + spacer + (after[:2] if after else "")
+    return "ATG" in window.upper()
+
+
+def choose_junction_enzymes(seq: str, cfg, how_many: int = 2) -> list[str]:
+    """Enzymes whose sites are absent from this construct, best first.
+
+    The point of the site is to be a handle, and a handle that cuts in two
+    places is not one - so a site already present anywhere disqualifies
+    its enzyme, and two junctions never get the same enzyme.
+    """
+    from .enzymes import CATALOG
+    from .seqtools import revcomp
+
+    stocked = {e.lower() for e in (getattr(cfg, "stocked_enzymes", None) or ())}
+    up = (seq or "").upper()
+    chosen: list[str] = []
+    for name in POPULAR_ENZYMES:
+        if len(chosen) >= how_many:
+            break
+        enz = CATALOG.get(name)
+        if enz is None or (stocked and name.lower() not in stocked):
+            continue
+        site = enz.site.upper()
+        if "N" in site or len(site) < 6:
+            continue
+        if site in up or revcomp(site) in up:
+            continue
+        if any(site in CATALOG[c].site.upper() or
+               CATALOG[c].site.upper() in site for c in chosen):
+            continue
+        chosen.append(name)
+    return chosen
+
+
+def junction_spacer(enzyme: str, five_prime: bool, before: str,
+                    after: str) -> str:
+    """The short stretch to drop in at one junction.
+
+    A pad, the site, and a pad: the pads are there because an enzyme will
+    not cut a site sitting flush against the end of a fragment, and they
+    give the primers a few bases that are neither promoter nor coding to
+    anchor on, which is usually where a junction's Tm trouble comes from.
+    """
+    from .enzymes import CATALOG
+    enz = CATALOG.get(enzyme)
+    if enz is None:
+        return ""
+    spacer = _PAD_5 + enz.site.upper() + _PAD_3
+    if five_prime and _makes_atg(spacer, before, after):
+        # Only an upstream spacer can introduce a start codon that
+        # matters; try the other arrangement before giving up on it.
+        for alt5, alt3 in (("TCA", "TCA"), ("CTA", "CTA"), ("ACT", "CAT")):
+            cand = alt5 + enz.site.upper() + alt3
+            if not _makes_atg(cand, before, after):
+                return cand
+        return ""
+    return spacer
+
+
+#: Module types that are read as protein. A spacer goes outside the run of
+#: them, never inside: between a promoter and the Kozak, and past the stop.
+_SPACER_BOUNDS = {"CDS", "p2A", "tag", "trafficking_motif", "linker", "Kozak"}
+
+
+def add_junction_sites(resolved: list, around: str, cfg) -> tuple[list, list]:
+    """Put a unique restriction site at each end of the cassette.
+
+    The two places worth a handle are the ones somebody comes back to: in
+    front of the coding sequence, so the insert can be swapped without
+    touching the promoter, and behind it, so the promoter and insert can
+    be moved together. Neither is inside the reading frame - the 5' one
+    goes upstream of the Kozak, which stays flush against the ATG where
+    it belongs, and the 3' one sits past the stop codon.
+
+    A handle has to be unique or it is not a handle, so the enzymes are
+    chosen against the finished sequence rather than from a list, and the
+    two junctions never get the same one. `around` is whatever else ends
+    up in the molecule - the backbone - so a site already in the vector
+    disqualifies its enzyme too.
+
+    Returns (modules with the spacers spliced in, notes).
+    """
+    if not getattr(cfg, "junction_sites", True) or not resolved:
+        return resolved, []
+
+    first = next((i for i, rm in enumerate(resolved)
+                  if rm.feature_type in _SPACER_BOUNDS), None)
+    last = next((len(resolved) - 1 - i
+                 for i, rm in enumerate(reversed(resolved))
+                 if rm.feature_type in _SPACER_BOUNDS), None)
+    if first is None or last is None:
+        return resolved, []
+
+    # `around` is the finished molecule as it stands without handles,
+    # which already contains these modules - so it is the whole of what
+    # has to be checked, and a site in backbone that gets replaced is
+    # correctly not counted.
+    picks = choose_junction_enzymes(around or "".join(rm.seq for rm in resolved),
+                                    cfg, how_many=2)
+    if not picks:
+        return resolved, ["no popular enzyme has a site absent from this "
+                          "construct, so no cloning handles were added"]
+
+    out = list(resolved)
+    notes: list[str] = []
+    # 3' first, so inserting it does not move the 5' index.
+    places = [(last + 1, picks[-1], False)]
+    if len(picks) > 1:
+        places.append((first, picks[0], True))
+    for index, enzyme, five in places:
+        before = "".join(rm.seq for rm in out[:index])[-6:] or (around or "")[-6:]
+        after = (out[index].seq[:6] if index < len(out) else "")
+        spacer = junction_spacer(enzyme, five, before, after)
+        if not spacer:
+            notes.append(f"could not place a {enzyme} site without putting "
+                         f"an ATG in front of the start codon")
+            continue
+        # Its own module, not glued onto a neighbour. Gluing kept the
+        # handle out of the folding machinery, but it also rewrote a
+        # module's sequence under everything that reads one: a literal
+        # sequence somebody typed in came back 24 bases longer than they
+        # wrote it, a start codon moved out from under the codon marker
+        # that was looking for it, and a HiFi route stopped being
+        # feasible. A module is what the specification asked for, and
+        # this is not part of any of them.
+        mod = Module(type="restriction_site", name=f"{enzyme} site",
+                     required=False, seq=spacer)
+        out.insert(index, ResolvedModule(
+            module=mod, part_id=None, part_name=f"{enzyme} site",
+            seq=spacer, feature_type="restriction_site"))
+        notes.append(
+            f"added a unique {enzyme} site {'in front of the Kozak' if five else 'after the stop codon'} "
+            f"({len(spacer)} bp): it cuts once in the finished plasmid, so the "
+            f"{'insert' if five else 'cassette'} can be taken out again without redesigning")
+    return out, notes
