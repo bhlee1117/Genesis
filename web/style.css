@@ -1908,3 +1908,10 @@ nav.steps .step-sep {
 .seqbrowser .base-G { fill: #c77c2a; }
 .seqbrowser .base-T { fill: #c05a5a; }
 .seqbrowser .strand-label { font-size: 9px; fill: var(--text-muted); }
+
+/* A candidate map is fetched only when asked for. */
+.cand-map-stub {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 12px;
+}
+.cand-map-stub button { padding: 3px 11px; font-size: 12px; }

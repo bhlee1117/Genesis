@@ -4231,13 +4231,48 @@ function wantedBy(ann, wants) {
   });
 }
 
-function showCandidateMap(host, plasmidId, wants, role) {
+/* Which panels the person has asked to see a map in. Asking once is
+   taken to mean they want the map for that slot, so changing the choice
+   afterwards redraws it rather than making them click again. */
+var MAP_WANTED = {};
+
+/**
+ * A map of a candidate plasmid, behind a button.
+ *
+ * Every one of these is a fetch of a whole plasmid and a few hundred
+ * annotations, and the scan step opens with one for the recipient and
+ * one per donor. Drawing them all on arrival made the step sit there
+ * loading for a moment before anything could be read, to show maps that
+ * are usually glanced at rather than studied.
+ */
+function showCandidateMap(host, plasmidId, wants, role, hint) {
   clear(host);
   if (!plasmidId) {
     host.appendChild(h('p', { class: 'muted small' },
       'Pick a plasmid to see what is in it.'));
     return;
   }
+  var key = role || String(plasmidId);
+  if (MAP_WANTED[key]) {
+    drawCandidateMap(host, plasmidId, wants, role);
+    return;
+  }
+  var name = (hint && hint.name) || ('plasmid #' + plasmidId);
+  host.appendChild(h('div', { class: 'cand-map-stub' },
+    h('button', {
+      type: 'button',
+      onclick: function () {
+        MAP_WANTED[key] = true;
+        drawCandidateMap(host, plasmidId, wants, role);
+      }
+    }, 'Show map'),
+    h('span', { class: 'muted small' },
+      name + (hint && hint.length ? ' \u00b7 ' + bp(hint.length) : '')
+           + (role ? ' \u00b7 ' + role : ''))));
+}
+
+function drawCandidateMap(host, plasmidId, wants, role) {
+  clear(host);
   host.appendChild(h('p', { class: 'muted small' }, 'Loading\u2026'));
   fetchPlasmid(plasmidId).then(function (p) {
     clear(host);
@@ -4307,8 +4342,12 @@ function renderCandidates(plan) {
   var lists = h('div', { class: 'cand-lists' });
   card.appendChild(h('div', { class: 'cand-split' }, lists, maps));
 
-  /* Draw what is already chosen, so nothing is blank before a click. */
-  showCandidateMap(panelFor('recipient'), chosenBackbone, wants, 'recipient');
+  /* Offer what is already chosen, named, without fetching it. */
+  var chosenRow = recipients.filter(function (r) {
+    return r.plasmid_id === chosenBackbone;
+  })[0];
+  showCandidateMap(panelFor('recipient'), chosenBackbone, wants, 'recipient',
+                   chosenRow && { name: chosenRow.name, length: chosenRow.length });
   (cand.donors || []).forEach(function (d, di) {
     var ids = partIdsFor(plan, d.covers || []);
     var picked = (d.options || []).filter(function (o) {
@@ -4320,7 +4359,8 @@ function renderCandidates(plan) {
       showCandidateMap(panelFor('donor' + di), picked.plasmid_id,
                        d.covers || [],
                        'donor ' + (di + 1) + ' \u2014 ' +
-                       (d.covers || []).join(' + '));
+                       (d.covers || []).join(' + '),
+                       { name: picked.name, length: picked.length });
     }
   });
 
@@ -4357,7 +4397,7 @@ function renderCandidates(plan) {
       function (r) {
         $('spec-backbone').value = String(r.plasmid_id);
         showCandidateMap(panelFor('recipient'), r.plasmid_id, wants,
-                         'recipient');
+                         'recipient', { name: r.name, length: r.length });
         replan();
       }));
     var list = h('div', { class: 'cand-list cand-rest'
@@ -4383,7 +4423,7 @@ function renderCandidates(plan) {
           onchange: function () {
             $('spec-backbone').value = String(r.plasmid_id);
             showCandidateMap(panelFor('recipient'), r.plasmid_id, wants,
-                             'recipient');
+                             'recipient', { name: r.name, length: r.length });
             replan();
           }
         }),
@@ -4458,7 +4498,8 @@ function renderCandidates(plan) {
           showCandidateMap(panelFor('donor' + di), o.plasmid_id,
                            d.covers || [],
                            'donor ' + (di + 1) + ' \u2014 '
-                           + (d.covers || []).join(' + '));
+                           + (d.covers || []).join(' + '),
+                           { name: o.name, length: o.length });
           replan();
         }));
       var rest = h('div', { class: 'cand-list cand-rest' });
@@ -4478,7 +4519,8 @@ function renderCandidates(plan) {
               showCandidateMap(panelFor('donor' + di), o.plasmid_id,
                                d.covers || [],
                                'donor ' + (di + 1) + ' \u2014 ' +
-                               (d.covers || []).join(' + '));
+                               (d.covers || []).join(' + '),
+                               { name: o.name, length: o.length });
               replan();
             }
           }),
