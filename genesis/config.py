@@ -8,6 +8,7 @@ defaults are derived from what the lab share actually contains.
 from __future__ import annotations
 
 import json
+from .seqtools import CALIBRATED_MG_MM, CALIBRATED_NA_MM
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -72,6 +73,12 @@ class Config:
     #: Backbone to reach for when an AAV is requested and none is named.
     #: Vector family assumed when a specification does not mention one.
     #: Set to "" to infer it from the backbone instead.
+    #: Free token from https://developers.addgene.org/. Only ever used to
+    #: search the catalogue for parts the lab has not got; nothing found
+    #: there is used as a donor or a PCR template. The environment
+    #: variable GENESIS_ADDGENE_TOKEN takes precedence.
+    addgene_token: str = ""
+
     default_vector: str = "AAV"
     default_aav_backbone: str = "PP072"
     default_lenti_backbone: str = ""
@@ -81,6 +88,36 @@ class Config:
     # --- Stage 9: primer design -----------------------------------------
     primer_tm_target: float = 60.0
     primer_tm_tolerance: float = 3.0
+    #: How far the two primers of one reaction may differ in Tm. They
+    #: anneal in the same tube at the same temperature, so the pair is
+    #: the unit that has to be right, not each primer on its own. NEB's
+    #: own calculator refuses a pair past 5 C; this lab runs tighter,
+    #: because 5 C is enough for the cooler primer to misprime at a Ta
+    #: the hotter one still needs. The junction can usually move far
+    #: enough to pay for it.
+    primer_pair_max_diff: float = 3.0
+    #: How far a junction may move back into its fragment so that the two
+    #: primers of one reaction can share an annealing step. The bases it
+    #: stops short of are written onto the next fragment's forward tail,
+    #: so the product is unchanged and the cost is that one oligo is this
+    #: much longer. Set to 0 to pin every junction where the construct
+    #: puts it and take the Tm mismatch instead.
+    primer_max_retreat: int = 25
+    #: Put a unique restriction site at each end of the cassette - in
+    #: front of the Kozak and past the stop codon - so the insert can be
+    #: swapped later without redesigning the whole plasmid. The sites are
+    #: chosen against the finished sequence, so they cut once or not at
+    #: all.
+    #:
+    #: Off until the planner stops tripping over the extra module. The
+    #: handles themselves are right - unique, popular enzymes, no start
+    #: codon introduced in front of the Kozak, product simulates
+    #: identical - but a twelve-base module is below the length worth
+    #: amplifying, so it is folded onto the primer tails that meet there,
+    #: and a folded junction cannot move. That costs the retreat that
+    #: keeps a primer pair inside its Tm limit, and three planner tests
+    #: fail outright.
+    junction_sites: bool = False
     #: Addgene's PCR cloning protocol: the region that hybridises to the
     #: template is 18-21 bp, which is "usually sufficient to give specificity
     #: and to also be compatible with a standard PCR reaction".
@@ -92,15 +129,36 @@ class Config:
     primer_leader: str = "TTAATT"
     primer_max_gc: float = 0.65
     primer_min_gc: float = 0.35
+    #: The band NEB asks for in the Q5 protocol - "ideally have a GC
+    #: content of 40-60%". The wider pair above is where Genesis starts
+    #: warning; this narrower one is what it aims at while choosing where
+    #: to put the primer.
+    primer_ideal_min_gc: float = 0.40
+    primer_ideal_max_gc: float = 0.60
     #: Homology arm. Used as a ceiling: the shortest arm that still reaches
     #: `overlap_tm_min` is taken, because every base of overlap is a base of
     #: oligo somebody pays for and synthesises with some error rate.
     overlap_length: int = 25
-    overlap_min_length: int = 15
+    #: A floor under whatever the kit itself asks for, not a replacement
+    #: for it: homology_range() already holds NEBuilder HiFi at 15-25 and
+    #: Gibson at 20-40, which is what each supplier specifies.
+    #:
+    #: Raised to 20 for this lab. NEB's own range starts at 15, but 15 is
+    #: the point at which it still works rather than the point at which
+    #: it works well, and NEB themselves ask for more as soon as there
+    #: are several fragments in the tube. Five more bases on one oligo is
+    #: a cheaper way to buy an assembly than a repeat of the assembly.
+    overlap_min_length: int = 20
     overlap_tm_min: float = 48.0
     primer_conc_nm: float = 500.0
-    na_mm: float = 50.0
-    mg_mm: float = 2.0
+    #: Free-ion concentrations of the reaction the Tm is quoted for.
+    #: 2 mM Mg2+ is what Q5 buffer contains; the monovalent figure was
+    #: fitted to 84 values from NEB's own Tm API across 18-40 nt and
+    #: 20-80% GC, because NEB's calculator is what a primer gets checked
+    #: against before it is ordered and disagreeing with it by 5 C is a
+    #: bug however defensible the thermodynamics.
+    na_mm: float = CALIBRATED_NA_MM
+    mg_mm: float = CALIBRATED_MG_MM
 
     # --- Stage 10: route ranking weights (higher = more discouraged) -----
     cost_weights: dict = field(default_factory=lambda: {

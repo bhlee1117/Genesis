@@ -288,12 +288,47 @@ def validate_construct(construct: AssembledConstruct,
             issues.append(Issue("info", "dna",
                                 "unique sites available for diagnostic digest: "
                                 + ", ".join(sorted(unique)[:12])))
+            issues.extend(_excision_note(construct, stocked_enzymes))
         else:
             issues.append(Issue("warning", "dna",
                                 "no stocked enzyme cuts this construct exactly "
                                 "once; colony screening by digest will be harder"))
 
     return issues
+
+
+def _excision_note(construct, stocked_enzymes) -> list:
+    """How to get the insert back out of the finished plasmid.
+
+    Nobody builds one of these once. The question asked of a new plasmid
+    six months later is which two enzymes release the cassette, and that
+    is answerable from the sequence: the nearest enzyme on each side of
+    the insert that cuts the whole molecule exactly once. Both distances
+    are quoted, because a site 10 bp out returns the insert and a site
+    2 kb out returns the insert plus 2 kb of backbone, and only one of
+    those can be put straight into another vector.
+    """
+    from .enzymes import excision_pair, flanking_sites
+
+    inserted = [i for i in (construct.layout or [])
+                if i.get("type") not in ("backbone", None)]
+    if not inserted:
+        return []
+    lo = min(i["start"] for i in inserted)
+    hi = max(i["end"] for i in inserted)
+    flanks = flanking_sites(construct.seq, lo, hi, stocked_enzymes,
+                            circular=construct.circular)
+    pair = excision_pair(flanks)
+    if not pair:
+        return [Issue("info", "dna",
+                      "no pair of unique sites flanks the insert, so it "
+                      "cannot be excised with stocked enzymes")]
+    up, down = pair
+    return [Issue("info", "dna",
+                  f"the insert can be cut out with {up['enzyme']} + "
+                  f"{down['enzyme']}, which takes {up['away']:,} bp of "
+                  f"backbone with it on one side and {down['away']:,} bp "
+                  f"on the other")]
 
 
 def _check_protein(construct: AssembledConstruct) -> list[Issue]:

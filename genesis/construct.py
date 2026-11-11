@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import dataclass, field, asdict
+from dataclasses import replace, dataclass, field, asdict
 
 from .seqtools import clean_seq, revcomp, translate, STOP_CODONS
 from .vocab import (canonical_feature_type, find_embedded_elements,
@@ -202,7 +202,19 @@ def candidate_parts(conn: sqlite3.Connection, module: Module, limit: int = 12) -
              WHERE p.feature_type = ? AND p.seq_length >= ?"""
     args: list = [module.type, min_part_length(module.type)]
     if module.name:
-        sql += " AND (p.name LIKE ? COLLATE NOCASE)"
+        # Also the names this part's own plasmids and folders use for it.
+        # The CDS in BHL021_pAAV_ef1a_FLEX_ASAP6c is annotated "ASAP4c
+        # 413G"; without the alias, ASAP6c is unfindable even though the
+        # folder, the file and the person who made it all say ASAP6c.
+        # Only authoritative aliases count: one that disagrees with the
+        # part's own label about a version number stays out until a human
+        # settles it, because a different number is a different sensor.
+        sql += (" AND (p.name LIKE ? COLLATE NOCASE"
+                "      OR EXISTS (SELECT 1 FROM part_alias a"
+                "                  WHERE a.part_id = p.id"
+                "                    AND a.authoritative = 1"
+                "                    AND a.alias LIKE ? COLLATE NOCASE))")
+        args.append(f"%{module.name}%")
         args.append(f"%{module.name}%")
     # Relevance before popularity. A search for "LR-Voltron2" must not land
     # on "LR-Voltron2-LR-WiChR-eGFP" just because that row has more sources:
@@ -211,11 +223,14 @@ def candidate_parts(conn: sqlite3.Connection, module: Module, limit: int = 12) -
     if module.name:
         sql += """ GROUP BY p.id ORDER BY
                      (p.name = ? COLLATE NOCASE) DESC,
+                     (EXISTS (SELECT 1 FROM part_alias a WHERE a.part_id = p.id
+                              AND a.authoritative = 1
+                              AND a.alias = ? COLLATE NOCASE)) DESC,
                      (p.name LIKE ? COLLATE NOCASE) DESC,
                      LENGTH(p.name) ASC,
                      n_sources DESC
                    LIMIT ?"""
-        args += [module.name, f"{module.name}%", limit]
+        args += [module.name, module.name, f"{module.name}%", limit]
     else:
         sql += " GROUP BY p.id ORDER BY n_sources DESC, p.seq_length DESC LIMIT ?"
         args.append(limit)
@@ -230,20 +245,36 @@ def part_sources(conn: sqlite3.Connection, part_id: int) -> list[dict]:
     amplify. Prefer circular, sequence-verified, annotated plasmids; among
     equals prefer the smaller one, which amplifies more cleanly.
     """
+    # Other rows for the same part. A plasmid holding EGFP under the name
+    # "GFP", or without its start codon, holds EGFP.
+    from .swap import equivalent_part_ids
+
+    ids = equivalent_part_ids(conn, part_id)
+    marks = ",".join("?" * len(ids))
     rows = conn.execute(
-        """SELECT pl.id, pl.name, pl.owner, pl.verified, pl.available_template,
-                  pl.circular, pl.seq_length, o.start, o.end, o.strand
+        f"""SELECT pl.id, pl.name, pl.owner, pl.verified, pl.available_template,
+                  pl.circular, pl.seq_length, o.start, o.end, o.strand,
+                  (o.part_id = ?) AS exact_part,
+                  (pl.circular = 1 AND
+                   (SELECT COUNT(DISTINCT a.feature_type) FROM annotation a
+                     WHERE a.plasmid_id = pl.id
+                       AND a.feature_type IN ('origin', 'resistance')) = 2)
+                  AS growable
            FROM part_occurrence o JOIN plasmid pl ON pl.id = o.plasmid_id
-           WHERE o.part_id = ? AND pl.available_template = 1
+           WHERE o.part_id IN ({marks}) AND pl.available_template = 1
            ORDER BY
-             pl.circular DESC,
+             growable DESC,
+             exact_part DESC,
              (pl.verified != 'unverified') DESC,
-             (SELECT COUNT(*) FROM annotation a
-              WHERE a.plasmid_id = pl.id
-                AND a.feature_type IN ('origin', 'resistance')) DESC,
              pl.seq_length ASC""",
-        (part_id,)).fetchall()
-    return [dict(r) for r in rows]
+        (part_id, *ids)).fetchall()
+    out = [dict(r) for r in rows]
+    # A fragment is a template of last resort, not a cheaper option: it
+    # orders behind every real plasmid, and survives in the list only so a
+    # part that exists nowhere else can still be reported rather than
+    # looking as though nobody has it.
+    real = [r for r in out if r["growable"]]
+    return real if real else out
 
 
 #: Module types that are translated as part of a fusion protein.
@@ -503,7 +534,13 @@ LOXFAS_SEQ = "ACAACTTCGTATATACCTTTCTATACGAAGTTGT"
 
 #: Module types a recombinase cassette encloses. The cassette stops at the
 #: elements that stay outside it, such as the polyA and the WPRE.
+#: "Kozak" belongs here because the Kozak that gets taken from a donor sits
+#: between the cassette and the coding sequence it initiates. Leaving it out
+#: ended the payload scan on it, so a pAAV-CAG-DIO-ASAP7y came out
+#: byte-identical to pAAV-CAG-ASAP7y: no lox sites, no error, a
+#: constitutive construct carrying the word DIO in its name.
 CASSETTE_PAYLOAD_TYPES = {"CDS", "trafficking_motif", "linker", "p2A", "tag",
+                          "Kozak",
                           "IRES"}
 
 
@@ -753,6 +790,12 @@ def expand_dio(resolved: list[ResolvedModule],
 expand_recombinase = expand_dio
 
 
+#: Shorter than this a "coding sequence" is an annotation artefact - a
+#: protease site, a tag fragment - and not something whose start and stop
+#: codons mean anything.
+MIN_TRANSLATED_RUN = 60
+
+
 def codon_markers(construct: AssembledConstruct) -> list[dict]:
     """Locate the start and stop codons of every translated run.
 
@@ -769,6 +812,11 @@ def codon_markers(construct: AssembledConstruct) -> list[dict]:
     """
     markers: list[dict] = []
     for run in translated_span(construct):
+        # A twelve base "CDS" is an annotation artefact, not a protein, and
+        # asking whether it starts with ATG and ends in a stop puts two
+        # false problems on every map that carries one.
+        if run["end"] - run["start"] < MIN_TRANSLATED_RUN:
+            continue
         strand = run.get("strand", 1)
         start, end = run["start"], run["end"]
         span = construct.seq[start:end]
@@ -1002,8 +1050,8 @@ def _coverage(wanted: str, region: str, k: int = 40) -> float:
 
 def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                            backbone_annotations: list[dict],
-                           spec_types: set, circular: bool = True
-                           ) -> AssembledConstruct:
+                           spec_types: set, circular: bool = True,
+                           cfg=None) -> AssembledConstruct:
     """Put the payload where it belongs inside the recipient plasmid.
 
     Two slots are filled, not one. The payload goes where the recipient's
@@ -1099,8 +1147,44 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
         rm.seq = match[1]
         satisfied.append((rm, match[0]))
 
+    # The same courtesy for a regulatory element the recipient already
+    # carries. YD030 holds the very CAG this design asks for - the same
+    # 1,745 bases, sitting exactly where they belong - and rebuilding it
+    # anyway cost a second PCR off the same plasmid and left 61 bp of it
+    # duplicated, because the kept arc and the re-inserted copy overlap.
+    #
+    # The bases have to match exactly. A promoter of the right *type* is
+    # not the promoter that was asked for, and quietly keeping a CAG when
+    # someone asked for hSyn is the same class of mistake as handing them
+    # the wrong sensor.
+    still_needed = []
+    for rm in regulatory:
+        match = None
+        for a in backbone_annotations:
+            if a["feature_type"] != rm.feature_type or id(a) in taken:
+                continue
+            bases = backbone_seq[a["start"]:a["end"]].upper()
+            if bases and bases == (rm.seq or "").upper():
+                match = a
+                break
+        if match is None:
+            still_needed.append(rm)
+            continue
+        taken.add(id(match))
+        satisfied.append((rm, match))
+        warnings.append(
+            f"the recipient already carries exactly this {rm.part_name}; "
+            f"that copy is kept and amplified with the backbone rather than "
+            f"adding a second one")
+    regulatory = still_needed
+
     payload_seq, payload_layout = block(payload)
     regulatory_seq, regulatory_layout = block(regulatory)
+
+    # Where the recipient's own regulatory elements end, so the payload
+    # can be told not to start before them.
+    satisfied_marks = {(a["feature_type"], a["name"], a["start"])
+                       for _rm, a in satisfied}
 
     # --- rotate so the payload region is contiguous ----------------------
     total = len(backbone_seq)
@@ -1116,6 +1200,7 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
         arc_end = (arc[1] - arc[0]) % total or total
 
     rotated_seq = backbone_seq[rotation:] + backbone_seq[:rotation]
+    keep_until = 0
     rotated = []
     for a in backbone_annotations:
         start, end = (a["start"] - rotation) % total, (a["end"] - rotation) % total
@@ -1127,6 +1212,8 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                 f"boundary and was not carried over")
             continue
         rotated.append({**a, "start": start, "end": end})
+        if (a["feature_type"], a["name"], a["start"]) in satisfied_marks:
+            keep_until = max(keep_until, end)
 
     edits: list[dict] = []
 
@@ -1162,6 +1249,14 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                         and a["start"] < arc_end]
             if cassette:
                 lo = min(a["start"] for a in cassette)
+                # A regulatory element the recipient supplies is being kept,
+                # so the payload must begin after it. Without this the start
+                # is the lowest coding annotation in the arc, and YD030 has
+                # a spurious ORF inside its chimeric intron at 899 - inside
+                # the CAG - which cut the promoter in half and reported it
+                # as "disrupted".
+                if keep_until:
+                    lo = max(lo, keep_until)
                 hi = arc_end
                 if not (spec_types & {"polyA", "WPRE"}):
                     after = [a["start"] for a in rotated
@@ -1169,6 +1264,19 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                              and lo <= a["start"] < arc_end]
                     if after:
                         hi = min(after)
+                        # The last replaced feature BEFORE the boundary.
+                        # Taking the maximum over all of them picked up
+                        # one lying past the WPRE in the rotated frame,
+                        # which put the gap at -483 bp and the check
+                        # never ran.
+                        before_hi = [a["end"] for a in cassette
+                                     if lo <= a["end"] <= hi]
+                        cassette_end = max(before_hi) if before_hi else lo
+                        hi, kept_note = _keep_cloning_handles(
+                            rotated_seq, rotated, cassette_end, hi,
+                            payload_seq, cfg)
+                        if kept_note:
+                            warnings.append(kept_note)
                 edits.append({"start": lo, "end": hi, "seq": payload_seq,
                               "layout": payload_layout})
             else:
@@ -1263,3 +1371,232 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
 
     return AssembledConstruct(seq, circular, layout, warnings,
                               missing_required, backbone_segments=kept)
+
+
+# --------------------------------------------------------------------------
+# Cloning handles at the cassette's two junctions
+# --------------------------------------------------------------------------
+
+#: Enzymes worth putting a site in for: common, cheap, single-site cutters
+#: that nearly every freezer has. Order is preference - the first one whose
+#: site is absent from the finished plasmid wins.
+POPULAR_ENZYMES = (
+    "HindIII", "EcoRI", "BamHI", "XbaI", "NheI", "SalI", "XhoI", "KpnI",
+    "SacI", "NotI", "AgeI", "BglII", "EcoRV", "SpeI", "PstI", "NcoI",
+    "MluI", "AscI", "BsrGI", "ClaI",
+)
+
+#: Bases put either side of a site. A restriction enzyme will not cut a
+#: recognition sequence flush against the end of a fragment, and these
+#: also give a primer somewhere other than the junction itself to anchor
+#: on. Chosen to be GC-balanced and to contain no ATG.
+_PAD_5 = "TCA"
+_PAD_3 = "CTA"
+
+
+def _makes_atg(spacer: str, before: str, after: str) -> bool:
+    """Whether inserting this spacer puts an ATG in the 5' untranslated run.
+
+    An ATG upstream of the real start codon is a second start codon: the
+    ribosome scans from the cap and takes the first one it meets in good
+    context, so an accidental one here costs expression. It has to be
+    checked across the seams as well as inside the spacer, because the
+    codon can straddle them.
+    """
+    window = (before[-2:] if before else "") + spacer + (after[:2] if after else "")
+    return "ATG" in window.upper()
+
+
+def choose_junction_enzymes(seq: str, cfg, how_many: int = 2) -> list[str]:
+    """Enzymes whose sites are absent from this construct, best first.
+
+    The point of the site is to be a handle, and a handle that cuts in two
+    places is not one - so a site already present anywhere disqualifies
+    its enzyme, and two junctions never get the same enzyme.
+    """
+    from .enzymes import CATALOG
+    from .seqtools import revcomp
+
+    stocked = {e.lower() for e in (getattr(cfg, "stocked_enzymes", None) or ())}
+    up = (seq or "").upper()
+    chosen: list[str] = []
+    for name in POPULAR_ENZYMES:
+        if len(chosen) >= how_many:
+            break
+        enz = CATALOG.get(name)
+        if enz is None or (stocked and name.lower() not in stocked):
+            continue
+        site = enz.site.upper()
+        if "N" in site or len(site) < 6:
+            continue
+        if site in up or revcomp(site) in up:
+            continue
+        if any(site in CATALOG[c].site.upper() or
+               CATALOG[c].site.upper() in site for c in chosen):
+            continue
+        chosen.append(name)
+    return chosen
+
+
+def junction_spacer(enzyme: str, five_prime: bool, before: str,
+                    after: str) -> str:
+    """The short stretch to drop in at one junction.
+
+    A pad, the site, and a pad: the pads are there because an enzyme will
+    not cut a site sitting flush against the end of a fragment, and they
+    give the primers a few bases that are neither promoter nor coding to
+    anchor on, which is usually where a junction's Tm trouble comes from.
+    """
+    from .enzymes import CATALOG
+    enz = CATALOG.get(enzyme)
+    if enz is None:
+        return ""
+    spacer = _PAD_5 + enz.site.upper() + _PAD_3
+    if five_prime and _makes_atg(spacer, before, after):
+        # Only an upstream spacer can introduce a start codon that
+        # matters; try the other arrangement before giving up on it.
+        for alt5, alt3 in (("TCA", "TCA"), ("CTA", "CTA"), ("ACT", "CAT")):
+            cand = alt5 + enz.site.upper() + alt3
+            if not _makes_atg(cand, before, after):
+                return cand
+        return ""
+    return spacer
+
+
+#: Module types that are read as protein. A spacer goes outside the run of
+#: them, never inside: between a promoter and the Kozak, and past the stop.
+_SPACER_BOUNDS = {"CDS", "p2A", "tag", "trafficking_motif", "linker", "Kozak"}
+
+
+def add_junction_sites(resolved: list, around: str, cfg) -> tuple[list, list]:
+    """Put a unique restriction site at each end of the cassette.
+
+    The two places worth a handle are the ones somebody comes back to: in
+    front of the coding sequence, so the insert can be swapped without
+    touching the promoter, and behind it, so the promoter and insert can
+    be moved together. Neither is inside the reading frame - the 5' one
+    goes upstream of the Kozak, which stays flush against the ATG where
+    it belongs, and the 3' one sits past the stop codon.
+
+    A handle has to be unique or it is not a handle, so the enzymes are
+    chosen against the finished sequence rather than from a list, and the
+    two junctions never get the same one. `around` is whatever else ends
+    up in the molecule - the backbone - so a site already in the vector
+    disqualifies its enzyme too.
+
+    Returns (modules with the spacers spliced in, notes).
+    """
+    if not getattr(cfg, "junction_sites", True) or not resolved:
+        return resolved, []
+
+    first = next((i for i, rm in enumerate(resolved)
+                  if rm.feature_type in _SPACER_BOUNDS), None)
+    last = next((len(resolved) - 1 - i
+                 for i, rm in enumerate(reversed(resolved))
+                 if rm.feature_type in _SPACER_BOUNDS), None)
+    if first is None or last is None:
+        return resolved, []
+
+    # `around` is the finished molecule as it stands without handles,
+    # which already contains these modules - so it is the whole of what
+    # has to be checked, and a site in backbone that gets replaced is
+    # correctly not counted.
+    picks = choose_junction_enzymes(around or "".join(rm.seq for rm in resolved),
+                                    cfg, how_many=2)
+    if not picks:
+        return resolved, ["no popular enzyme has a site absent from this "
+                          "construct, so no cloning handles were added"]
+
+    out = list(resolved)
+    notes: list[str] = []
+    # 3' first, so inserting it does not move the 5' index.
+    places = [(last + 1, picks[-1], False)]
+    if len(picks) > 1:
+        places.append((first, picks[0], True))
+    for index, enzyme, five in places:
+        before = "".join(rm.seq for rm in out[:index])[-6:] or (around or "")[-6:]
+        after = (out[index].seq[:6] if index < len(out) else "")
+        spacer = junction_spacer(enzyme, five, before, after)
+        if not spacer:
+            notes.append(f"could not place a {enzyme} site without putting "
+                         f"an ATG in front of the start codon")
+            continue
+        # Its own module, not glued onto a neighbour. Gluing kept the
+        # handle out of the folding machinery, but it also rewrote a
+        # module's sequence under everything that reads one: a literal
+        # sequence somebody typed in came back 24 bases longer than they
+        # wrote it, a start codon moved out from under the codon marker
+        # that was looking for it, and a HiFi route stopped being
+        # feasible. A module is what the specification asked for, and
+        # this is not part of any of them.
+        mod = Module(type="restriction_site", name=f"{enzyme} site",
+                     required=False, seq=spacer)
+        out.insert(index, ResolvedModule(
+            module=mod, part_id=None, part_name=f"{enzyme} site",
+            seq=spacer, feature_type="restriction_site"))
+        notes.append(
+            f"added a unique {enzyme} site {'in front of the Kozak' if five else 'after the stop codon'} "
+            f"({len(spacer)} bp): it cuts once in the finished plasmid, so the "
+            f"{'insert' if five else 'cassette'} can be taken out again without redesigning")
+    return out, notes
+
+
+#: How much unannotated backbone is worth keeping to save a cut site.
+#: A polylinker is a few dozen bases; more than this and whatever is
+#: there is not a polylinker.
+HANDLE_WINDOW = 60
+
+
+def _keep_cloning_handles(seq: str, anns: list, cassette_end: int,
+                          hi: int, payload: str, cfg) -> tuple:
+    """Stop the replaced region short of a polylinker worth keeping.
+
+    The region to replace runs from the old cassette to whatever is kept
+    after it - usually the WPRE - and the bases in between go with it.
+    In YD030 those bases are a polylinker: EcoRI, EcoRV and HindIII in
+    twenty-seven bases, each cutting the plasmid exactly once, sitting
+    precisely where somebody would want a handle. The design was
+    throwing all three away and the finished plasmid had none of them.
+
+    So if that gap is short, carries no annotation of its own, and holds
+    a site that cuts the backbone once and does not cut the payload, the
+    replaced region stops at the cassette instead and the gap is kept.
+    Nothing is invented: these are the vector's own bases, in the vector's
+    own place.
+    """
+    from .enzymes import CATALOG, find_sites
+
+    if hi <= cassette_end or hi - cassette_end > HANDLE_WINDOW:
+        return hi, ""
+    gap = (cassette_end, hi)
+    # Only unannotated filler qualifies; anything else in there is part
+    # of what the design means to remove.
+    for a in anns:
+        if a.get("start") is None:
+            continue
+        if a["start"] < gap[1] and a["end"] > gap[0] and \
+                a["end"] - a["start"] < hi - cassette_end + 1:
+            if a["start"] >= gap[0] and a["end"] <= gap[1]:
+                return hi, ""
+
+    stocked = [e for e in (getattr(cfg, "stocked_enzymes", None) or ())
+               if e in CATALOG]
+    found = []
+    for name in stocked:
+        enz = CATALOG[name]
+        if len(enz.site) < 6:
+            continue
+        cuts = [c.top_cut for c in find_sites(seq, enz, True)]
+        if len(cuts) != 1:
+            continue
+        if payload and find_sites(payload, enz, False):
+            continue
+        if gap[0] <= cuts[0] < gap[1]:
+            found.append(name)
+    if not found:
+        return hi, ""
+    return cassette_end, (
+        f"kept the {hi - cassette_end} bp between the old cassette and the "
+        f"next element, because it carries {', '.join(sorted(found))} - "
+        f"{'a site' if len(found) == 1 else 'sites'} that cut this plasmid "
+        f"once and would otherwise have been cut out with the cassette")

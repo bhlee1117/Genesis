@@ -115,6 +115,17 @@ CREATE TABLE IF NOT EXISTS part (
 CREATE INDEX IF NOT EXISTS idx_part_type ON part(feature_type);
 CREATE INDEX IF NOT EXISTS idx_part_name ON part(name);
 
+CREATE TABLE IF NOT EXISTS part_alias (
+    id         INTEGER PRIMARY KEY,
+    part_id    INTEGER NOT NULL REFERENCES part(id) ON DELETE CASCADE,
+    alias      TEXT NOT NULL,
+    source     TEXT,              -- folder | plasmid | label | user
+    authoritative INTEGER DEFAULT 0,
+    note       TEXT,
+    UNIQUE(part_id, alias)
+);
+CREATE INDEX IF NOT EXISTS idx_part_alias_name ON part_alias(alias COLLATE NOCASE);
+
 CREATE TABLE IF NOT EXISTS part_occurrence (
     id         INTEGER PRIMARY KEY,
     part_id    INTEGER NOT NULL REFERENCES part(id) ON DELETE CASCADE,
@@ -147,6 +158,29 @@ CREATE TABLE IF NOT EXISTS design (
     created_at   TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_design_construct ON design(construct_id);
+
+-- Autosaved working plans -----------------------------------------------
+-- Deliberately NOT the `design` table. A design is something somebody
+-- chose to keep, and it is versioned, named and owned; these are the
+-- plans the designer never got round to saving, kept so that closing a
+-- tab - or a server that stops with the machine it runs on - does not
+-- cost an afternoon's work. They expire by themselves, which is only
+-- safe because nothing here was ever deliberately saved.
+CREATE TABLE IF NOT EXISTS plan_draft (
+    id          INTEGER PRIMARY KEY,
+    owner       TEXT NOT NULL DEFAULT '',
+    name        TEXT NOT NULL DEFAULT '',
+    spec_key    TEXT NOT NULL,     -- checksum of the spec, so one spec
+    spec        TEXT NOT NULL,     -- keeps one row however often it is run
+    plan        TEXT NOT NULL,
+    route_id    TEXT,
+    created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+    saved_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at  TEXT NOT NULL,
+    UNIQUE(owner, spec_key)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_owner ON plan_draft(owner, saved_at DESC);
+CREATE INDEX IF NOT EXISTS idx_draft_expiry ON plan_draft(expires_at);
 
 CREATE TABLE IF NOT EXISTS outcome (
     id          INTEGER PRIMARY KEY,
@@ -205,7 +239,21 @@ _ADDED_COLUMNS = (
 )
 
 
+#: Tables added after the first release. `_ADDED_COLUMNS` only ever widens
+#: an existing table, so a genuinely new one needs saying here or an
+#: already-populated database never gets it.
+_ADDED_TABLES = ("part_alias", "plan_draft")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
+    have = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if any(t not in have for t in _ADDED_TABLES):
+        # The script is written with IF NOT EXISTS throughout, so running it
+        # again only fills in what is missing.
+        conn.executescript(SCHEMA)
+        conn.commit()
+
     for table, column, decl in _ADDED_COLUMNS:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
