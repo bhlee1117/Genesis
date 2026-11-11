@@ -3441,7 +3441,7 @@ function renderPlan() {
     ], plan.fragments));
   }
   /* --- 2. the molecule that was asked for -------------------------- */
-  fillStep('target', [summary, renderConstruct(c),
+  fillStep('target', [summary, renderConstruct(c, chosenSimulation()),
                       plan.vector ? renderVector(plan.vector, plan) : null]);
 
   /* --- 3. where the parts come from, and what to start from -------- */
@@ -3662,7 +3662,447 @@ function mapWithToggle(length, items, opts) {
   return host;
 }
 
-function renderConstruct(c) {
+/* --------------------------------------------------------------------------
+ * Zoomable sequence browser
+ *
+ * The feature map answers "what is in this plasmid" and stops there. The
+ * questions it cannot answer are the ones asked while checking a design:
+ * where exactly does one element stop and the next begin, is the Kozak
+ * really flush against the ATG, did that restriction site survive, and
+ * what do the bases at a junction actually read. Those need the sequence,
+ * and the sequence is only legible when zoomed in far enough that the
+ * whole plasmid no longer fits.
+ *
+ * So: one track, a window onto it, and a zoom that runs from the whole
+ * molecule down to individual bases. Below about seven pixels per base
+ * the letters appear, both strands, because a restriction site on the
+ * bottom strand is still a restriction site.
+ * ------------------------------------------------------------------------ */
+
+var BROWSER_MIN_SPAN = 24;          // closest zoom: this many bases across
+var BROWSER_LETTER_PX = 7;          // bases get letters at this width
+
+/** Expand a IUPAC recognition site into a regular expression. */
+var IUPAC = {
+  A: 'A', C: 'C', G: 'G', T: 'T', R: '[AG]', Y: '[CT]', S: '[GC]',
+  W: '[AT]', K: '[GT]', M: '[AC]', B: '[CGT]', D: '[AGT]', H: '[ACT]',
+  V: '[ACG]', N: '[ACGT]'
+};
+
+function siteRegex(site) {
+  var out = '';
+  for (var i = 0; i < site.length; i++) {
+    var c = IUPAC[site[i].toUpperCase()];
+    if (!c) return null;
+    out += c;
+  }
+  return new RegExp(out, 'g');
+}
+
+function revcompJS(seq) {
+  var map = { A: 'T', T: 'A', G: 'C', C: 'G', N: 'N' };
+  var out = '';
+  for (var i = seq.length - 1; i >= 0; i--) out += map[seq[i].toUpperCase()] || 'N';
+  return out;
+}
+
+/**
+ * Every place a stocked enzyme cuts, with how many times it cuts in all.
+ *
+ * A site that occurs once is a handle; the same site occurring six times
+ * is not, and the difference is the whole reason for looking. Both are
+ * drawn, and the unique ones are marked.
+ */
+function findEnzymeSites(seq, enzymes, circular) {
+  var up = seq.toUpperCase();
+  // A circular molecule can carry a site across the origin, so the search
+  // runs over the sequence with its own head stuck on the end.
+  var pad = circular ? up + up.slice(0, 20) : up;
+  var hits = [];
+  var counts = {};
+  (enzymes || []).forEach(function (e) {
+    var re = siteRegex(e.site);
+    if (!re) return;
+    var seen = {};
+    [['+', e.site], ['-', revcompJS(e.site)]].forEach(function (pair) {
+      var r = siteRegex(pair[1]);
+      if (!r) return;
+      var m;
+      while ((m = r.exec(pad)) !== null) {
+        var at = m.index % up.length;
+        r.lastIndex = m.index + 1;
+        if (m.index >= up.length) continue;
+        var key = e.name + ':' + at;
+        if (seen[key]) continue;
+        seen[key] = true;
+        hits.push({ enzyme: e.name, at: at, len: e.site.length,
+                    strand: pair[0], site: e.site });
+        counts[e.name] = (counts[e.name] || 0) + 1;
+      }
+    });
+  });
+  hits.forEach(function (x) { x.cuts = counts[x.enzyme]; });
+  return hits;
+}
+
+/**
+ * opts: { circular, features, sites, junctions, label }
+ * junctions: [{at, name}] - where one fragment stops and the next starts
+ */
+function sequenceBrowser(seq, opts) {
+  opts = opts || {};
+  var total = seq.length;
+  var features = (opts.features || []).filter(function (f) {
+    return f && typeof f.start === 'number' && typeof f.end === 'number';
+  });
+  var sites = opts.sites || [];
+  var junctions = opts.junctions || [];
+
+  var view = { start: 0, span: total };     // the window, in bases
+  var host = h('div', { class: 'browser-canvas' });
+  var readout = h('span', { class: 'browser-readout mono' });
+  var hint = h('span', { class: 'muted small' });
+
+  function clampView() {
+    view.span = Math.max(BROWSER_MIN_SPAN, Math.min(view.span, total));
+    if (view.span >= total) { view.start = 0; return; }
+    if (opts.circular) {
+      view.start = ((view.start % total) + total) % total;
+    } else {
+      view.start = Math.max(0, Math.min(view.start, total - view.span));
+    }
+  }
+
+  /** Zoom about a fixed base, so the thing under the pointer stays put. */
+  function zoomAbout(base, factor) {
+    var before = (base - view.start + total) % total;
+    var frac = view.span ? before / view.span : 0.5;
+    view.span = Math.round(view.span * factor);
+    clampView();
+    view.start = Math.round(base - frac * view.span);
+    clampView();
+    draw();
+  }
+
+  function baseAt(px, width) {
+    var inner = Math.max(width - 2 * MAP_PAD, 1);
+    var frac = (px - MAP_PAD) / inner;
+    return view.start + frac * view.span;
+  }
+
+  var lastW = 0;
+  function draw() {
+    var w = Math.round(host.clientWidth) || lastW || 760;
+    lastW = w;
+    clear(host);
+    host.appendChild(buildBrowserSvg(w, seq, view, features, sites,
+                                     junctions, opts));
+    clear(readout);
+    var from = Math.round(view.start) + 1;
+    var to = Math.round(view.start + view.span);
+    readout.appendChild(document.createTextNode(
+      bp(from) + '–' + bp(opts.circular ? ((to - 1) % total) + 1 : to) +
+      '  (' + bp(Math.round(view.span)) + ' shown of ' + bp(total) + ')'));
+    clear(hint);
+    var perBase = (w - 2 * MAP_PAD) / view.span;
+    hint.appendChild(document.createTextNode(
+      perBase >= BROWSER_LETTER_PX
+        ? 'bases are shown; both strands read 5′ to 3′ on their own side'
+        : 'zoom in to ' + Math.ceil((w - 2 * MAP_PAD) / BROWSER_LETTER_PX) +
+          ' bases or fewer to read the sequence'));
+  }
+
+  host.addEventListener('wheel', function (ev) {
+    ev.preventDefault();
+    var base = baseAt(ev.offsetX, lastW || host.clientWidth);
+    zoomAbout(base, ev.deltaY > 0 ? 1.25 : 0.8);
+  }, { passive: false });
+
+  var dragging = null;
+  host.addEventListener('mousedown', function (ev) {
+    dragging = { x: ev.clientX, start: view.start };
+    host.classList.add('dragging');
+  });
+  window.addEventListener('mousemove', function (ev) {
+    if (!dragging) return;
+    var w = lastW || host.clientWidth || 760;
+    var perPx = view.span / Math.max(w - 2 * MAP_PAD, 1);
+    view.start = dragging.start - (ev.clientX - dragging.x) * perPx;
+    clampView();
+    draw();
+  });
+  window.addEventListener('mouseup', function () {
+    dragging = null;
+    host.classList.remove('dragging');
+  });
+
+  // Draw once regardless, and again whenever the width changes. Relying
+  // on the observer alone left the panel blank when it was opened at zero
+  // width - inside a step that is not on screen yet, which is exactly
+  // when this gets built - because an observer on a box that goes 0 to 0
+  // has nothing to report.
+  requestAnimationFrame(draw);
+  if (typeof ResizeObserver === 'function') new ResizeObserver(draw).observe(host);
+
+  function button(label, title, fn) {
+    return h('button', { type: 'button', title: title, onclick: fn }, label);
+  }
+
+  var controls = h('div', { class: 'browser-controls' },
+    button('−', 'Zoom out', function () {
+      zoomAbout(view.start + view.span / 2, 1.6);
+    }),
+    button('+', 'Zoom in', function () {
+      zoomAbout(view.start + view.span / 2, 0.625);
+    }),
+    button('whole', 'Show the whole molecule', function () {
+      view.start = 0; view.span = total; clampView(); draw();
+    }),
+    button('bases', 'Zoom until the sequence is readable', function () {
+      var w = lastW || host.clientWidth || 760;
+      view.span = Math.floor((w - 2 * MAP_PAD) / BROWSER_LETTER_PX);
+      clampView(); draw();
+    }),
+    readout);
+
+  var jump = h('select', {
+    class: 'browser-jump',
+    onchange: function () {
+      var i = Number(jump.value);
+      if (isNaN(i) || !features[i]) return;
+      var f = features[i];
+      var len = Math.max((f.end - f.start) || 1, BROWSER_MIN_SPAN);
+      view.span = Math.min(Math.round(len * 1.6), total);
+      view.start = Math.round(f.start - (view.span - len) / 2);
+      clampView(); draw();
+    }
+  }, h('option', { value: '' }, 'Jump to an element…'),
+     features.map(function (f, i) {
+       return h('option', { value: String(i) },
+                (f.name || typeOf(f)) + '  (' + bp(f.start + 1) + ')');
+     }));
+
+  return h('div', { class: 'browser' },
+    controls,
+    h('div', { class: 'browser-second' }, jump, hint),
+    host);
+}
+
+function buildBrowserSvg(width, seq, view, features, sites, junctions, opts) {
+  var total = seq.length;
+  var inner = Math.max(width - MAP_PAD * 2, 10);
+  var perBase = inner / view.span;
+  var letters = perBase >= BROWSER_LETTER_PX;
+
+  var axis = 92;
+  var height = letters ? 168 : 132;
+  var root = svg('svg', {
+    width: width, height: height, viewBox: '0 0 ' + width + ' ' + height,
+    class: 'seqbrowser', role: 'img'
+  });
+
+  function x(base) {
+    var off = (base - view.start + total) % total;
+    if (off > total - view.span && view.start + view.span <= total) {
+      off = base - view.start;          // linear window, no wrap needed
+    }
+    return MAP_PAD + off * perBase;
+  }
+
+  /* --- features ------------------------------------------------------ */
+  features.forEach(function (f) {
+    var fx = x(f.start);
+    var fw = Math.max((f.end - f.start) * perBase, 1.5);
+    if (fx + fw < 0 || fx > width) return;
+    var rev = Number(f.strand) === -1;
+    var y = rev ? axis + 10 : axis - 10 - 13;
+    var rect = svg('rect', {
+      x: fx, y: y, width: fw, height: 13, rx: 2,
+      fill: f.colour || colorFor(typeOf(f)),
+      class: 'feat' + (rev ? ' feat-rev' : '')
+    });
+    rect.appendChild(svg('title', null,
+      (f.name || '(unnamed)') + '\n' + typeOf(f) + '\n' +
+      (f.start + 1) + '–' + f.end + ' (' + (f.end - f.start) + ' bp)'));
+    root.appendChild(rect);
+    if (fw > 40 && f.name) {
+      root.appendChild(svg('text', {
+        x: Math.max(fx, 2) + Math.min(fw, width) / 2, y: y + 10,
+        class: 'feat-label', 'text-anchor': 'middle'
+      }, String(f.name).slice(0, Math.floor(fw / 6))));
+    }
+  });
+
+  /* --- the axis and its ticks ---------------------------------------- */
+  root.appendChild(svg('line', {
+    x1: MAP_PAD, y1: axis, x2: width - MAP_PAD, y2: axis, class: 'axis-line'
+  }));
+  var ticks = width < 420 ? 4 : 8;
+  for (var t = 0; t <= ticks; t++) {
+    var base = Math.round(view.start + view.span * t / ticks);
+    var tx = MAP_PAD + (view.span * t / ticks) * perBase;
+    root.appendChild(svg('line', {
+      x1: tx, y1: axis, x2: tx, y2: axis + 4, class: 'axis-tick'
+    }));
+    root.appendChild(svg('text', {
+      x: tx, y: axis + 15, class: 'axis-label', 'text-anchor': 'middle'
+    }, bp(opts.circular ? (((base % total) + total) % total) + 1 : base + 1)));
+  }
+
+  /* --- restriction sites --------------------------------------------- */
+  var placed = [];
+  sites.forEach(function (s) {
+    var sx = x(s.at);
+    if (sx < -20 || sx > width + 20) return;
+    var unique = s.cuts === 1;
+    root.appendChild(svg('line', {
+      x1: sx, y1: axis - 34, x2: sx, y2: axis - 10,
+      class: 'cut-tick' + (unique ? ' cut-unique' : '')
+    }));
+    // Only label what there is room for, nearest-first.
+    var clash = placed.some(function (p) { return Math.abs(p - sx) < 34; });
+    if (!clash) {
+      placed.push(sx);
+      var label = svg('text', {
+        x: sx, y: axis - 38, 'text-anchor': 'middle',
+        class: 'cut-label' + (unique ? ' cut-unique' : '')
+      }, s.enzyme);
+      label.appendChild(svg('title', null,
+        s.enzyme + ' ' + s.site + '\n' + (s.at + 1) +
+        (unique ? '\ncuts here and nowhere else'
+                : '\none of ' + s.cuts + ' sites in this molecule')));
+      root.appendChild(label);
+    }
+  });
+
+  /* --- fragment junctions -------------------------------------------- */
+  junctions.forEach(function (j) {
+    var jx = x(j.at);
+    if (jx < 0 || jx > width) return;
+    root.appendChild(svg('line', {
+      x1: jx, y1: axis - 10, x2: jx, y2: axis + 23, class: 'junction-tick'
+    })).appendChild(svg('title', null, j.name || 'fragment junction'));
+  });
+
+  /* --- the bases ------------------------------------------------------ */
+  if (letters) {
+    var top = axis + 46;
+    var from = Math.floor(view.start);
+    var upto = Math.ceil(view.start + view.span);
+    for (var i = from; i < upto; i++) {
+      var at = opts.circular ? ((i % total) + total) % total : i;
+      if (at < 0 || at >= total) continue;
+      var bx = MAP_PAD + (i - view.start) * perBase + perBase / 2;
+      var base = seq[at].toUpperCase();
+      root.appendChild(svg('text', {
+        x: bx, y: top, 'text-anchor': 'middle',
+        class: 'base base-' + base
+      }, base));
+      root.appendChild(svg('text', {
+        x: bx, y: top + 15, 'text-anchor': 'middle',
+        class: 'base base-rev base-' + (revcompJS(base) || 'N')
+      }, revcompJS(base)));
+    }
+    root.appendChild(svg('text', {
+      x: 4, y: top, class: 'strand-label'
+    }, '5′'));
+    root.appendChild(svg('text', {
+      x: 4, y: top + 15, class: 'strand-label'
+    }, '3′'));
+  }
+  return root;
+}
+
+/* The enzyme table, fetched once and shared by every browser on the page. */
+var ENZYME_CACHE = null;
+function stockedEnzymes() {
+  if (!ENZYME_CACHE) {
+    ENZYME_CACHE = api('/api/enzymes').then(function (rows) {
+      return (rows || []).filter(function (e) {
+        return e.stocked && e.site && e.site.length >= 4 && !e.type_iis;
+      });
+    }, function () { return []; });
+  }
+  return ENZYME_CACHE;
+}
+
+/**
+ * The browser, folded away until asked for.
+ *
+ * Finding every site of two dozen enzymes in a 9 kb molecule is quick but
+ * not free, and most visits to a plan never open this, so none of it runs
+ * until the panel does.
+ */
+function browserSection(c, seq, layout, sim) {
+  var host = h('div', { class: 'browser-host' });
+  var built = false;
+  var box = h('details', {
+    class: 'construct-browser',
+    ontoggle: function () {
+      if (built || !box.open) return;
+      built = true;
+      clear(host);
+      host.appendChild(h('p', { class: 'muted small' }, 'Finding sites\u2026'));
+      stockedEnzymes().then(function (enzymes) {
+        var sites = findEnzymeSites(seq, enzymes, !!c.circular);
+        clear(host);
+        host.appendChild(sequenceBrowser(seq, {
+          circular: !!c.circular,
+          features: layout,
+          sites: sites,
+          junctions: constructJunctions(sim),
+          label: c.name
+        }));
+        var unique = {};
+        sites.forEach(function (x) { if (x.cuts === 1) unique[x.enzyme] = 1; });
+        var names = Object.keys(unique).sort();
+        host.appendChild(h('p', { class: 'muted small' },
+          names.length
+            ? 'Cuts once in this molecule, so usable as a handle: ' +
+              names.join(', ') + '. Those are drawn in red; everything else '
+              + 'cuts more than once.'
+            : 'No stocked enzyme cuts this molecule exactly once.'));
+      });
+    }
+  },
+    h('summary', null, 'Browse the sequence \u2014 zoom in to read the bases ' +
+      'and check the restriction sites'),
+    host);
+  return box;
+}
+
+/**
+ * Where one piece of the build meets the next, in product coordinates.
+ *
+ * Drawn because the question asked of a junction is what the bases
+ * actually read across it - whether the Kozak survived the join, whether
+ * a site was reconstructed - and that is only answerable when the
+ * boundary is marked on the sequence rather than inferred from two
+ * feature blocks happening to touch.
+ */
+function constructJunctions(sim) {
+  var placed = ((sim && sim.sources) || []).filter(function (s) {
+    return typeof s.at_start === 'number';
+  });
+  var out = [];
+  placed.forEach(function (s) {
+    out.push({ at: s.at_start, name: s.name + ' starts' });
+    if (typeof s.at_end === 'number') {
+      out.push({ at: s.at_end, name: s.name + ' ends' });
+    }
+  });
+  return out;
+}
+
+/** The simulation of whichever route is selected, if there is one. */
+function chosenSimulation() {
+  var routes = (state.plan && state.plan.routes) || [];
+  var r = routes.filter(function (x) { return x.id === state.routeId; })[0]
+       || routes.filter(function (x) { return x.feasible; })[0];
+  return (r && r.simulation) || null;
+}
+
+function renderConstruct(c, sim) {
   var seq = typeof c.sequence === 'string' ? c.sequence : '';
   var layout = (c.layout || []).filter(function (f) {
     return f && typeof f.start === 'number';
@@ -3678,6 +4118,8 @@ function renderConstruct(c) {
 
   card.appendChild(mapWithToggle(c.length, layout, {
     label: c.name, markers: c.codon_markers, circular: !!c.circular }));
+
+  if (seq) card.appendChild(browserSection(c, seq, layout, sim));
 
   if (!seq) {
     card.appendChild(h('p', { class: 'muted' },
