@@ -1096,7 +1096,7 @@ def design(conn: sqlite3.Connection, spec: ConstructSpec,
         if backbone:
             return assemble_into_backbone(
                 mods, backbone["seq"], backbone_annotations, spec_types,
-                circular=spec.circular)
+                circular=spec.circular, cfg=cfg)
         return assemble(mods, "", circular=spec.circular)
 
     # Built once to find out what the molecule actually contains, because

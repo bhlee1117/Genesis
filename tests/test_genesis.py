@@ -5709,6 +5709,75 @@ class TestRestrictionCutsWhereItMatters(unittest.TestCase):
                          "offered a single cut to replace a cassette")
 
 
+class TestTheVectorsOwnPolylinkerIsKept(unittest.TestCase):
+    """YD030 carries EcoRI, EcoRV and HindIII in the 27 bases between
+    the old cassette and the WPRE, each cutting the plasmid exactly
+    once. The replaced region ran to the WPRE's start, so all three went
+    out with the cassette and the finished plasmid had none of them -
+    which is what made adding a site look necessary in the first place.
+    """
+
+    @staticmethod
+    def _cfg():
+        cfg = Config()
+        cfg.stocked_enzymes = ["EcoRI", "EcoRV", "HindIII", "BamHI"]
+        return cfg
+
+    def _backbone(self):
+        # ...cassette | GAATTC GATATC AAGCTT | WPRE...
+        import random as _r
+        rng = _r.Random(77)
+        junk = lambda n: "".join(rng.choice("ACGT") for _ in range(n))
+        return (junk(500) + "GAATTCGATATCAAGCTT" + junk(500))
+
+    def test_the_gap_is_kept_when_it_carries_a_unique_site(self):
+        from genesis.construct import _keep_cloning_handles
+        seq = self._backbone()
+        hi, note = _keep_cloning_handles(seq, [], 500, 518, "ACGT" * 50,
+                                         self._cfg())
+        self.assertEqual(hi, 500, "the polylinker was thrown away")
+        self.assertIn("EcoRI", note)
+        self.assertIn("HindIII", note)
+
+    def test_a_gap_with_nothing_useful_in_it_is_not_kept(self):
+        from genesis.construct import _keep_cloning_handles
+        import random as _r
+        rng = _r.Random(78)
+        seq = "".join(rng.choice("ACGT") for _ in range(1000))
+        hi, note = _keep_cloning_handles(seq, [], 500, 520, "ACGT" * 50,
+                                         self._cfg())
+        self.assertEqual(hi, 520)
+        self.assertEqual(note, "")
+
+    def test_a_site_the_payload_also_carries_is_no_handle(self):
+        from genesis.construct import _keep_cloning_handles
+        seq = self._backbone()
+        # the payload itself contains HindIII and EcoRI and EcoRV
+        payload = "ACGT" * 20 + "AAGCTT" + "GAATTC" + "GATATC" + "ACGT" * 20
+        hi, note = _keep_cloning_handles(seq, [], 500, 518, payload,
+                                         self._cfg())
+        self.assertEqual(hi, 518, "kept a site the insert also cuts")
+
+    def test_a_long_gap_is_not_a_polylinker(self):
+        from genesis.construct import _keep_cloning_handles, HANDLE_WINDOW
+        seq = self._backbone()
+        hi, note = _keep_cloning_handles(seq, [], 500,
+                                         500 + HANDLE_WINDOW + 1,
+                                         "ACGT" * 50, self._cfg())
+        self.assertEqual(hi, 500 + HANDLE_WINDOW + 1)
+
+    def test_an_annotated_gap_is_left_alone(self):
+        # Something annotated in there is part of what the design means
+        # to remove, not filler.
+        from genesis.construct import _keep_cloning_handles
+        seq = self._backbone()
+        anns = [{"feature_type": "CDS", "name": "tail", "start": 502,
+                 "end": 514}]
+        hi, note = _keep_cloning_handles(seq, anns, 500, 518, "ACGT" * 50,
+                                         self._cfg())
+        self.assertEqual(hi, 518)
+
+
 class TestGettingTheInsertBackOut(unittest.TestCase):
     """Which two enzymes release the cassette from the finished plasmid.
 

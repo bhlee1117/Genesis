@@ -1050,8 +1050,8 @@ def _coverage(wanted: str, region: str, k: int = 40) -> float:
 
 def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                            backbone_annotations: list[dict],
-                           spec_types: set, circular: bool = True
-                           ) -> AssembledConstruct:
+                           spec_types: set, circular: bool = True,
+                           cfg=None) -> AssembledConstruct:
     """Put the payload where it belongs inside the recipient plasmid.
 
     Two slots are filled, not one. The payload goes where the recipient's
@@ -1264,6 +1264,19 @@ def assemble_into_backbone(resolved: list[ResolvedModule], backbone_seq: str,
                              and lo <= a["start"] < arc_end]
                     if after:
                         hi = min(after)
+                        # The last replaced feature BEFORE the boundary.
+                        # Taking the maximum over all of them picked up
+                        # one lying past the WPRE in the rotated frame,
+                        # which put the gap at -483 bp and the check
+                        # never ran.
+                        before_hi = [a["end"] for a in cassette
+                                     if lo <= a["end"] <= hi]
+                        cassette_end = max(before_hi) if before_hi else lo
+                        hi, kept_note = _keep_cloning_handles(
+                            rotated_seq, rotated, cassette_end, hi,
+                            payload_seq, cfg)
+                        if kept_note:
+                            warnings.append(kept_note)
                 edits.append({"start": lo, "end": hi, "seq": payload_seq,
                               "layout": payload_layout})
             else:
@@ -1526,3 +1539,64 @@ def add_junction_sites(resolved: list, around: str, cfg) -> tuple[list, list]:
             f"({len(spacer)} bp): it cuts once in the finished plasmid, so the "
             f"{'insert' if five else 'cassette'} can be taken out again without redesigning")
     return out, notes
+
+
+#: How much unannotated backbone is worth keeping to save a cut site.
+#: A polylinker is a few dozen bases; more than this and whatever is
+#: there is not a polylinker.
+HANDLE_WINDOW = 60
+
+
+def _keep_cloning_handles(seq: str, anns: list, cassette_end: int,
+                          hi: int, payload: str, cfg) -> tuple:
+    """Stop the replaced region short of a polylinker worth keeping.
+
+    The region to replace runs from the old cassette to whatever is kept
+    after it - usually the WPRE - and the bases in between go with it.
+    In YD030 those bases are a polylinker: EcoRI, EcoRV and HindIII in
+    twenty-seven bases, each cutting the plasmid exactly once, sitting
+    precisely where somebody would want a handle. The design was
+    throwing all three away and the finished plasmid had none of them.
+
+    So if that gap is short, carries no annotation of its own, and holds
+    a site that cuts the backbone once and does not cut the payload, the
+    replaced region stops at the cassette instead and the gap is kept.
+    Nothing is invented: these are the vector's own bases, in the vector's
+    own place.
+    """
+    from .enzymes import CATALOG, find_sites
+
+    if hi <= cassette_end or hi - cassette_end > HANDLE_WINDOW:
+        return hi, ""
+    gap = (cassette_end, hi)
+    # Only unannotated filler qualifies; anything else in there is part
+    # of what the design means to remove.
+    for a in anns:
+        if a.get("start") is None:
+            continue
+        if a["start"] < gap[1] and a["end"] > gap[0] and \
+                a["end"] - a["start"] < hi - cassette_end + 1:
+            if a["start"] >= gap[0] and a["end"] <= gap[1]:
+                return hi, ""
+
+    stocked = [e for e in (getattr(cfg, "stocked_enzymes", None) or ())
+               if e in CATALOG]
+    found = []
+    for name in stocked:
+        enz = CATALOG[name]
+        if len(enz.site) < 6:
+            continue
+        cuts = [c.top_cut for c in find_sites(seq, enz, True)]
+        if len(cuts) != 1:
+            continue
+        if payload and find_sites(payload, enz, False):
+            continue
+        if gap[0] <= cuts[0] < gap[1]:
+            found.append(name)
+    if not found:
+        return hi, ""
+    return cassette_end, (
+        f"kept the {hi - cassette_end} bp between the old cassette and the "
+        f"next element, because it carries {', '.join(sorted(found))} - "
+        f"{'a site' if len(found) == 1 else 'sites'} that cut this plasmid "
+        f"once and would otherwise have been cut out with the cassette")
