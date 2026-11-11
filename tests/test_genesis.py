@@ -5565,6 +5565,70 @@ class TestTheCalibrationCannotBeSilentlyUndone(unittest.TestCase):
         self.assertGreater(rmse(50.0), rmse(200.0) + 1.0)
 
 
+class TestAnArmThatGoesOnMatchingIsPartOfTheDuplex(unittest.TestCase):
+    """An overlap arm is the neighbour's sequence, so in principle none
+    of it binds this template. In practice junctions fall on Kozaks and
+    start codons, both sides look alike, and the last bases of the arm
+    match anyway - on the iGluSnFR4f forward primer two of them, worth
+    4.0 C, which was the whole of a pair reported 4.4 C apart.
+    """
+
+    def test_it_counts_the_arm_bases_that_match(self):
+        from genesis.primers import tail_match
+        # template ...GCCACC | ATGGAG...,  arm ending ...CCGGTCCC
+        template = "AAAAAAAAAAGCCACC" + "ATGGAGACAGACACACTC" + "TTTTTT"
+        at = template.index("ATGGAG")
+        self.assertEqual(tail_match("TCTCTGTTAAACCCCGGTCCC", template, at,
+                                    "F"), 2)
+        self.assertEqual(tail_match("TCTCTGTTAAACCCCGGTAAA", template, at,
+                                    "F"), 0, "counted a mismatch")
+        self.assertEqual(tail_match("", template, at, "F"), 0)
+
+    def test_the_binding_region_is_never_invented(self):
+        # The guard that matters: whatever is claimed to bind has to be
+        # on the template. A stale count once claimed a 21-mer that did
+        # not occur in the plasmid at all.
+        from genesis.primers import Primer
+        template = "AAAAAAAAAAGCCACC" + "ATGGAGACAGACACACTC" + "TTTTTT"
+        at = template.index("ATGGAG")
+        p = Primer(name="x-F", sequence="", anneal="ATGGAGACAGACACACTC",
+                   tail="TCTCTGTTAAACCCCGGTCCC", direction="F",
+                   tpl_seq=template, anneal_at=at)
+        self.assertEqual(p.tail_binds, 2)
+        self.assertEqual(p.binding, "CCATGGAGACAGACACACTC")
+        self.assertIn(p.binding, template)
+        self.assertEqual(p.arm + p.binding, p.tail + p.anneal)
+
+    def test_rewriting_the_tail_moves_the_binding_region_with_it(self):
+        # The tail is rewritten after the primer is built - to carry a
+        # folded element, a stretch of recipient, or a neighbour's
+        # retreat - and a count worked out beforehand was then wrong,
+        # claiming bases that are not on the template. Derived, not
+        # stored, so it cannot drift.
+        from genesis.primers import Primer
+        template = "AAAAAAAAAAGCCACC" + "ATGGAGACAGACACACTC" + "TTTTTT"
+        at = template.index("ATGGAG")
+        p = Primer(name="x-F", sequence="", anneal="ATGGAGACAGACACACTC",
+                   tail="TCTCTGTTAAACCCCGGTCCC", direction="F",
+                   tpl_seq=template, anneal_at=at)
+        self.assertEqual(p.tail_binds, 2)
+        p.tail = "GGGGGGGGGGGGGG"            # a rewrite that shares nothing
+        self.assertEqual(p.tail_binds, 0)
+        self.assertEqual(p.binding, p.anneal)
+        p.tail = "GGGGGGGGGGGCCACC"          # one that shares more
+        self.assertEqual(p.tail_binds, 6)
+        self.assertIn(p.binding, template)
+
+    def test_the_stored_plan_does_not_carry_the_template(self):
+        # tpl_seq is kilobases and only needed while designing.
+        from genesis.primers import Primer
+        p = Primer(name="x-F", sequence="ACGT", anneal="ACGT",
+                   tpl_seq="A" * 5000)
+        d = p.to_dict(Config())
+        self.assertNotIn("tpl_seq", d)
+        self.assertIn("tail_binds", d)
+
+
 class TestTmAgreesWithNEB(unittest.TestCase):
     """NEB's calculator is what a primer is checked against before it is
     ordered, so disagreeing with it is a bug however defensible the

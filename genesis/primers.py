@@ -31,19 +31,65 @@ class Primer:
     #: next fragment's forward tail has to be this much longer, or those
     #: bases appear in no amplicon and the product comes out short.
     retreat: int = 0
+    #: Enough of the template to work out what this primer actually binds,
+    #: kept because the tail is rewritten after the primer is built - to
+    #: carry a folded element, a stretch of recipient, or a neighbour's
+    #: retreat - and anything precomputed against the old tail would be
+    #: quietly wrong afterwards. Dropped from `to_dict`, which is what
+    #: gets stored and sent.
+    tpl_seq: str = ""
+    tpl_circular: bool = False
+    anneal_at: int = 0
+
+    @property
+    def tail_binds(self) -> int:
+        """How many bases at the 3' end of `tail` also pair with the template.
+
+        An overlap arm is the neighbouring fragment's sequence, so in
+        principle none of it binds here - but junctions fall at Kozaks
+        and start codons, where both sides of the join look alike, and
+        the last bases of the arm often match anyway. They pair in the
+        first cycle like any others, so they belong in the Tm: on the
+        iGluSnFR4f forward primer two such bases are worth 4.0 C, which
+        was the difference between a pair reported 4.4 C apart and one
+        that is really 0.4 C apart.
+
+        Computed on demand rather than stored, because the tail changes
+        under it.
+        """
+        if not self.tpl_seq or not self.tail:
+            return 0
+        return tail_match(self.tail, self.tpl_seq, self.anneal_at,
+                          self.direction, self.tpl_circular)
 
     @property
     def length(self) -> int:
         return len(self.sequence)
 
+    @property
+    def binding(self) -> str:
+        """Everything at this primer's 3' end that pairs with the template."""
+        return (self.tail[len(self.tail) - self.tail_binds:] + self.anneal
+                if self.tail_binds else self.anneal)
+
+    @property
+    def arm(self) -> str:
+        """The part of the tail that does not pair with the template."""
+        return (self.tail[:len(self.tail) - self.tail_binds]
+                if self.tail_binds else self.tail)
+
     def to_dict(self, cfg: Config | None = None) -> dict:
         cfg = cfg or Config()
         d = asdict(self)
+        d.pop("tpl_seq", None)            # kilobases, and only needed here
         d["length"] = self.length
-        d["anneal_tm"] = tm(self.anneal, cfg.primer_conc_nm,
+        d["tail_binds"] = self.tail_binds
+        d["binding"] = self.binding
+        d["arm"] = self.arm
+        d["anneal_tm"] = tm(self.binding, cfg.primer_conc_nm,
                             cfg.na_mm, cfg.mg_mm)
         d["full_tm"] = tm(self.sequence, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
-        d["gc"] = round(gc_fraction(self.anneal), 3)
+        d["gc"] = round(gc_fraction(self.binding), 3)
         return d
 
 
@@ -138,7 +184,7 @@ RETREAT_PENALTY = 0.15
 
 def rank_anneal_sites(template: str, start: int, direction: str, cfg: Config,
                       circular: bool = False, unique_in: str = "",
-                      keep: int = 0) -> list[dict]:
+                      keep: int = 0, tail: str = "") -> list[dict]:
     """Every site worth considering, best first, with the Tm it would have.
 
     `pick_anneal` answers "which is the best site for this primer", which
@@ -157,11 +203,18 @@ def rank_anneal_sites(template: str, start: int, direction: str, cfg: Config,
             region = revcomp(slice_region(template, lo, start, circular))
         if len(region) < length:
             break
-        t = tm(region, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+        # The arm this primer will carry may go on matching the template
+        # past the junction, and those bases pair too. Rank on what the
+        # finished oligo will do, not on the region in isolation: that
+        # mismatch put eleven of forty-five pairs outside the limit while
+        # every one of them had been chosen to be inside it.
+        ext = tail_match(tail, template, start, direction, circular) if tail else 0
+        binding = tail[len(tail) - ext:] + region if ext else region
+        t = tm(binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
         if t != t:
             continue
         out.append({"region": region, "tm": t,
-                    "penalty": anneal_penalty(region, cfg, unique_in,
+                    "penalty": anneal_penalty(binding, cfg, unique_in,
                                               circular)})
     # Sorted for the single-primer caller; NOT truncated by default,
     # because the pair search needs the cool candidates a ranking by
@@ -175,7 +228,8 @@ def rank_anneal_sites(template: str, start: int, direction: str, cfg: Config,
 
 def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
                       circular: bool = False, unique_in: str = "",
-                      max_retreat: int = 0) -> tuple:
+                      max_retreat: int = 0, f_tail: str = "",
+                      r_tail: str = "") -> tuple:
     """Choose both sites of one reaction together.
 
     A forward and a reverse primer go into the same tube and anneal at
@@ -204,7 +258,8 @@ def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
     Returns (f_region, r_region, gap, retreat).
     """
     limit = getattr(cfg, "primer_pair_max_diff", 5.0)
-    fwd = rank_anneal_sites(template, start, "F", cfg, circular, unique_in)
+    fwd = rank_anneal_sites(template, start, "F", cfg, circular, unique_in,
+                            tail=f_tail)
     fallback = (pick_anneal(template, start, "F", cfg, circular),
                 pick_anneal(template, end, "R", cfg, circular),
                 float("nan"), 0)
@@ -224,7 +279,8 @@ def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
         return chosen
 
     here = best_against(
-        rank_anneal_sites(template, end, "R", cfg, circular, unique_in))
+        rank_anneal_sites(template, end, "R", cfg, circular, unique_in,
+                          tail=r_tail))
     if here is None:
         return fallback
     if here[2] <= limit or max_retreat <= 0:
@@ -235,7 +291,7 @@ def pair_anneal_sites(template: str, start: int, end: int, cfg: Config,
     nearest = (here[2], here, 0)
     for back in range(1, max_retreat + 1):
         rev = rank_anneal_sites(template, end - back, "R", cfg, circular,
-                                unique_in)
+                                unique_in, tail=r_tail)
         if not rev:
             continue
         cand = best_against(rev)
@@ -296,10 +352,14 @@ def validate_primer(primer: Primer, template: str, cfg: Config,
     w: list[str] = []
     anneal = primer.anneal
     full = primer.sequence
+    # The Tm check asks what the oligo does on the template, so it runs
+    # on everything that pairs; the length checks below ask what the
+    # designer chose, so they stay on the region that was designed.
+    binding = primer.binding
 
-    t = tm(anneal, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+    t = tm(binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
     if t != t:
-        n_ambig = sum(1 for ch in anneal if ch not in "ACGT")
+        n_ambig = sum(1 for ch in binding if ch not in "ACGT")
         w.append(f"the source sequence has {n_ambig} ambiguous base(s) at this "
                  f"primer site, so no reliable primer can be designed here; "
                  f"re-sequence this region or choose another source plasmid")
@@ -387,10 +447,10 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
     # tube at the same temperature, so the pair is the unit that has to be
     # right; picking each one's best site alone optimises a quantity
     # nobody runs.
-    f_anneal, r_anneal, tm_gap, retreat = pair_anneal_sites(
-        template, start, end, cfg, circular_template, unique_in=template,
-        max_retreat=max_retreat)
-
+    # Tails first. They are the neighbours' sequence and do not depend on
+    # where this fragment's primers land - but where the primers land has
+    # to depend on them, because an arm that goes on matching the template
+    # is part of the duplex.
     f_tail = pick_overlap(upstream_seq, cfg, from_end=True,
                           unique_in=unique_in)
     # `extra_arm` is the previous fragment's retreat: the bases it stopped
@@ -406,6 +466,10 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
                                    unique_in=unique_in))
               if carry_downstream else "")
 
+    f_anneal, r_anneal, tm_gap, retreat = pair_anneal_sites(
+        template, start, end, cfg, circular_template, unique_in=template,
+        max_retreat=max_retreat, f_tail=f_tail, r_tail=r_tail)
+
     fwd = Primer(
         name=f"{fragment_name}-F", sequence=f_tail + f_anneal, anneal=f_anneal,
         tail=f_tail, direction="F", template=fragment_name,
@@ -415,8 +479,21 @@ def design_gibson_pair(fragment_index: int, fragment_name: str,
         tail=r_tail, direction="R", template=fragment_name,
         target_start=start, target_end=end - retreat, retreat=retreat)
 
+    # Where each primer sits, so `binding` can be worked out later even
+    # though the tails get rewritten between here and the order sheet.
+    for pr, at in ((fwd, start), (rev, end - retreat)):
+        pr.tpl_seq, pr.tpl_circular, pr.anneal_at = (
+            template, circular_template, at)
+
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)
     rev.warnings = validate_primer(rev, template, cfg, circular_template)
+
+    # The gap the chooser worked with was computed before the tails
+    # existed, so it knew nothing about this. Re-measure.
+    _a = tm(fwd.binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+    _b = tm(rev.binding, cfg.primer_conc_nm, cfg.na_mm, cfg.mg_mm)
+    if _a == _a and _b == _b:
+        tm_gap = abs(_a - _b)
 
     limit = getattr(cfg, "primer_pair_max_diff", 5.0)
     if tm_gap == tm_gap and tm_gap > limit:
@@ -506,6 +583,9 @@ def design_re_pair(fragment_name: str, template: str, start: int, end: int,
                  fragment_name, start, end)
     rev = Primer(f"{fragment_name}-R", r_tail + r_anneal, r_anneal, r_tail, "R",
                  fragment_name, start, end)
+    for pr, at in ((fwd, start), (rev, end)):
+        pr.tpl_seq, pr.tpl_circular, pr.anneal_at = (
+            template, circular_template, at)
     fwd.warnings = validate_primer(fwd, template, cfg, circular_template)
     rev.warnings = validate_primer(rev, template, cfg, circular_template)
     limit = getattr(cfg, "primer_pair_max_diff", 5.0)
@@ -561,6 +641,40 @@ def _occurrences(arm: str, host: str) -> int:
     host = host.upper()
     wrapped = host + host[:len(arm) - 1]
     return wrapped.count(arm) + wrapped.count(revcomp(arm))
+
+
+def tail_match(tail: str, template: str, at: int, direction: str,
+               circular: bool = False) -> int:
+    """How far the tail goes on matching the template past the junction.
+
+    `at` is where the annealing region begins on the template for a
+    forward primer, or where it ends for a reverse one. Walking outward
+    from there, the arm is compared with the template on the primer's own
+    strand and the run of agreement counted.
+
+    This is not the annealing site having been moved. Nobody put these
+    bases there: the arm is the neighbouring fragment's end and it simply
+    happens to start the way the template does - which is common, because
+    a junction usually falls on a Kozak or a start codon and both sides
+    of it carry GCCACC or ATG. On the iGluSnFR4f forward primer it is two
+    bases, and they are worth 4.0 C.
+    """
+    if not tail or not template:
+        return 0
+    k = len(tail)
+    if direction == "F":
+        before = slice_region(template, at - k, at, circular) \
+            if (circular or at - k >= 0) else template[:at]
+    else:
+        after = slice_region(template, at, at + k, circular) \
+            if (circular or at + k <= len(template)) else template[at:]
+        before = revcomp(after)
+    n = 0
+    while (n < len(tail) and n < len(before)
+           and tail[len(tail) - 1 - n].upper()
+           == before[len(before) - 1 - n].upper()):
+        n += 1
+    return n
 
 
 def pick_overlap(neighbour: str, cfg: Config, from_end: bool = True,
