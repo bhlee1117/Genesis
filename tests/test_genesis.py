@@ -5629,6 +5629,86 @@ class TestAnArmThatGoesOnMatchingIsPartOfTheDuplex(unittest.TestCase):
         self.assertIn("tail_binds", d)
 
 
+class TestRestrictionCutsWhereItMatters(unittest.TestCase):
+    """A pair that cuts the backbone uniquely is not thereby a pair that
+    cuts it in a useful place.
+
+    The selection asked only for uniqueness and absence from the insert,
+    so HindIII + EcoRV - which cut pAAV_CAG_pHoran4 four bases apart -
+    came out as the way to swap a 3 kb cassette. The route then built a
+    plan whose own simulation said the product still carried mOrange.
+    """
+
+    N = 6000
+
+    def test_cuts_at_the_edges_cost_nothing(self):
+        from genesis.planner import _brackets
+        self.assertEqual(_brackets(1000, 2000, (1000, 2000), self.N), 0)
+
+    def test_cuts_just_outside_cost_what_they_take(self):
+        from genesis.planner import _brackets
+        self.assertEqual(_brackets(990, 2010, (1000, 2000), self.N), 20)
+
+    def test_cuts_far_outside_take_the_backbone_with_them(self):
+        from genesis.planner import _brackets
+        self.assertEqual(_brackets(500, 3000, (1000, 2000), self.N), 1500)
+
+    def test_two_cuts_four_bases_apart_are_rejected_by_the_slack(self):
+        # This is the real HindIII + EcoRV case. Going the other way
+        # round, the arc between them *does* contain the region - it
+        # contains almost the whole plasmid - so what rules it out is
+        # not failing to bracket but how much it takes with it.
+        from genesis.planner import _brackets, RE_EDGE_SLACK
+        extra = _brackets(8, 12, (1000, 2000), self.N)
+        self.assertIsNotNone(extra)
+        self.assertEqual(extra, 4996)
+        self.assertGreater(extra, RE_EDGE_SLACK)
+
+    def test_cuts_inside_the_region_do_not_release_it(self):
+        from genesis.planner import _brackets, RE_EDGE_SLACK
+        extra = _brackets(1200, 1800, (1000, 2000), self.N)
+        self.assertGreater(extra, RE_EDGE_SLACK)
+
+    def test_a_region_that_wraps_the_origin_is_handled(self):
+        from genesis.planner import _brackets
+        self.assertEqual(_brackets(5800, 200, (5800, 200), self.N), 0)
+
+    def test_contiguous_kept_arcs_are_merged_before_the_gap_is_read(self):
+        # The layout splits a kept stretch wherever something was
+        # replaced in the middle of it, so a single arc arrives as two
+        # that meet end to end. Bailing on anything but one meant the
+        # check never ran on a real design.
+        from genesis.planner import _replaced_span
+
+        class Fake:
+            backbone_segments = [{"source_start": 4038, "source_end": 5814},
+                                 {"source_start": 23, "source_end": 4038}]
+        self.assertEqual(_replaced_span(Fake(), 6539), (5814, 23))
+
+    def test_nothing_replaced_means_no_region(self):
+        from genesis.planner import _replaced_span
+
+        class Whole:
+            backbone_segments = [{"source_start": 0, "source_end": 0}]
+        self.assertIsNone(_replaced_span(Whole(), 6539))
+
+    def test_one_cut_is_not_offered_when_a_cassette_has_to_come_out(self):
+        # A single cut linearises the plasmid and removes nothing, so the
+        # old cassette stays in the product.
+        from genesis.planner import _find_enzyme_pairs
+
+        class Fake:
+            circular = True
+            seq = "A" * 100
+            backbone_segments = [{"source_start": 23, "source_end": 5814}]
+        cfg = Config()
+        cfg.stocked_enzymes = ["HindIII"]
+        bb = ("AAGCTT" + "ACGT" * 1633)[:6539]
+        out = _find_enzyme_pairs(bb, "GGGG" * 50, Fake(), [], cfg, True)
+        self.assertFalse([c for c in out if c["enzymes"][0] == c["enzymes"][1]],
+                         "offered a single cut to replace a cassette")
+
+
 class TestGettingTheInsertBackOut(unittest.TestCase):
     """Which two enzymes release the cassette from the finished plasmid.
 

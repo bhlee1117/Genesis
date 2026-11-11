@@ -863,10 +863,20 @@ def plan_restriction_route(conn: sqlite3.Connection, construct: AssembledConstru
             for c in candidates]
     if not candidates:
         route.feasible = False
-        route.warnings.append(
-            "no stocked enzyme pair cuts the backbone uniquely while leaving "
-            "the insert and all protected features intact; use the HiFi route "
-            "or add sites by PCR")
+        miss = dict(_LAST_NEAR_MISS)
+        if miss:
+            a, b = miss["enzymes"]
+            route.warnings.append(
+                f"no stocked enzyme pair cuts at the edges of the region "
+                f"being replaced. The closest is {a} + {b}, and it takes "
+                f"{miss['extra']:,} bp of backbone the design keeps out "
+                f"along with it, which the insert would have to carry "
+                f"back; use the HiFi route instead")
+        else:
+            route.warnings.append(
+                "no stocked enzyme pair cuts the backbone uniquely while "
+                "leaving the insert and all protected features intact; use "
+                "the HiFi route or add sites by PCR")
         return route
 
     best = candidates[0]
@@ -1002,6 +1012,92 @@ def _native_pairs_that_work(conn: sqlite3.Connection, candidates: list,
     return kept
 
 
+def _replaced_span(construct: AssembledConstruct, bb_len: int):
+    """Which arc of the recipient this design takes out, as (start, end).
+
+    The kept arcs are recorded on the construct; what is replaced is
+    whatever they leave out. Returns None when nothing says - an insert
+    going into a recipient that keeps all of itself is an addition, not
+    a replacement, and has no region to bracket.
+    """
+    segs = getattr(construct, "backbone_segments", None) or []
+    if not segs or not bb_len:
+        return None
+
+    # The arcs arrive in whatever pieces the layout fell into - a cassette
+    # replaced in the middle of a kept stretch leaves two that are really
+    # one, meeting end to end - so they are merged on the circle before
+    # the gap between them is read off. Bailing on anything but a single
+    # arc meant the check never ran on a real design.
+    covered = [False] * bb_len
+    for seg in segs:
+        a, b = seg.get("source_start"), seg.get("source_end")
+        if a is None or b is None:
+            continue
+        a %= bb_len
+        b %= bb_len
+        n = (b - a) % bb_len or bb_len
+        for k in range(n):
+            covered[(a + k) % bb_len] = True
+
+    if all(covered) or not any(covered):
+        return None
+    # The one uncovered run, found by starting at a covered base so the
+    # run is not split across the origin.
+    origin = covered.index(True)
+    runs, start = [], None
+    for k in range(bb_len):
+        i = (origin + k) % bb_len
+        if not covered[i] and start is None:
+            start = i
+        elif covered[i] and start is not None:
+            runs.append((start, i))
+            start = None
+    if start is not None:
+        runs.append((start, origin))
+    return runs[0] if len(runs) == 1 else None
+
+
+def _brackets(cut_a: int, cut_b: int, span, bb_len: int) -> int | None:
+    """How much kept backbone a cut pair takes out along with the region.
+
+    The piece a double digest removes is the arc from one cut round to
+    the other. For the digest to do what the design asks, that piece has
+    to contain the whole of the region being replaced - otherwise what is
+    left of it stays in the vector and comes back in the product, which
+    is how a pair cutting four bases apart was reported as a way to
+    replace a 3 kb cassette.
+
+    Returns the number of extra bases removed - sequence the design means
+    to keep, which the insert would have to put back - or None when the
+    pair does not bracket the region at all.
+    """
+    if span is None:
+        return None
+    rem_start, rem_end = span
+    for c1, c2 in ((cut_a, cut_b), (cut_b, cut_a)):
+        # the arc c1 -> c2 going forward round the molecule
+        length = (c2 - c1) % bb_len
+        if (rem_start - c1) % bb_len <= length and \
+                (rem_end - c1) % bb_len <= length:
+            extra = length - (rem_end - rem_start) % bb_len
+            if extra >= 0:
+                return extra
+    return None
+
+
+#: How far a cut may sit from the edge of the region being replaced. A
+#: polylinker puts its sites within a few bases of each other, so a real
+#: pair lands within this; anything further is removing sequence the
+#: design means to keep, and the insert would have to carry it back.
+RE_EDGE_SLACK = 40
+
+#: The closest pair that bracketed the region but cut too far outside it,
+#: kept so the infeasibility message can name it. Written by
+#: `_find_enzyme_pairs` and read immediately afterwards by its one caller.
+_LAST_NEAR_MISS: dict = {}
+
+
 def _find_enzyme_pairs(bb_seq: str, insert_seq: str,
                        construct: AssembledConstruct,
                        protected: list[tuple[int, int, str]], cfg: Config,
@@ -1010,7 +1106,9 @@ def _find_enzyme_pairs(bb_seq: str, insert_seq: str,
 
     Implements the Stage 7 checklist: uniqueness, absence from the insert,
     no cuts inside protected features, end compatibility, and whether a
-    single or double digest is possible.
+    single or double digest is possible - and, since the pair has to cut
+    the recipient somewhere useful, that the two cuts bracket the region
+    being replaced.
     """
     results: list[dict] = []
     names = [n for n in cfg.stocked_enzymes if n in CATALOG]
@@ -1040,12 +1138,39 @@ def _find_enzyme_pairs(bb_seq: str, insert_seq: str,
             continue
         usable.append(n)
 
+    span = _replaced_span(construct, len(bb_seq))
+    cut_at = {n: [c.top_cut for c in find_sites(bb_seq, CATALOG[n], bb_circular)]
+              for n in usable}
+    near_misses: list[tuple] = []
+
     for i, a in enumerate(usable):
         for b in usable[i:]:
             if a == b and len(usable) > 1:
                 continue
+            # Both cuts have to fall so that the piece they remove covers
+            # the whole region this design replaces. Without this the pair
+            # was chosen on uniqueness alone, and HindIII + EcoRV - which
+            # cut pAAV_CAG_pHoran4 four bases apart - came out as the way
+            # to swap a 3 kb cassette, leaving mOrange in the product for
+            # the simulation to catch afterwards.
+            extra = None
+            if span is not None and cut_at.get(a) and cut_at.get(b):
+                extra = _brackets(cut_at[a][0], cut_at[b][0], span, len(bb_seq))
+                if extra is None:
+                    continue
+                if extra > RE_EDGE_SLACK:
+                    # Containing the region is not enough: the cuts have
+                    # to be at its edges. HindIII + EcoRV bracket it in
+                    # the sense that the arc between them covers it, and
+                    # that arc is 6,535 of the plasmid's 6,539 bases.
+                    near_misses.append((extra, a, b))
+                    continue
             enz_a, enz_b = CATALOG[a], CATALOG[b]
             warnings: list[str] = []
+            if extra:
+                warnings.append(
+                    f"{a} + {b} also remove {extra:,} bp of backbone the "
+                    f"design keeps; the insert has to carry those bases back")
             if enz_a.end_type != enz_b.end_type and "blunt" not in (
                     enz_a.end_type, enz_b.end_type):
                 pass  # different overhang classes are fine on opposite ends
@@ -1082,7 +1207,12 @@ def _find_enzyme_pairs(bb_seq: str, insert_seq: str,
                 "score": len(warnings) + (2 if a == b else 0),
             })
 
-    if not results:
+    # One cut linearises the plasmid; it does not take anything out of
+    # it. That is a way to put an insert in, and no way at all to replace
+    # a cassette - the old one stays, which is how a single HindIII cut
+    # was offered as a route whose own simulation then said "nothing
+    # drops out of it".
+    if not results and span is None:
         # Fall back to adding sites by PCR, which only needs the enzyme to be
         # absent from the insert and the backbone to be cuttable.
         for n in names:
@@ -1096,6 +1226,15 @@ def _find_enzyme_pairs(bb_seq: str, insert_seq: str,
                 })
 
     results.sort(key=lambda r: r["score"])
+    if near_misses:
+        # Not candidates - the route cannot use them - but the closest
+        # one is the only useful thing to say when nothing qualifies.
+        near_misses.sort()
+        extra, a, b = near_misses[0]
+        _LAST_NEAR_MISS.clear()
+        _LAST_NEAR_MISS.update({"enzymes": (a, b), "extra": extra})
+    else:
+        _LAST_NEAR_MISS.clear()
     return results
 
 
