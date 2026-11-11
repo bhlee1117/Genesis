@@ -5629,6 +5629,64 @@ class TestAnArmThatGoesOnMatchingIsPartOfTheDuplex(unittest.TestCase):
         self.assertIn("tail_binds", d)
 
 
+class TestGettingTheInsertBackOut(unittest.TestCase):
+    """Which two enzymes release the cassette from the finished plasmid.
+
+    The sites are the ones the backbone already carries - nothing is
+    added to the sequence to make this work.
+    """
+
+    @staticmethod
+    def _plasmid():
+        # insert at 300-600; AscI before it, PacI after it, each once
+        import random as _r
+        rng = _r.Random(41)
+        def junk(n):
+            return "".join(rng.choice("ACGT") for _ in range(n))
+        return (junk(280) + "GGCGCGCC" + junk(12)      # AscI at 280
+                + "ATG" + junk(294) + "TAA"            # the insert, 300-600
+                + junk(10) + "TTAATTAA" + junk(300))   # PacI just after
+
+    def test_it_names_the_nearest_unique_site_on_each_side(self):
+        from genesis.enzymes import excision_pair, flanking_sites
+        seq = self._plasmid()
+        f = flanking_sites(seq, 300, 600, ["AscI", "PacI", "EcoRI"],
+                           circular=True)
+        pair = excision_pair(f)
+        self.assertIsNotNone(pair)
+        self.assertEqual({pair[0]["enzyme"], pair[1]["enzyme"]},
+                         {"AscI", "PacI"})
+
+    def test_one_site_is_not_an_excision(self):
+        # A single cutter opens the plasmid; it does not take anything
+        # out of it. This reported "MluI + MluI" before, because on a
+        # circle one site lies both before the insert and after it.
+        from genesis.enzymes import excision_pair, flanking_sites
+        seq = self._plasmid()
+        f = flanking_sites(seq, 300, 600, ["AscI"], circular=True)
+        self.assertTrue(f["upstream"] and f["downstream"],
+                        "the one site should appear in both directions")
+        self.assertIsNone(excision_pair(f), "excised with a single site")
+
+    def test_a_site_inside_the_insert_is_not_a_flank(self):
+        from genesis.enzymes import flanking_sites
+        seq = self._plasmid()
+        f = flanking_sites(seq, 0, len(seq), ["AscI", "PacI"], circular=True)
+        self.assertEqual(f["upstream"], [])
+        self.assertEqual(f["downstream"], [])
+        self.assertEqual({d["enzyme"] for d in f["inside"]}, {"AscI", "PacI"})
+
+    def test_an_insert_that_wraps_the_origin_still_has_two_sides(self):
+        # On a pAAV the cassette runs off the end of the coordinates and
+        # back round, and measuring that as a forward span put every
+        # site upstream and none downstream.
+        from genesis.enzymes import flanking_sites
+        seq = self._plasmid()
+        f = flanking_sites(seq, 900, 100, ["AscI", "PacI"], circular=True)
+        self.assertTrue(f["upstream"], "nothing upstream of a wrapped insert")
+        self.assertTrue(f["downstream"], "nothing downstream of a wrapped insert")
+
+
 class TestCloningHandles(unittest.TestCase):
     """A unique restriction site at each end of the cassette.
 

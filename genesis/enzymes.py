@@ -404,3 +404,86 @@ def methylation_warnings(seq: str, enzyme: Enzyme, circular: bool = False) -> li
                     f"{enzyme.name} site at {site.site_start} overlaps a dcm "
                     f"site (CCWGG); use a dcm- strain")
     return warnings
+
+
+def flanking_sites(seq: str, lo: int, hi: int, stocked, limit: int = 6,
+                   circular: bool = True) -> dict:
+    """Unique cutters either side of a span, nearest first.
+
+    What somebody wants to know about a finished plasmid is how to get
+    the insert back out of it. That is answered by the enzymes that cut
+    once in the whole molecule and cut outside the insert - one upstream,
+    one downstream, and the pair of them releases it.
+
+    Distances are reported from the span's edges so a site 8 bp away and
+    one 2 kb away are visibly different things: both work, but only one
+    of them gives back the insert and nothing else.
+
+    The span may wrap position 1, which on a pAAV it usually does - the
+    backbone starts at an ITR, so the cassette runs off the end of the
+    coordinates and back round. Measuring that span as if it ran forwards
+    reports every site as upstream and none as downstream.
+    """
+    from .seqtools import revcomp
+
+    up = (seq or "").upper()
+    n = len(up)
+    out = {"upstream": [], "downstream": [], "inside": []}
+    for name in stocked or ():
+        enz = CATALOG.get(name)
+        if enz is None:
+            continue
+        site = enz.site.upper()
+        if len(site) < 6 or "N" in site:
+            continue
+        hits = [i for i in range(n - len(site) + 1) if up[i:i + len(site)] == site]
+        rc = revcomp(site)
+        if rc != site:
+            hits += [i for i in range(n - len(rc) + 1) if up[i:i + len(rc)] == rc]
+        if len(hits) != 1:
+            continue
+        at = hits[0]
+        wraps = circular and hi < lo
+        inside = (lo <= at < hi) if not wraps else (at >= lo or at < hi)
+        if inside:
+            out["inside"].append({"enzyme": name, "at": at})
+            continue
+        # On a circle every site outside the insert lies both before it
+        # and after it, so each is listed in both directions with its own
+        # distance - but a single site cuts the plasmid open, it does not
+        # release anything, so `excision_pair` has to take two.
+        before = (lo - at) % n if circular else lo - at
+        after = (at - hi) % n if circular else at - hi
+        out["upstream"].append({"enzyme": name, "at": at, "away": before})
+        out["downstream"].append({"enzyme": name, "at": at, "away": after})
+    out["upstream"].sort(key=lambda d: d["away"])
+    out["downstream"].sort(key=lambda d: d["away"])
+    out["upstream"] = out["upstream"][:limit]
+    out["downstream"] = out["downstream"][:limit]
+    return out
+
+
+def excision_pair(flanks: dict) -> tuple | None:
+    """The two enzymes that take the insert out, closest in on each side.
+
+    Two, and two different ones: one site opens the plasmid, it does not
+    cut anything out of it. The first version took the nearest entry from
+    each list and on a circular plasmid with a single unique cutter that
+    was the same site twice, reported as "MluI + MluI".
+
+    The pair chosen is the one that brings least backbone with it -
+    nearest downstream of the insert, nearest upstream of it - and they
+    have to be distinct positions, not just distinct names, since two
+    enzymes can share a recognition site.
+    """
+    down = flanks.get("downstream") or []
+    up = flanks.get("upstream") or []
+    best = None
+    for d in down:
+        for u in up:
+            if u["at"] == d["at"] or u["enzyme"] == d["enzyme"]:
+                continue
+            cost = u["away"] + d["away"]
+            if best is None or cost < best[0]:
+                best = (cost, u, d)
+    return (best[1], best[2]) if best else None
